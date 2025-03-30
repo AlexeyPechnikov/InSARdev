@@ -1,11 +1,12 @@
 # ----------------------------------------------------------------------------
-# PyGMTSAR
-# 
-# This file is part of the PyGMTSAR project: https://github.com/mobigroup/gmtsar
-# 
+# insardev
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev directory for license terms.
+# Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_export import Stack_export
 

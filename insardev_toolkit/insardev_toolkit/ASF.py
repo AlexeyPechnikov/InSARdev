@@ -1,14 +1,13 @@
 # ----------------------------------------------------------------------------
-# InSAR.dev
-# 
-# This file is part of the InSAR.dev project: https://InSAR.dev
-# 
+# insardev_toolkit
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 from .tqdm_joblib import tqdm_joblib
-#from .S1 import S1
 
 class ASF(tqdm_joblib):
     import pandas as pd

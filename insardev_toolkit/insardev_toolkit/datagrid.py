@@ -1,11 +1,11 @@
 # ----------------------------------------------------------------------------
-# InSAR.dev
-# 
-# This file is part of the InSAR.dev project: https://InSAR.dev
-# 
+# insardev_toolkit
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 
 class datagrid:
@@ -648,7 +648,12 @@ class datagrid:
                             coords=data.coords,
                             name=data.name)
 
+    # Backward compatibility wrapper
     def nearest_grid(self, in_grid, search_radius_pixels=None):
+        print('WARNING: nearest_grid() is deprecated. Use fill_nan_nearest() instead.')
+        return self.fill_nan_nearest(in_grid, search_radius_pixels)
+
+    def fill_nan_nearest(self, in_grid, search_radius_pixels=None):
         """
         Perform nearest neighbor interpolation on a 2D grid.
 
@@ -667,7 +672,7 @@ class datagrid:
         Examples
         --------
         Fill gaps in the specified grid using nearest neighbor interpolation:
-        stack.nearest_grid(grid)
+        stack.fill_nan_nearest(grid)
 
         Notes
         -----
@@ -679,7 +684,7 @@ class datagrid:
         import xarray as xr
         import numpy as np
 
-        assert in_grid.chunks is not None, 'nearest_grid() input grid chunks are not defined'
+        assert in_grid.chunks is not None, 'fill_nan_nearest() input grid chunks are not defined'
 
         if search_radius_pixels is None:
             search_radius_pixels = self.chunksize
@@ -688,7 +693,7 @@ class datagrid:
             return in_grid
         else:
             assert search_radius_pixels <= self.chunksize, \
-                f'ERROR: apply nearest_grid_pixels() multiple times to fill gaps more than {self.chunksize} pixels chunk size'
+                f'ERROR: apply fill_nan_nearest() multiple times to fill gaps more than {self.chunksize} pixels chunk size'
 
         def func(grid, y, x, distance, scaley, scalex):
 
@@ -743,5 +748,5 @@ class datagrid:
             output_dtypes=[np.float32],
             dask_gufunc_kwargs={'distance': search_radius_pixels, 'scaley': scale[0], 'scalex': scale[1]},
         )
-        assert grid.chunks is not None, 'nearest_grid() output grid chunks are not defined'
+        assert grid.chunks is not None, 'fill_nan_nearest() output grid chunks are not defined'
         return grid

@@ -1,11 +1,11 @@
 # ----------------------------------------------------------------------------
-# PyGMTSAR
-# 
-# This file is part of the PyGMTSAR project: https://github.com/mobigroup/gmtsar
-# 
+# insardev_pygmtsar
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from .S1_slc import S1_slc
 from .PRM import PRM

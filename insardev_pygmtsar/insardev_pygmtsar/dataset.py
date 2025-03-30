@@ -1,23 +1,36 @@
 # ----------------------------------------------------------------------------
-# InSAR.dev
-# 
-# This file is part of the InSAR.dev project: https://InSAR.dev
-# 
+# insardev_pygmtsar
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from insardev_toolkit import datagrid, tqdm_dask
+from insardev_toolkit import tqdm_dask
+from .datagrid import datagrid
 
 class dataset(datagrid):
 
-    # redefine
-    netcdf_complevel = 1
-    
     # work directory
     basedir = '.'
 
     def _glob_re(self, name, basedir='auto'):
+        """
+        Find files matching a regular expression pattern in a directory.
+
+        Parameters
+        ----------
+        name : str
+            Regular expression pattern to match filenames against.
+        basedir : str, optional
+            Base directory to search in. If 'auto', uses default directory. Default is 'auto'.
+
+        Returns
+        -------
+        list
+            Sorted list of full paths to matching files.
+        """
         import os
         import re
 
@@ -28,6 +41,21 @@ class dataset(datagrid):
         return sorted([os.path.join(basedir, filename) for filename in filenames])
 
     def get_filename(self, name, basedir='auto'):
+        """
+        Generate a NetCDF filename by appending .nc extension.
+
+        Parameters
+        ----------
+        name : str
+            Base name for the file without extension.
+        basedir : str, optional
+            Base directory for the file. If 'auto', uses default directory. Default is 'auto'.
+
+        Returns
+        -------
+        str
+            Full path to the NetCDF file.
+        """
         import os
 
         if isinstance(basedir, str) and basedir == 'auto':
@@ -36,22 +64,31 @@ class dataset(datagrid):
         filename = os.path.join(basedir, f'{name}.nc')
         return filename
 
-
     def get_filenames(self, pairs, name, basedir='auto'):
         """
-        Get the filenames of the data grids. The filenames are determined by the pairs and name parameters.
+        Get the filenames of the data grids based on pairs and name parameters.
 
         Parameters
         ----------
         pairs : np.ndarray or pd.DataFrame or None
-            An array or DataFrame of pairs. If None, the function will open a single grid or a set of subswath grids.
+            An array or DataFrame of pairs. Can be:
+            - 1D array of dates for single date files
+            - 2D array of date pairs for interferogram files 
+            - DataFrame with 'ref' and 'rep' columns for interferogram files
         name : str
-            The name of the grid to be opened.
-        
+            Base name for the grid files. Will be prefixed to dates/pairs in filenames.
+            If empty or None, no prefix will be added.
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory.
+            Default is 'auto'.
+
         Returns
         -------
-        str or list of str
-            The filename or a list of filenames of the grids.
+        list of str
+            List of full paths to NetCDF files. Filenames are constructed as:
+            - For single dates: {basedir}/{name}_{date}.nc 
+            - For pairs: {basedir}/{name}_{ref_date}_{rep_date}.nc
+            Dates are formatted without hyphens.
         """
         import pandas as pd
         import numpy as np
@@ -86,7 +123,7 @@ class dataset(datagrid):
 
     def open_cube(self, name, basedir='auto'):
         """
-        Opens an xarray 2D/3D Dataset or dataArray from a NetCDF file.
+        Opens an xarray 2D/3D Dataset or DataArray from a NetCDF file.
 
         This function takes the name of the model to be opened, reads the NetCDF file, and re-chunks
         the dataset according to the provided chunksize or the default value from the 'stack' object.
@@ -96,12 +133,19 @@ class dataset(datagrid):
         ----------
         name : str
             The name of the model file to be opened.
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
 
         Returns
         -------
-        xarray.Dataset
-            Xarray Dataset read from the specified NetCDF file.
+        xarray.Dataset or xarray.DataArray
+            Data read from the specified NetCDF file. Returns a Dataset unless the original data
+            was a DataArray with a name stored in attributes.
 
+        Raises
+        ------
+        AssertionError
+            If the specified NetCDF file does not exist.
         """
         import xarray as xr
         import pandas as pd
@@ -146,6 +190,35 @@ class dataset(datagrid):
         return data
 
     def sync_cube(self, data, name=None, spatial_ref=None, caption='Syncing NetCDF 2D/3D Dataset', basedir='auto'):
+        """
+        Save and reload a 2D/3D xarray Dataset or DataArray to/from a NetCDF file.
+
+        This is a convenience method that combines save_cube() and open_cube() operations.
+
+        Parameters
+        ----------
+        data : xarray.Dataset or xarray.DataArray
+            The data to be saved and reloaded.
+        name : str, optional
+            The name for the output NetCDF file. If None and data is a DataArray,
+            will use data.name. Default is None.
+        spatial_ref : str, optional
+            The spatial reference system. Default is None.
+        caption : str, optional
+            The text caption for the saving progress bar. Default is 'Syncing NetCDF 2D/3D Dataset'.
+        basedir : str, optional
+            Base directory for saving/loading the file. If 'auto', uses the default directory. Default is 'auto'.
+
+        Returns
+        -------
+        xarray.Dataset
+            The reloaded data from the saved NetCDF file.
+
+        Raises
+        ------
+        ValueError
+            If name is None and data is not a named DataArray.
+        """
         import xarray as xr
         if name is None and isinstance(data, xr.DataArray):
             assert data.name is not None, 'Define data name or use "name" argument for the NetCDF filename'
@@ -157,33 +230,52 @@ class dataset(datagrid):
 
     def save_cube(self, data, name=None, spatial_ref=None, caption='Saving NetCDF 2D/3D Dataset', basedir='auto'):
         """
-        Save a lazy and not lazy 2D/3D xarray Dataset or DataArray to a NetCDF file.
+        Save a lazy or non-lazy 2D/3D xarray Dataset or DataArray to a NetCDF file.
 
         The 'date' or 'pair' dimension is always chunked with a size of 1.
 
         Parameters
         ----------
         data : xarray.Dataset or xarray.DataArray
-            The model to be saved.
-        name : str
-            The text name for the output NetCDF file.
-        caption: str
-            The text caption for the saving progress bar.
+            The data to be saved. Can be either lazy (dask array) or non-lazy (numpy array).
+        name : str, optional
+            The name for the output NetCDF file. If None and data is a DataArray,
+            will use data.name. Required if data is a Dataset.
+        spatial_ref : str, optional
+            The spatial reference system. Default is None.
+        caption : str, optional
+            The text caption for the saving progress bar. Default is 'Saving NetCDF 2D/3D Dataset'.
+        basedir : str, optional
+            Base directory for saving the file. If 'auto', uses the default directory. Default is 'auto'.
 
         Returns
         -------
         None
 
+        Raises
+        ------
+        ValueError
+            If name is None and data is not a named DataArray.
+        AssertionError
+            If name is None and data is a DataArray without a name.
+
         Examples
-        -------
-        stack.save_cube(intf90m, 'intf90m')                              # save lazy 3d dataset
-        stack.save_cube(intf90m.phase, 'intf90m')                        # save lazy 3d dataarray
-        stack.save_cube(intf90m.isel(pair=0), 'intf90m')                 # save lazy 2d dataset
-        stack.save_cube(intf90m.isel(pair=0).phase, 'intf90m')           # save lazy 2d dataarray
-        stack.save_cube(intf90m.compute(), 'intf90m')                    # save 3d dataset     
-        stack.save_cube(intf90m.phase.compute(), 'intf90m')              # save 3d dataarray
-        stack.save_cube(intf90m.isel(pair=0).compute(), 'intf90m')       # save 2d dataset
-        stack.save_cube(intf90m.isel(pair=0).phase.compute(), 'intf90m') # save 2d dataarray
+        --------
+        # Save lazy 3D dataset/dataarray
+        stack.save_cube(intf90m, 'intf90m')                              
+        stack.save_cube(intf90m.phase, 'intf90m')                        
+
+        # Save lazy 2D dataset/dataarray
+        stack.save_cube(intf90m.isel(pair=0), 'intf90m')                 
+        stack.save_cube(intf90m.isel(pair=0).phase, 'intf90m')           
+
+        # Save non-lazy (computed) 3D dataset/dataarray
+        stack.save_cube(intf90m.compute(), 'intf90m')                    
+        stack.save_cube(intf90m.phase.compute(), 'intf90m')              
+
+        # Save non-lazy (computed) 2D dataset/dataarray
+        stack.save_cube(intf90m.isel(pair=0).compute(), 'intf90m')       
+        stack.save_cube(intf90m.isel(pair=0).phase.compute(), 'intf90m') 
         """
         import xarray as xr
         import pandas as pd
@@ -244,6 +336,16 @@ class dataset(datagrid):
             import gc; gc.collect()
 
     def delete_cube(self, name, basedir='auto'):
+        """
+        Delete a NetCDF cube file.
+
+        Parameters
+        ----------
+        name : str
+            Name of the cube file to delete
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
+        """
         import os
 
         filename = self.get_filename(name, basedir=basedir)
@@ -252,6 +354,31 @@ class dataset(datagrid):
             os.remove(filename)
 
     def sync_stack(self, data, name=None, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=300):
+        """
+        Synchronize stack data by deleting existing files and saving new data.
+
+        Parameters
+        ----------
+        data : xarray.Dataset or xarray.DataArray
+            Data to synchronize
+        name : str, optional
+            Name for the output files. If None, uses data.name. Default is None.
+        spatial_ref : str, optional
+            Spatial reference system. Default is None.
+        caption : str, optional
+            Progress bar caption. Default is 'Saving 2D Stack'.
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
+        queue : int, optional
+            Number of files to process at once. Default is None.
+        timeout : int, optional
+            Timeout in seconds for worker restart. Default is 300.
+
+        Returns
+        -------
+        xarray.Dataset or xarray.DataArray
+            Opened synchronized stack data
+        """
         import xarray as xr
         if name is None and isinstance(data, xr.DataArray):
             assert data.name is not None, 'Define data name or use "name" argument for the NetCDF filenames'
@@ -264,7 +391,24 @@ class dataset(datagrid):
 
     def open_stack(self, name, stack=None, basedir='auto'):
         """
-        Examples:
+        Open a stack of NetCDF files.
+
+        Parameters
+        ----------
+        name : str
+            Base name of the stack files
+        stack : list or array-like, optional
+            Dates or pairs to open. If None, opens all files. Default is None.
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
+
+        Returns
+        -------
+        xarray.Dataset or xarray.DataArray
+            Opened stack data
+
+        Examples
+        --------
         stack.open_stack('data')
         stack.open_stack('data', ['2018-03-23'])
         stack.open_stack('data', ['2018-03-23', '2018-03-11'])
@@ -343,8 +487,27 @@ class dataset(datagrid):
     
         return data
 
-    # use save_mfdataset
     def save_stack(self, data, name, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=None):
+        """
+        Save stack data to multiple 2D NetCDF files.
+
+        Parameters
+        ----------
+        data : xarray.Dataset or xarray.DataArray
+            Data to save
+        name : str
+            Base name for the output files
+        spatial_ref : str, optional
+            Spatial reference system. Default is None.
+        caption : str, optional
+            Progress bar caption. Default is 'Saving 2D Stack'.
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
+        queue : int, optional
+            Number of files to process at once. Default is None.
+        timeout : int, optional
+            Timeout in seconds for worker restart. Default is None.
+        """
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -439,6 +602,16 @@ class dataset(datagrid):
             counter += len(chunk)
 
     def delete_stack(self, name, basedir='auto'):
+        """
+        Delete all 2D NetCDF files in a stack.
+
+        Parameters
+        ----------
+        name : str
+            Base name of the stack files to delete
+        basedir : str, optional
+            Base directory path. If 'auto', uses default directory. Default is 'auto'.
+        """
         import os
 
         if name == '' or name is None:

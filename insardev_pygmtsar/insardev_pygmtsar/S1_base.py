@@ -1,11 +1,11 @@
 # ----------------------------------------------------------------------------
-# PyGMTSAR
-# 
-# This file is part of the PyGMTSAR project: https://github.com/mobigroup/gmtsar
-# 
+# insardev_pygmtsar
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from insardev_toolkit import tqdm_joblib, tqdm_dask
 from .dataset import dataset
@@ -31,6 +31,27 @@ class S1_base(tqdm_joblib, dataset):
         return self.df
 
     def get_prefix(self, burst, date=None):
+        """
+        Get the path prefix for a burst and date combination.
+
+        Parameters
+        ----------
+        burst : str
+            The burst identifier.
+        date : str, optional
+            Date string in yyyy-mm-dd format. If None, uses reference date.
+            If False, returns only burst path.
+
+        Returns
+        -------
+        str
+            Path prefix combining burst and date information.
+
+        Examples
+        --------
+        Get prefix for burst '173_370325_IW1' and date '2022-01-20':
+        prefix = stack.get_prefix('173_370325_IW1', '2022-01-20')
+        """
         import os
 
         assert date is None or date is False or len(date)==10, f'ERROR: date format is not yyyy-mm-dd (burst={burst} date={date})'

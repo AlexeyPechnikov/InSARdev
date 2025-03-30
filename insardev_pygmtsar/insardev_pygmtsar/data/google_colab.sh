@@ -1,4 +1,13 @@
 #!/bin/sh
+# ----------------------------------------------------------------------------
+# insardev_pygmtsar
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
+# Copyright (c) 2025, Alexey Pechnikov
+#
+# See the LICENSE file in the insardev_pygmtsar directory for license terms.
+# ----------------------------------------------------------------------------
 
 # Install GMTSAR if needed
 count=$(ls /usr/local | grep -c GMTSAR)

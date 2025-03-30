@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-__version__ = '2025.2.20.dev'
+from insardev_toolkit import datagrid as _datagrid
 
-# processing functions
-from .Stack import Stack
-# morphology and other helper functions
-from .utils import utils
+class datagrid(_datagrid):
+
+    # redefine
+    netcdf_complevel = -1

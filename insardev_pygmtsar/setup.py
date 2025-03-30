@@ -1,15 +1,13 @@
 #!/usr/bin/env python
 # ----------------------------------------------------------------------------
-# InSAR.dev Professional
+# insardev_pygmtsar
 #
-# This file is part of the InSAR.dev Professional project: https://github.com/mobigroup/InSARdev-pro
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
 #
 # Copyright (c) 2025, Alexey Pechnikov
 #
-# This source code is licensed under a Proprietary License.
-# For license terms and conditions see the LICENSE.md file provided with the source code.
+# See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-
 from setuptools import setup
 import urllib.request
 
@@ -22,24 +20,24 @@ def get_version():
                 return version
 
 # read the contents of local README file
-#from pathlib import Path
-#this_directory = Path(__file__).parent
-#long_description = (this_directory / "README.md").read_text()
+from pathlib import Path
+this_directory = Path(__file__).parent
+long_description = (this_directory / "README.md").read_text()
 
-upstream_url = 'https://raw.githubusercontent.com/AlexeyPechnikov/pygmtsar/pygmtsar2/README.md'
-response = urllib.request.urlopen(upstream_url)
-long_description = response.read().decode('utf-8')
+#upstream_url = 'https://raw.githubusercontent.com/AlexeyPechnikov/InSARdev/refs/heads/main/README.md'
+#response = urllib.request.urlopen(upstream_url)
+#long_description = response.read().decode('utf-8')
 
 setup(
     name='insardev_pygmtsar',
     version=get_version(),
-    description='InSAR.dev (Python InSAR): PyGMTSAR backend Pro',
+    description='InSAR.dev (Python InSAR): PyGMTSAR backend',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/AlexeyPechnikov/pygmtsar',
+    url='https://github.com/AlexeyPechnikov/InSARdev',
     author='Alexey Pechnikov',
     author_email='alexey@pechnikov.dev',
-    license='Proprietary',
+    license='BSD-3-Clause',
     packages=['insardev_pygmtsar'],
     include_package_data=True,
     package_data={
@@ -63,6 +61,7 @@ setup(
         'Development Status :: 4 - Beta',
         'Intended Audience :: Science/Research',
         'Natural Language :: English',
+        'License :: OSI Approved :: BSD License',
         'Operating System :: POSIX',
         'Operating System :: POSIX :: Linux',
         'Operating System :: MacOS',
@@ -71,5 +70,5 @@ setup(
         'Programming Language :: Python :: 3.11'
     ],
     python_requires='>=3.10',
-    keywords='satellite interferometry, InSAR, remote sensing, geospatial analysis, Sentinel-1, SBAS, PSI'
+    keywords='satellite interferometry, InSAR, remote sensing, Sentinel-1'
 )

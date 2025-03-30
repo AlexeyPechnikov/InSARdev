@@ -1,11 +1,12 @@
 # ----------------------------------------------------------------------------
-# InSAR.dev
-# 
-# This file is part of the InSAR.dev project: https://InSAR.dev
-# 
+# insardev
+#
+# This file is part of the InSARdev project: https://github.com/AlexeyPechnikov/InSARdev
+#
 # Copyright (c) 2025, Alexey Pechnikov
-# 
-# Licensed under the BSD 3-Clause License (see LICENSE for details)
+#
+# See the LICENSE file in the insardev directory for license terms.
+# Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_unwrap_snaphu import Stack_unwrap_snaphu
 # required for function decorators
@@ -547,7 +548,7 @@ class Stack_unwrap(Stack_unwrap_snaphu):
 
         assert data.dims == ('pair', 'y', 'x'), 'Input data must have dimensions (pair, y, x)'
 
-        interpolated = [self.nearest_grid(data.sel(pair=pair), search_radius_pixels) for pair in data.pair]
+        interpolated = [self.fill_nan_nearest(data.sel(pair=pair), search_radius_pixels) for pair in data.pair]
         return xr.concat(interpolated, dim='pair')
 
     @staticmethod
