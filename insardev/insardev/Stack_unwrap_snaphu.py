@@ -32,7 +32,7 @@ class Stack_unwrap_snaphu(Stack_multilooking):
             The correlation data as a string or xarray.DataArray, default is 'corr'.
 
         conf : str, optional
-            The SNAPHU configuration string, default is None (use the PRM's snaphu_config method).
+            The SNAPHU configuration string, default is None (use the snaphu_config method).
 
         conncomp : bool, optional
             If True, return connection components map, default is False.
@@ -169,10 +169,6 @@ class Stack_unwrap_snaphu(Stack_multilooking):
         str
             The Snaphu configuration file content.
 
-        Notes
-        -----
-        This method uses the `snaphu_config` method of the PRM object.
-
         Examples
         --------
         Generate a Snaphu configuration file with defomax=10:
@@ -181,11 +177,10 @@ class Stack_unwrap_snaphu(Stack_multilooking):
         Generate a Snaphu configuration file with defomax=5 and additional parameters:
         snaphu_config(defomax=5, param1=10, param2=20)
         """
-        #return self.PRM().snaphu_config(defomax, **kwargs)
         import os
         import joblib
 
-        tiledir = os.path.splitext(self.PRM().filename)[0]
+        tiledir = self.basedir
         n_jobs = joblib.cpu_count()
 
         conf_basic = f"""
