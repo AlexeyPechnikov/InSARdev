@@ -264,7 +264,7 @@ class S1_align(S1_dem):
             os.remove(filename)
 
     # 'threading' for Docker and 'loky' by default
-    def compute_align(self, geometry='auto', bursts=None, dates=None, n_jobs=-1, degrees=12.0/3600, joblib_aligning_backend=None, debug=False):
+    def compute_align(self, bursts=None, dates=None, n_jobs=-1, degrees=12.0/3600, debug=False):
         """
         Stack and align scenes.
 
@@ -291,9 +291,6 @@ class S1_align(S1_dem):
         # supress warnings about unary_union/union_all() future behaviour to replace None by empty collection
         warnings.filterwarnings('ignore')
 
-        if joblib_aligning_backend is not None:
-            print('Note: the joblib_aligning_backend argument has been removed from the compute_align() function.')
-
         if bursts is None:
             bursts = self.df.index.get_level_values(0).unique()
         if dates is None:
@@ -308,12 +305,12 @@ class S1_align(S1_dem):
 
         # prepare reference scene
         #self.stack_ref()
-        with self.tqdm_joblib(tqdm(desc='Preparing Reference', total=1)) as progress_bar:
+        with self.tqdm_joblib(tqdm(desc='Preparing Reference', total=len(bursts))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
                 (joblib.delayed(self._align_ref)(burst, debug=debug) for burst in bursts)
 
         # prepare secondary images
-        with self.tqdm_joblib(tqdm(desc='Aligning Repeat', total=len(dates_rep))) as progress_bar:
+        with self.tqdm_joblib(tqdm(desc='Aligning Repeat', total=len(dates_rep)*len(bursts))) as progress_bar:
             # threading backend is the only one working inside Docker container to run multiple binaries in parallel
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
                 (joblib.delayed(self._align_rep)(burst, date, degrees=degrees, debug=debug) \

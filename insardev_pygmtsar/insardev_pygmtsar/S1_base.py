@@ -143,3 +143,20 @@ class S1_base(tqdm_joblib, dataset):
 
         assert not date == self.reference, f'ERROR: repeat date cannot be equal to reference date "{date}"'
         return self.df.loc[[(burst, date)]]
+
+    def get_record(self, burst, date):
+        """
+        Return dataframe record.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        pd.DataFrame
+            The DataFrame containing the record.
+        """
+        df = self.df.loc[[(burst, date)]]
+        assert len(df) > 0, f'Record not found'
+        return df

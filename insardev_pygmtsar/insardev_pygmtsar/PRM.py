@@ -471,7 +471,7 @@ class PRM(datagrid, PRM_gmtsar):
                         SC_clock_stop=SC_clock_stop)
 
     # note: only one dimension chunked due to sequential file reading 
-    def read_SLC_int(self, scale=2.5e-07, shape=None):
+    def read_SLC_int(self):
         """
         Read SLC (Single Look Complex) data and compute the power of the signal.
         The method reads binary SLC data file, which contains alternating sequences of real and imaginary parts.
@@ -549,35 +549,9 @@ class PRM(datagrid, PRM_gmtsar):
         assert re.shape == (ydim, xdim), f'Originated re shape ({ydim},{xdim}), but got {re.shape}'
         assert im.shape == (ydim, xdim), f'Originated im width ({ydim},{xdim}), but got {im.shape}'
 
-        # pad to the specified reference frame
-        if shape is not None:
-            if shape[1] is not None and shape[1] > xdim:
-                rpad = da.zeros((ydim, shape[1] - xdim), dtype=np.int16)
-                re = da.concatenate([re, rpad], axis=1)
-                im = da.concatenate([im, rpad], axis=1)
-            elif shape[1] is not None and shape[1] < xdim:
-                re = re[:,:shape[1]]
-                im = im[:,:shape[1]]
-            if shape[0] is not None and shape[0] > ydim:
-                apad = da.zeros((shape[0] - ydim, shape[1] if shape[1] is not None else xdim), dtype=np.int16)
-                re = da.concatenate([re, apad], axis=0)
-                im = da.concatenate([im, apad], axis=0)
-            elif shape[0] is not None and shape[0] < ydim:
-                re = re[:shape[0]]
-                im = im[:shape[0]]
-
-        coords = {'a': np.arange(ydim if shape is None or shape[0] is None else shape[0]) + 0.5,
-                  'r': np.arange(xdim if shape is None or shape[1] is None else shape[1]) + 0.5}
-
-        #coords = {'y': np.arange(ydim) + 0.5, 'x': np.arange(xdim) + 0.5}
-        # perform aligning on-the-fly using coordinates
-        #coords = {'y': np.arange(ydim) + ashift + 0.5, 'x': np.arange(xdim) + rshift + 0.5}
+        coords = {'a': np.arange(ydim) + 0.5, 'r': np.arange(xdim) + 0.5}
         re = xr.DataArray(re, coords=coords).rename('re')
         im = xr.DataArray(im, coords=coords).rename('im')
-        #if intensity:
-        #    return ((scale or 1)*re.astype(np.float32))**2 + ((scale or 1)*im.astype(np.float32))**2
-        if scale is not None:
-            return scale * (xr.merge([re, im]).astype(np.float32))
         return xr.merge([re, im])
 
     def read_LED(self):

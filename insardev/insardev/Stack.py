@@ -12,6 +12,9 @@ from .Stack_export import Stack_export
 
 class Stack(Stack_export):
 
+    # redefine for fast caching
+    netcdf_complevel = -1
+
     def __repr__(self):
         return 'Object %s %d bursts %d dates' % (self.__class__.__name__, len(self.ds), len(self.ds[0].date))
 
@@ -21,46 +24,80 @@ class Stack(Stack_export):
         data = xr.concat(xr.align(*self.ds, join='outer'), dim='stack_dim').mean('stack_dim')
         return data
 
-    def __init__(self, basedir, pattern_burst='*_*_?W?', pattern_date = '????????.nc', scale = 2.5e-07):
+    def __init__(self, basedir, pattern_burst='*_*_?W?', pattern_date = '[0-9]{8}\.nc'):
         """
         Initialize an instance of the Stack class.
         """
-        import numpy as np
+        #import numpy as np
         import xarray as xr
+        import geopandas as gpd
+        import pandas as pd
+        from shapely import wkt
+        from tqdm.auto import tqdm
+        import joblib
         import glob
         import os
+
+        def read_netcdf_attributes(filename, attr_start='BPR'):
+            with xr.open_dataset(filename, engine=self.netcdf_engine_read, format=self.netcdf_format) as ds:
+                attrs = dict(ds.attrs)
+            # remove attributes before geometry
+            keys = list(attrs.keys())
+            idx = keys.index(attr_start)
+            attrs = {k: attrs[k] for k in keys[idx:]}
+            return attrs
 
         self.basedir = basedir
         
         bursts = glob.glob(pattern_burst, root_dir=self.basedir)
-        datas = []
+        filenames = []
         for burst in bursts:
-            data = xr.open_mfdataset(
-                os.path.join(self.basedir, burst, pattern_date),
-                engine=self.netcdf_engine_read,
-                format=self.netcdf_format,
-                parallel=True,
-                concat_dim='date',
-                chunks={'date': 1, 'y': self.chunksize, 'x': self.chunksize},
-                combine='nested',
-            )
-            #print (data)
-            # zero in np.int16 type means NODATA
-            data = self.spatial_ref(
-                scale*(data.re.astype(np.float32) + 1j*data.im.astype(np.float32)).where(data.re != 0).rename('data'),
-                data
-            )\
-            .to_dataset(name='data')\
-            .assign({v: data[v] for v in data.data_vars if v not in ['im', 're']})\
-            .assign_attrs({'burst': burst})
-            datas.append(data)
-            del data
-    
-        self.ds = datas
+            basedir = os.path.join(self.basedir, burst)
+            fnames = self._glob_re(pattern_date, basedir=basedir)
+            filenames.extend(fnames)
+            #print ('fnames', fnames)
 
-    def baseline_table(self):
-        import xarray as xr
-        return xr.concat([ds.BPR for ds in self.ds], dim='burst').mean('burst').to_dataframe()[['BPR']]
+        with self.tqdm_joblib(tqdm(desc='TODO fnames', total=len(filenames))) as progress_bar:
+            attrs = joblib.Parallel(n_jobs=-1, backend=None)\
+                (joblib.delayed(read_netcdf_attributes)(filename) for filename in filenames)
+        #print ('attrs', attrs)
+
+        processed_attrs = []
+        for attr in attrs:
+            processed_attr = {}
+            for key, value in list(attr.items())[::-1]:
+                #print (key, value)
+                if hasattr(value, 'item'):
+                    processed_attr[key] = value.item()
+                elif key == 'geometry':
+                    processed_attr[key] = wkt.loads(value)
+                else:
+                    processed_attr[key] = value
+            processed_attrs.append(processed_attr)
+        df = gpd.GeoDataFrame(processed_attrs)
+        #df = df.sort_values(by=['fullBurstID', 'date']).set_index(['fullBurstID', 'date'])
+        df = df.sort_values(by=df.columns[:2].tolist()).set_index(df.columns[:2].tolist())
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        self.df = df
+
+    def to_dataframe(self):
+        """
+        Return a Pandas DataFrame for all Stack scenes.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The DataFrame containing Stack scenes.
+
+        Examples
+        --------
+        df = stack.to_dataframe()
+        """
+        return self.df
+
+    # def baseline_table(self):
+    #     import xarray as xr
+    #     return xr.concat([ds.BPR for ds in self.ds], dim='burst').mean('burst').to_dataframe()[['BPR']]
 
     def baseline_pairs(self, days=None, meters=None, invert=False):
         """

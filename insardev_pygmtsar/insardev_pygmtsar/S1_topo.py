@@ -65,7 +65,7 @@ class S1_topo(S1_geocode):
         plt.ylabel('Azimuth')
         plt.title(caption)
 
-    def topo_phase(self, burst, dates=None, topo='auto', grid=None, method='nearest', debug=False):
+    def topo_phase(self, burst, date, topo='auto', grid=None, method='nearest'):
         """
         np.arctan2(np.sin(topo_phase), np.cos(topo_phase))[0].plot.imshow()
         """
@@ -80,12 +80,6 @@ class S1_topo(S1_geocode):
         warnings.filterwarnings('ignore')
         warnings.filterwarnings('ignore', module='dask')
         warnings.filterwarnings('ignore', module='dask.core')
-
-        if debug:
-            print ('DEBUG: topo_phase')
-
-        if dates is None:
-            dates = self.df.index.get_level_values(1).unique()
 
         if isinstance(topo, str) and topo == 'auto':
             topo = self.get_topo(burst)
@@ -188,8 +182,6 @@ class S1_topo(S1_geocode):
             phase_shift = cnst * drho
             del near_range, drho, height, B, alpha, Bx, Bv, Bh, time
 
-            # for 3d processing
-            #return np.expand_dims(phase_shift.astype(np.complex64), 0)
             #return phase_shift.astype(np.complex64)
             return phase_shift.astype(np.float32)
 
@@ -202,36 +194,21 @@ class S1_topo(S1_geocode):
             prm1.set(prm1.SAT_baseline(prm1).sel('SC_height','SC_height_start','SC_height_end')).fix_aligned()
             return (prm1, prm2)
 
-        prms = joblib.Parallel(n_jobs=-1)(joblib.delayed(prepare_prms)(burst, date) for date in dates)
-
+        prms = prepare_prms(burst, date)
         # fill NaNs by 0 and expand to 3d
         topo2d = da.where(da.isnan(topo.data), 0, topo.data)
-
-        # for 3d processing
-        # topo3d = da.repeat(da.expand_dims(topo2d, 0), len(pairs), axis=0).rechunk((1, 'auto', 'auto'))
-        # out = da.blockwise(
-        #     block_phase_dask,
-        #     'kyx',
-        #     topo3d, 'kyx',
-        #     topo.y,    'y',
-        #     topo.x,    'x',
-        #     [prm[0] for prm in prms], 'k',
-        #     [prm[1] for prm in prms], 'k',
-        #     dtype=np.complex64,
-        # )
-
-        out = da.stack([da.blockwise(
+        out = da.blockwise(
             block_phase_dask,
             'yx',
             topo2d, 'yx',
             topo.a, 'y',
             topo.r, 'x',
-            prm1=prm[0],
-            prm2=prm[1],
+            prm1=prms[0],
+            prm2=prms[1],
             #dtype=np.complex64
             dtype=np.float32
-        ) for prm in prms], axis=0)
+        )
+        del topo2d, prms
 
-        coords = coords={'date': pd.to_datetime(dates), 'a': topo.a, 'r': topo.r}
-        return xr.DataArray(out, coords).where(da.isfinite(topo)).rename('phase')
+        return xr.DataArray(out, topo.coords).where(da.isfinite(topo)).rename('phase')
 

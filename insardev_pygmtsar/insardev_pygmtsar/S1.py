@@ -12,6 +12,9 @@ from .PRM import PRM
 
 class S1(S1_topo):
 
+    # redefine to save disk space
+    netcdf_complevel = 1
+
     df = None
     basedir = None
     reference = None

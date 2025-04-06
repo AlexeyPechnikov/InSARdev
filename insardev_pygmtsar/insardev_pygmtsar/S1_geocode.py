@@ -18,10 +18,15 @@ class S1_geocode(S1_align):
         warnings.filterwarnings('ignore')
         warnings.filterwarnings('ignore', module='dask')
         warnings.filterwarnings('ignore', module='dask.core')
+        from tqdm.auto import tqdm
+        import joblib
 
-        # TODO
         bursts = self.df.index.get_level_values(0).unique()
-        for burst in bursts:
+        dates = self.df.index.get_level_values(1).unique()
+
+        #print ('bursts', bursts)
+        def burst_geocode(burst, dem, resolution, coarsen, epsg):
+            #print ('burst', burst)
             self.compute_trans(burst, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
             # do not save the grid
             #trans_inv = self.compute_trans_inv(burst, interactive=True)
@@ -29,45 +34,49 @@ class S1_geocode(S1_align):
             #self.compute_trans_slc(burst, topo=topo)
             # save the grid (2 times faster)
             self.compute_trans_inv(burst)
-            self.compute_trans_slc(burst)
+            #self.compute_trans_slc(burst)
 
-    def baseline_table(self, burst, dates=None):
-        """
-        Generates a baseline table for Sentinel-1 data, containing dates, times, and baseline components.
+        # use sequential processing as geocoding is well parallelized internally
+        for burst in tqdm(bursts, desc='Geocoding transform'):
+            burst_geocode(burst, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
+        
+        # # Iterate over both bursts and dates
+        # for burst in tqdm(bursts, desc='Geocoding bursts'):
+        #     for date in tqdm(dates, desc=f'Processing dates for burst {burst}', leave=False):
+        #         self.compute_trans_slc(burst, date=date)
+        
+        # use parallel processing for simple bursts conversion
+        with self.tqdm_joblib(tqdm(desc='Geocoding bursts', total=len(bursts)*len(dates))) as progress_bar:
+            attrs = joblib.Parallel(n_jobs=-1, backend=None)\
+                (joblib.delayed(self.compute_trans_slc)(burst, date) for burst in bursts for date in dates)
 
-        This function creates a baseline table for Sentinel-1 data by processing the PRM files, which
-        contain metadata for each image. The table includes dates, times, and parallel and perpendicular
-        baseline components for each image.
-        """
+    def compute_trans_slc(self, burst, date, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
         import pandas as pd
         import numpy as np
-
-        if dates is None:
-            dates = self.df.index.get_level_values(1).unique()
-
-        prm_ref = self.PRM(burst)
-        data = []
-        for date in dates:
-            prm_rep = self.PRM(burst, date)
-            BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
-            data.append({'date':date, 'BPL':BPL, 'BPR':BPR})
-        df = pd.DataFrame(data).set_index('date')
-        df.index = pd.DatetimeIndex(df.index)
-        return df
-
-    def compute_trans_slc(self, burst, data='auto', topo='auto', phase='auto', scale=2.5e-07, interactive=False):
-        import numpy as np
         import xarray as xr
+        import dask
         import os
 
-        if isinstance(data, str) and data == 'auto':
-            data = self.open_data(burst)
-
         if isinstance(phase, str) and phase == 'auto':
-            phase = self.topo_phase(burst, topo=topo)
+            phase = self.topo_phase(burst, date, topo=topo)
+        #dates = pd.DatetimeIndex(data.date).strftime('%Y-%m-%d')
 
-        #data_proj = self.ra2proj((data * phase.conj()).rename('data'))
-        complex_proj = self.ra2proj(burst, data * np.exp(-1j * phase))
+        # get record
+        df = self.get_record(burst, date)
+
+        # get PRM parameters
+        prm_ref = self.PRM(burst)
+        prm_rep = self.PRM(burst, date)
+
+        # read SLC data
+        slc = prm_rep.read_SLC_int()
+        # scale as complex values, zero in np.int16 type means NODATA
+        slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).where(slc.re != 0).rename('data')
+        # zero in np.int16 type means NODATA
+        #slc_complex = slc_complex.where(slc_complex != 0)
+        del slc
+        # reproject as a single complex variable
+        complex_proj = self.ra2proj(burst, slc_complex * np.exp(-1j * phase))
 
         # do not apply scale to complex_proj to preserve projection attributes
         data_proj = self.spatial_ref(
@@ -79,18 +88,48 @@ class S1_geocode(S1_align):
                     )
         del complex_proj
 
-        baseline_table = self.baseline_table(burst)
-        data_proj['BPR'] = baseline_table.BPR.to_xarray().astype(np.float32)
+        # add PRM attributes
+        for name, value in prm_rep.df.itertuples():
+            if name not in ['input_file', 'SLC_file', 'led_file']:
+                data_proj.attrs[name] = value
+        # add calculated attributes
+        BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
+        # prevent confusing -0.0
+        data_proj.attrs['BPR'] = BPR + 0
+        # workaround for the hard-coded attribute
+        data_proj.attrs['SLC_scale'] = scale
         
+        # add record attributes
+        for _, row in df.reset_index().iterrows():
+            # reverse the items order within each row
+            for name, value in ((n, v) for n, v in list(row.items())[::-1] if n not in ['orbit', 'path']):
+                if isinstance(value, (pd.Timestamp, np.datetime64)):
+                    value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+                if name == 'geometry':
+                    value = value.wkt
+                data_proj.attrs[name] = value
+
+        # add date coordinate for stacking
+        data_proj['date'] = pd.Timestamp(date)
+
         if interactive:
             return data_proj
 
-        #prefix = self.get_prefix(burst, False)
+        #print ('data_proj', data_proj)
         basedir = os.path.join(self.basedir, burst)
-        self.delete_stack(None, basedir=basedir)
-        self.save_stack(data_proj, None, None, 'Geocode SLC', basedir=basedir)
-        del data_proj
-
+        basename = date.replace('-', '')
+        filename = self.get_filename(basename, basedir=basedir)
+        #print ('filename', filename)
+        if os.path.exists(filename):
+            os.remove(filename)
+        #encoding = {'data': self._compression(data_proj.shape)}
+        encoding = {varname: self._compression(data_proj[varname].shape) for varname in data_proj.data_vars}
+        #print ('encoding', encoding)
+        data_proj.to_netcdf(filename,
+                            encoding=encoding,
+                            engine=self.netcdf_engine_write,
+                            format=self.netcdf_format)
+        
     def ra2proj(self, burst, data, trans='auto'):
         """
         Perform geocoding from radar to geographic coordinates.
@@ -127,7 +166,7 @@ class S1_geocode(S1_align):
 
         # use outer data and trans variables
         @dask.delayed
-        def trans_block(ys_block, xs_block, stackval=None):
+        def trans_block(ys_block, xs_block):
             from scipy.interpolate import RegularGridInterpolator
             # disable "distributed.utils_perf - WARNING - full garbage collections ..."
             try:
@@ -139,13 +178,14 @@ class S1_geocode(S1_align):
             import warnings
             warnings.filterwarnings('ignore')
         
-            # use outer variables
-            data_grid = data.sel({stackvar: stackval}) if stackval is not None else data
+            # use outer variables data & trans
             trans_block = trans.sel(y=ys_block, x=xs_block).compute(n_workers=1)
-        
+            coord_a = data.a
+            coord_r = data.r
+
             # check if the data block exists
             if not trans_block.azi.size:
-                del data_grid, trans_block
+                del trans_block
                 return np.nan * np.zeros((ys_block.size, xs_block.size), dtype=data.dtype)
 
             # use trans table subset
@@ -157,18 +197,15 @@ class S1_geocode(S1_align):
             # calculate trans grid subset extent
             amin, amax = np.nanmin(azis), np.nanmax(azis)
             rmin, rmax = np.nanmin(rngs), np.nanmax(rngs)
-            coord_a = data_grid.a
             coord_a = coord_a[(coord_a>amin-1)&(coord_a<amax+1)]
-            coord_r = data_grid.r
             coord_r = coord_r[(coord_r>rmin-1)&(coord_r<rmax+1)]
             del amin, amax, rmin, rmax
             # when no valid pixels for the processing
             if coord_a.size == 0 or coord_r.size == 0:
-                del coord_a, coord_r, points, data_grid
+                del coord_a, coord_r, points
                 return np.nan * np.zeros((ys_block.size, xs_block.size), dtype=data.dtype)
 
-            data_block = data_grid.sel(a=coord_a, r=coord_r).compute(n_workers=1)
-            del data_grid
+            data_block = data.sel(a=coord_a, r=coord_r).compute(n_workers=1)
             values = data_block.data
             del data_block
 
@@ -185,41 +222,23 @@ class S1_geocode(S1_align):
         ys_blocks = np.array_split(ys, np.arange(0, ys.size, self.chunksize)[1:])
         xs_blocks = np.array_split(xs, np.arange(0, xs.size, self.chunksize)[1:])
 
-        # find stack dim
-        stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
-        #print ('stackvar', stackvar)
+        # per-block processing
+        blocks_total  = []
+        for ys_block in ys_blocks:
+            blocks = []
+            for xs_block in xs_blocks:
+                block = dask.array.from_delayed(trans_block(ys_block, xs_block),
+                                                shape=(ys_block.size, xs_block.size), dtype=data.dtype)
+                blocks.append(block)
+                del block
+            blocks_total.append(blocks)
+            del blocks
+        dask_block = dask.array.block(blocks_total)
+        coords = {'y': trans.coords['y'], 'x': trans.coords['x']}
+        da = xr.DataArray(dask_block, coords=coords)
+        del blocks_total, dask_block
 
-        stack = []
-        for stackval in data[stackvar].values if len(data.dims) == 3 else [None]:
-            # per-block processing
-            blocks_total  = []
-            for ys_block in ys_blocks:
-                blocks = []
-                for xs_block in xs_blocks:
-                    block = dask.array.from_delayed(trans_block(ys_block, xs_block, stackval),
-                                                    shape=(ys_block.size, xs_block.size), dtype=data.dtype)
-                    blocks.append(block)
-                    del block
-                blocks_total.append(blocks)
-                del blocks
-            dask_block = dask.array.block(blocks_total)
-            if len(data.dims) == 3:
-                coords = {stackvar: [stackval], 'y': trans.coords['y'], 'x': trans.coords['x']}
-                da = xr.DataArray(dask_block[None, :], coords=coords)
-            else:
-                coords = {'y': trans.coords['y'], 'x': trans.coords['x']}
-                da = xr.DataArray(dask_block, coords=coords)
-            stack.append(da)
-            del blocks_total, dask_block
-
-        # wrap lazy Dask array to Xarray dataarray
-        if len(data.dims) == 2:
-            out = stack[0]
-        else:
-            out = xr.concat(stack, dim=stackvar)
-        del stack
-
-        return self.spatial_ref(out.rename(data.name), trans)
+        return self.spatial_ref(da.rename(data.name), trans)
 
     @staticmethod
     def get_utm_epsg(lat, lon):
@@ -489,7 +508,7 @@ class S1_geocode(S1_align):
             return trans
         
         prefix = self.get_prefix(burst, False)
-        self.save_cube(trans, prefix + 'trans', epsg, 'Radar Transform')
+        self.save_cube(trans, prefix + 'trans', epsg, None)
         del trans
 
     def get_trans_inv(self, burst):
@@ -630,10 +649,10 @@ class S1_geocode(S1_align):
         # calculate indices on the fly
         trans_blocks = trans[['azi', 'rng']].coarsen(y=self.netcdf_chunksize, x=self.netcdf_chunksize, boundary='pad')
         #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
-        # materialize with progress bar indication
-        tqdm_dask(trans_blocks_persist := dask.persist(trans_blocks.min(), trans_blocks.max()), desc='Radar Transform Indexing')
+        # materialize without progress bar indication
+        #trans_blocks_persist = dask.persist(trans_blocks.min(), trans_blocks.max()
         # only convert structure
-        block_min, block_max = dask.compute(trans_blocks_persist)[0]
+        block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
         trans_amin = block_min.azi
         trans_amax = block_max.azi
         trans_rmin = block_min.rng
@@ -681,45 +700,4 @@ class S1_geocode(S1_align):
             return trans_inv
         
         prefix = self.get_prefix(burst, False)
-        return self.save_cube(trans_inv, prefix + 'trans_inv', None, f'Radar Inverse Transform')
-
-    # 2.5e-07 is Sentinel-1 scale factor
-    # use original PRM files to get binary file locations
-    def open_data(self, burst, dates=None, scale=2.5e-07, debug=False):
-        import xarray as xr
-        import pandas as pd
-        import numpy as np
-        from scipy import constants
-        import os
-
-        if debug:
-            print (f'DEBUG: open_data: burst {burst} apply scale: {scale}')
-
-        if dates is None:
-            dates = self.df.index.get_level_values(1).unique()
-        #print ('dates', dates)
-
-        #offsets = {'bottoms': bottoms, 'lefts': lefts, 'rights': rights, 'bottom': minh, 'extent': [maxy, maxx], 'ylims': ylims, 'xlims': xlims}
-        offsets = self.prm_offsets(burst, debug=debug)
-        #print ('offsets', offsets)
-
-        stack = []
-        for date in dates:
-            prm = self.PRM(burst, date)
-            # disable scaling
-            slc = prm.read_SLC_int(scale=scale, shape=offsets['extent'])
-            stack.append(slc.assign_coords(date=date))
-            del slc, prm
-
-        ds = xr.concat(stack, dim='date').assign(date=pd.to_datetime(dates))\
-            .chunk({'a': self.chunksize, 'r': self.chunksize})
-        del stack
-
-        if scale is None:
-            # there is no complex int16 datatype, so return two variables for real and imag parts
-            return ds
-        # scale and return as complex values
-        ds_complex = (ds.re.astype(np.float32) + 1j*ds.im.astype(np.float32))
-        del ds
-        # zero in np.int16 type means NODATA
-        return ds_complex.where(ds_complex != 0).rename('data')
+        return self.save_cube(trans_inv, prefix + 'trans_inv', None, None)
