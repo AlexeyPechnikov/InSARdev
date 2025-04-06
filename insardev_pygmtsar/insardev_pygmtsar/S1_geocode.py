@@ -12,7 +12,7 @@ from insardev_toolkit import tqdm_dask
 
 class S1_geocode(S1_align):
 
-    def compute_geocode(self, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
+    def geocode(self, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
         import warnings
         # suppress Dask warning "RuntimeWarning: All-NaN slice encountered"
         warnings.filterwarnings('ignore')
@@ -34,23 +34,28 @@ class S1_geocode(S1_align):
             #self.compute_trans_slc(burst, topo=topo)
             # save the grid (2 times faster)
             self.compute_trans_inv(burst)
-            #self.compute_trans_slc(burst)
 
         # use sequential processing as geocoding is well parallelized internally
         for burst in tqdm(bursts, desc='Geocoding transform'):
             burst_geocode(burst, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
-        
-        # # Iterate over both bursts and dates
-        # for burst in tqdm(bursts, desc='Geocoding bursts'):
-        #     for date in tqdm(dates, desc=f'Processing dates for burst {burst}', leave=False):
-        #         self.compute_trans_slc(burst, date=date)
-        
-        # use parallel processing for simple bursts conversion
-        with self.tqdm_joblib(tqdm(desc='Geocoding bursts', total=len(bursts)*len(dates))) as progress_bar:
-            attrs = joblib.Parallel(n_jobs=-1, backend=None)\
-                (joblib.delayed(self.compute_trans_slc)(burst, date) for burst in bursts for date in dates)
 
-    def compute_trans_slc(self, burst, date, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
+    def transform(self):
+        from tqdm.auto import tqdm
+        import joblib
+
+        bursts = self.df.index.get_level_values(0).unique()
+        dates = self.df.index.get_level_values(1).unique()
+
+        # # use parallel processing for simple bursts conversion
+        # with self.tqdm_joblib(tqdm(desc='Geocoding bursts', total=len(bursts)*len(dates))) as progress_bar:
+        #    joblib.Parallel(n_jobs=-1, backend=None)\
+        #        (joblib.delayed(self.transform_slc)(burst, date) for burst in bursts for date in dates)
+
+        for burst in tqdm(bursts, desc='Geocoding bursts'):
+            for date in tqdm(dates, desc=f'Processing dates for burst {burst}', leave=False):
+                self.transform_slc(burst, date)
+
+    def transform_slc(self, burst, date, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
         import pandas as pd
         import numpy as np
         import xarray as xr
@@ -61,6 +66,7 @@ class S1_geocode(S1_align):
             phase = self.topo_phase(burst, date, topo=topo)
         #dates = pd.DatetimeIndex(data.date).strftime('%Y-%m-%d')
 
+        #print(f'transform_slc {burst} {date}')
         # get record
         df = self.get_record(burst, date)
 
@@ -76,8 +82,8 @@ class S1_geocode(S1_align):
         #slc_complex = slc_complex.where(slc_complex != 0)
         del slc
         # reproject as a single complex variable
-        complex_proj = self.ra2proj(burst, slc_complex * np.exp(-1j * phase))
-
+        complex_proj = self.project(burst, slc_complex * np.exp(-1j * phase))
+        
         # do not apply scale to complex_proj to preserve projection attributes
         data_proj = self.spatial_ref(
                          xr.merge([
@@ -115,10 +121,7 @@ class S1_geocode(S1_align):
         if interactive:
             return data_proj
 
-        #print ('data_proj', data_proj)
-        basedir = os.path.join(self.basedir, burst)
-        basename = date.replace('-', '')
-        filename = self.get_filename(basename, basedir=basedir)
+        filename = os.path.join(self.basedir, burst, date.replace('-', '')+'.nc')
         #print ('filename', filename)
         if os.path.exists(filename):
             os.remove(filename)
@@ -130,7 +133,7 @@ class S1_geocode(S1_align):
                             engine=self.netcdf_engine_write,
                             format=self.netcdf_format)
         
-    def ra2proj(self, burst, data, trans='auto'):
+    def project(self, burst, data, trans='auto'):
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -154,6 +157,7 @@ class S1_geocode(S1_align):
         unwraps_ll = stack.open_grids(pairs, 'unwrap', geocode=True)
         """
         import dask
+        import dask.array as da
         import xarray as xr
         import numpy as np
         import warnings
@@ -161,38 +165,22 @@ class S1_geocode(S1_align):
 
         if isinstance(trans, str) and trans == 'auto':
             trans = self.get_trans(burst)
-        # select required variables only
-        trans = trans[['azi', 'rng']]
 
-        # use outer data and trans variables
-        @dask.delayed
-        def trans_block(ys_block, xs_block):
+        # use outer data variable
+        def trans_block(trans_block_azi, trans_block_rng):
             from scipy.interpolate import RegularGridInterpolator
-            # disable "distributed.utils_perf - WARNING - full garbage collections ..."
-            try:
-                from dask.distributed import utils_perf
-                utils_perf.disable_gc_diagnosis()
-            except ImportError:
-                from distributed.gc import disable_gc_diagnosis
-                disable_gc_diagnosis()
-            import warnings
-            warnings.filterwarnings('ignore')
-        
-            # use outer variables data & trans
-            trans_block = trans.sel(y=ys_block, x=xs_block).compute(n_workers=1)
+
             coord_a = data.a
             coord_r = data.r
 
             # check if the data block exists
-            if not trans_block.azi.size:
-                del trans_block
-                return np.nan * np.zeros((ys_block.size, xs_block.size), dtype=data.dtype)
+            if not trans_block_azi.size:
+                return np.nan * np.zeros(trans_block_azi.shape, dtype=data.dtype)
 
             # use trans table subset
-            azis = trans_block.azi.values.ravel()
-            rngs = trans_block.rng.values.ravel()
+            azis = trans_block_azi.ravel()
+            rngs = trans_block_rng.ravel()
             points = np.column_stack([azis, rngs])
-            del trans_block
             
             # calculate trans grid subset extent
             amin, amax = np.nanmin(azis), np.nanmax(azis)
@@ -203,42 +191,28 @@ class S1_geocode(S1_align):
             # when no valid pixels for the processing
             if coord_a.size == 0 or coord_r.size == 0:
                 del coord_a, coord_r, points
-                return np.nan * np.zeros((ys_block.size, xs_block.size), dtype=data.dtype)
+                return np.nan * np.zeros(trans_block_azi.shape, dtype=data.dtype)
 
             data_block = data.sel(a=coord_a, r=coord_r).compute(n_workers=1)
             values = data_block.data
             del data_block
 
             interp = RegularGridInterpolator((coord_a, coord_r), values, method='nearest', bounds_error=False)
-            grid_proj = interp(points).reshape(ys_block.size, xs_block.size)
+            grid_proj = interp(points).reshape(trans_block_azi.shape)
             del coord_a, coord_r, points, values
             return grid_proj
 
-        # define output coordinates grid
-        ys = trans.y
-        xs = trans.x
+        out = da.blockwise(
+            trans_block,
+            'yx',
+            trans.azi, 'yx',
+            trans.rng, 'yx',
+            dtype=data.dtype
+        )
 
-        # split to equal chunks and rest
-        ys_blocks = np.array_split(ys, np.arange(0, ys.size, self.chunksize)[1:])
-        xs_blocks = np.array_split(xs, np.arange(0, xs.size, self.chunksize)[1:])
-
-        # per-block processing
-        blocks_total  = []
-        for ys_block in ys_blocks:
-            blocks = []
-            for xs_block in xs_blocks:
-                block = dask.array.from_delayed(trans_block(ys_block, xs_block),
-                                                shape=(ys_block.size, xs_block.size), dtype=data.dtype)
-                blocks.append(block)
-                del block
-            blocks_total.append(blocks)
-            del blocks
-        dask_block = dask.array.block(blocks_total)
-        coords = {'y': trans.coords['y'], 'x': trans.coords['x']}
-        da = xr.DataArray(dask_block, coords=coords)
-        del blocks_total, dask_block
-
-        return self.spatial_ref(da.rename(data.name), trans)
+        da = xr.DataArray(out, trans.coords).rename(data.name)
+        del out
+        return self.spatial_ref(da, trans)
 
     @staticmethod
     def get_utm_epsg(lat, lon):

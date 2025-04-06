@@ -264,7 +264,7 @@ class S1_align(S1_dem):
             os.remove(filename)
 
     # 'threading' for Docker and 'loky' by default
-    def compute_align(self, bursts=None, dates=None, n_jobs=-1, degrees=12.0/3600, debug=False):
+    def align(self, bursts=None, dates=None, n_jobs=-1, degrees=12.0/3600, debug=False):
         """
         Stack and align scenes.
 
