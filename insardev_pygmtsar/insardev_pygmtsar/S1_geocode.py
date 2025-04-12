@@ -12,50 +12,49 @@ from insardev_toolkit import tqdm_dask
 
 class S1_geocode(S1_align):
 
-    def geocode(self, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
+    def geocode(self, records=None, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
         import warnings
         # suppress Dask warning "RuntimeWarning: All-NaN slice encountered"
         warnings.filterwarnings('ignore')
         warnings.filterwarnings('ignore', module='dask')
         warnings.filterwarnings('ignore', module='dask.core')
         from tqdm.auto import tqdm
-        import joblib
-
-        bursts = self.df.index.get_level_values(0).unique()
-        dates = self.df.index.get_level_values(1).unique()
+        #import joblib
 
         #print ('bursts', bursts)
-        def burst_geocode(burst, dem, resolution, coarsen, epsg):
+        def burst_geocode(burst_ref, dem, resolution, coarsen, epsg):
             #print ('burst', burst)
-            self.compute_trans(burst, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
+            self.compute_trans(burst_ref, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
             # do not save the grid
             #trans_inv = self.compute_trans_inv(burst, interactive=True)
             #topo = self.get_topo(burst, trans_inv)
             #self.compute_trans_slc(burst, topo=topo)
             # save the grid (2 times faster)
-            self.compute_trans_inv(burst)
+            self.compute_trans_inv(burst_ref)
 
+        bursts_ref = self.get_records_ref(records).index.get_level_values(2)
         # use sequential processing as geocoding is well parallelized internally
-        for burst in tqdm(bursts, desc='Geocoding transform'):
-            burst_geocode(burst, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
+        for burst_ref in tqdm(bursts_ref, desc='Geocoding transform'):
+            burst_geocode(burst_ref, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
 
-    def transform(self):
+    def transform(self, records=None):
         from tqdm.auto import tqdm
-        import joblib
-
-        bursts = self.df.index.get_level_values(0).unique()
-        dates = self.df.index.get_level_values(1).unique()
+        #import joblib
 
         # # use parallel processing for simple bursts conversion
         # with self.tqdm_joblib(tqdm(desc='Geocoding bursts', total=len(bursts)*len(dates))) as progress_bar:
         #    joblib.Parallel(n_jobs=-1, backend=None)\
         #        (joblib.delayed(self.transform_slc)(burst, date) for burst in bursts for date in dates)
 
-        for burst in tqdm(bursts, desc='Geocoding bursts'):
-            for date in tqdm(dates, desc=f'Processing dates for burst {burst}', leave=False):
-                self.transform_slc(burst, date)
+        #bursts_rep = self.get_records_rep(records).index.get_level_values(2)
+        #bursts = self.df.index.get_level_values(2)
+        rep_ref_dict = self.get_records_rep_ref(records)
+        # process as repeat as reference bursts
+        rep_ref_dict = rep_ref_dict | dict(zip(rep_ref_dict.values(), rep_ref_dict.values()))
+        for burst_rep, burst_ref in tqdm(rep_ref_dict.items(), desc='Geocoding bursts'):
+            self.transform_slc(burst_rep, burst_ref)
 
-    def transform_slc(self, burst, date, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
+    def transform_slc(self, burst_rep, burst_ref, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
         import pandas as pd
         import numpy as np
         import xarray as xr
@@ -63,16 +62,16 @@ class S1_geocode(S1_align):
         import os
 
         if isinstance(phase, str) and phase == 'auto':
-            phase = self.topo_phase(burst, date, topo=topo)
+            phase = self.topo_phase(burst_rep, burst_ref, topo=topo)
         #dates = pd.DatetimeIndex(data.date).strftime('%Y-%m-%d')
 
         #print(f'transform_slc {burst} {date}')
         # get record
-        df = self.get_record(burst, date)
+        df = self.get_record(burst_rep)
 
         # get PRM parameters
-        prm_ref = self.PRM(burst)
-        prm_rep = self.PRM(burst, date)
+        prm_rep = self.PRM(burst_rep)
+        prm_ref = self.PRM(burst_ref)
 
         # read SLC data
         slc = prm_rep.read_SLC_int()
@@ -82,7 +81,7 @@ class S1_geocode(S1_align):
         #slc_complex = slc_complex.where(slc_complex != 0)
         del slc
         # reproject as a single complex variable
-        complex_proj = self.project(burst, slc_complex * np.exp(-1j * phase))
+        complex_proj = self.project(burst_rep, slc_complex * np.exp(-1j * phase))
         
         # do not apply scale to complex_proj to preserve projection attributes
         data_proj = self.spatial_ref(
@@ -115,14 +114,11 @@ class S1_geocode(S1_align):
                     value = value.wkt
                 data_proj.attrs[name] = value
 
-        # add date coordinate for stacking
-        data_proj['date'] = pd.Timestamp(date)
-
         if interactive:
             return data_proj
 
-        filename = os.path.join(self.basedir, burst, date.replace('-', '')+'.nc')
-        #print ('filename', filename)
+        prefix = self.get_prefix(burst_rep)
+        filename = os.path.join(self.basedir, prefix, f'{burst_rep}.nc')
         if os.path.exists(filename):
             os.remove(filename)
         #encoding = {'data': self._compression(data_proj.shape)}
@@ -251,12 +247,15 @@ class S1_geocode(S1_align):
         Get the inverse transform data:
         get_trans()
         """
-        prefix = self.get_prefix(burst, False)
-        return self.open_cube(prefix + 'trans')
+        import os
+
+        prefix = self.get_prefix(burst)
+        filename = os.path.join(prefix, 'trans')
+        return self.open_cube(filename)
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_trans(self, burst, dem='auto', resolution=(10, 2.5), coarsen='auto', epsg='auto', interactive=False):
+    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), coarsen='auto', epsg='auto', interactive=False):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -291,14 +290,17 @@ class S1_geocode(S1_align):
 
         # range, azimuth, elevation(ref to radius in PRM), look_E, look_N, look_U
         llt2ratlook_map = {0: 'rng', 1: 'azi', 2: 'ele', 3: 'look_E', 4: 'look_N', 5: 'look_U'}
+        #llt2ratlook_map = {0: 'rng', 1: 'azi', 2: 'ele'}
 
-        prm = self.PRM(burst)
+        prm = self.PRM(burst_ref)
         def SAT_llt2ratlook(lats, lons, zs):
             # for binary=True values outside of the scene missed and the array is not complete
             # 4th and 5th coordinates are the same as input lat, lon
             #print (f'SAT_llt2rat: lats={lats}, lons={lons}, zs={zs} ({lats.shape}, {lons.shape}, {zs.shape})')
             coords3d = np.column_stack([lons, lats, np.nan_to_num(zs)])
             rae = prm.SAT_llt2rat(coords3d, precise=1, binary=False).astype(np.float32).reshape(zs.size, 5)[...,:3]
+            #rae[~np.isfinite(zs), :] = np.nan
+            #return rae
             # look_E look_N look_U
             look = prm.SAT_look(coords3d, binary=True).astype(np.float32).reshape(zs.size, 6)[...,3:]
             out = np.concatenate([rae, look], axis=-1)
@@ -433,7 +435,7 @@ class S1_geocode(S1_align):
         if isinstance(epsg, str) and epsg == 'auto':
             epsg = self.get_utm_epsg(dem.lat.mean(), dem.lon.mean())
 
-        a_max, r_max = self.prm_offsets(burst)['extent']
+        a_max, r_max = prm.bounds()
         borders = {'amin': 0, 'amax': a_max, 'rmin': 0, 'rmax': r_max}
         #print ('borders', borders)
         
@@ -480,9 +482,10 @@ class S1_geocode(S1_align):
 
         if interactive:
             return trans
-        
-        prefix = self.get_prefix(burst, False)
-        self.save_cube(trans, prefix + 'trans', epsg, None)
+
+        prefix = self.get_prefix(burst_ref)
+        filename = os.path.join(prefix, 'trans')
+        self.save_cube(trans, filename, epsg, None)
         del trans
 
     def get_trans_inv(self, burst):
@@ -504,10 +507,13 @@ class S1_geocode(S1_align):
         Get the inverse transform data:
         get_trans_inv()
         """
-        prefix = self.get_prefix(burst, False)
-        return self.open_cube(prefix + 'trans_inv')
+        import os
 
-    def compute_trans_inv(self, burst, trans='auto', interactive=False):
+        prefix = self.get_prefix(burst)
+        filename = os.path.join(prefix, 'trans_inv')
+        return self.open_cube(filename)
+
+    def compute_trans_inv(self, burst_ref, trans='auto', interactive=False):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
             a NetCDF file for future use.
@@ -530,6 +536,7 @@ class S1_geocode(S1_align):
         import dask
         import xarray as xr
         import numpy as np
+        import os
         import warnings
         warnings.filterwarnings('ignore')
 
@@ -618,7 +625,7 @@ class S1_geocode(S1_align):
 
         if isinstance(trans, str) and trans == 'auto':
             # trans.dat - file generated by llt_grid2rat (r a topo lon lat)"
-            trans = self.get_trans(burst)
+            trans = self.get_trans(burst_ref)
 
         # calculate indices on the fly
         trans_blocks = trans[['azi', 'rng']].coarsen(y=self.netcdf_chunksize, x=self.netcdf_chunksize, boundary='pad')
@@ -642,7 +649,8 @@ class S1_geocode(S1_align):
         ll_blocks = np.array_split(trans['x'].values, np.arange(0, trans['x'].size, self.netcdf_chunksize)[1:])
 
         # split radar coordinate grid to equal chunks and rest
-        a_max, r_max = self.prm_offsets(burst)['extent']
+        prm = self.PRM(burst_ref)
+        a_max, r_max = prm.bounds()
         azis = np.arange(0.5, a_max, 1)
         rngs = np.arange(0.5, r_max, 1)
         #print ('azis', azis, 'rngs', rngs, 'sizes', azis.size, rngs.size)
@@ -673,5 +681,7 @@ class S1_geocode(S1_align):
         if interactive:
             return trans_inv
         
-        prefix = self.get_prefix(burst, False)
-        return self.save_cube(trans_inv, prefix + 'trans_inv', None, None)
+        prefix = self.get_prefix(burst_ref)
+        filename = os.path.join(prefix, 'trans_inv')
+        self.save_cube(trans_inv, filename, None, None)
+        del trans_inv

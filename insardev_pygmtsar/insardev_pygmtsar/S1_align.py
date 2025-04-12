@@ -107,28 +107,25 @@ class S1_align(S1_dem):
         import numpy as np
         import os
 
-        #reference_line = list(self.get_reference(burst).itertuples())[0]
-        #print (reference_line)
-
-        # for reference scene
         prefix = self.get_prefix(burst)
         path_prefix = os.path.join(self.basedir, prefix)
 
-        # generate PRM, LED, SLC
-        self._make_s1a_tops(burst, debug=debug)
+        if not os.path.isdir(path_prefix):
+            os.makedirs(path_prefix)
 
-        PRM.from_file(path_prefix + '.PRM')\
+        # generate PRM, LED, SLC
+        self._make_s1a_tops(burst, mode=1, debug=debug)
+
+        PRM.from_file(os.path.join(path_prefix, f'{burst}.PRM'))\
             .calc_dop_orb(inplace=True).update()
 
     # aligning for secondary image
-    def _align_rep(self, burst, date=None, degrees=12.0/3600, debug=False):
+    def _align_rep(self, burst_rep, burst_ref, degrees=12.0/3600, debug=False):
         """
         Align and stack secondary images.
 
         Parameters
         ----------
-        date : str or None, optional
-            Date of the image to process. If None, process all images. Default is None.
         degrees : float, optional
             Degrees per pixel resolution for the coarse DEM. Default is 12.0/3600.
         debug : bool, optional
@@ -140,7 +137,7 @@ class S1_align(S1_dem):
 
         Examples
         --------
-        stack.stack_rep(date='2023-05-01', degrees=15.0/3600, debug=True)
+        stack.stack_rep(degrees=15.0/3600, debug=True)
         """
         import xarray as xr
         import numpy as np
@@ -149,11 +146,16 @@ class S1_align(S1_dem):
         # temporary filenames to be removed
         cleanup = []
 
-        ref_prefix = self.get_prefix(burst)
-        rep_prefix = self.get_prefix(burst, date)
+        #ref_prefix = self.get_prefix(burst)
+        #rep_prefix = self.get_prefix(burst, date)
+
+        #burst_ref = self.get_reference(burst)
+
+        prefix = self.get_prefix(burst_ref)
+        #path_prefix = os.path.join(self.basedir, prefix)
 
         # define reference image parameters
-        earth_radius = self.PRM(burst).get('earth_radius')
+        earth_radius = self.PRM(burst_ref).get('earth_radius')
 
         # prepare coarse DEM for alignment
         # 12 arc seconds resolution is enough, for SRTM 90m decimation is 4x4
@@ -161,14 +163,14 @@ class S1_align(S1_dem):
         #topo_llt.shape
 
         # define relative filenames for PRM
-        rep_prm  = os.path.join(self.basedir, rep_prefix + '.PRM')
-        ref_prm  = os.path.join(self.basedir, ref_prefix + '.PRM')
+        rep_prm  = os.path.join(self.basedir, prefix, f'{burst_rep}.PRM')
+        ref_prm  = os.path.join(self.basedir, prefix, f'{burst_ref}.PRM')
 
         # TODO: define 1st image for line, in the example we have no more
         tmp_da = 0
 
         # generate PRM, LED
-        self._make_s1a_tops(burst, date, debug=debug)
+        self._make_s1a_tops(burst_rep, debug=debug)
 
         # compute the time difference between first frame and the rest frames
         t1, prf = PRM.from_file(rep_prm).get('clock_start', 'PRF')
@@ -243,9 +245,9 @@ class S1_align(S1_dem):
         # generate the image with point-by-point shifts
         # note: it removes calc_dop_orb parameters from PRM file
         # generate PRM, LED
-        self._make_s1a_tops(burst=burst, date=date, mode=1,
-                           rshift_fromfile=f'{rep_prefix}_r.grd',
-                           ashift_fromfile=f'{rep_prefix}_a.grd',
+        self._make_s1a_tops(burst_rep, mode=1,
+                           rshift_fromfile=f'{burst_rep}_r.grd',
+                           ashift_fromfile=f'{burst_rep}_a.grd',
                            debug=debug)
 
         # need to update shift parameter so stitch_tops will know how to stitch
@@ -264,7 +266,7 @@ class S1_align(S1_dem):
             os.remove(filename)
 
     # 'threading' for Docker and 'loky' by default
-    def align(self, bursts=None, dates=None, n_jobs=-1, degrees=12.0/3600, debug=False):
+    def align(self, records=None, n_jobs=-1, degrees=12.0/3600, debug=False):
         """
         Stack and align scenes.
 
@@ -291,11 +293,26 @@ class S1_align(S1_dem):
         # supress warnings about unary_union/union_all() future behaviour to replace None by empty collection
         warnings.filterwarnings('ignore')
 
-        if bursts is None:
-            bursts = self.df.index.get_level_values(0).unique()
-        if dates is None:
-            dates = self.df.index.get_level_values(1).unique()
-        dates_rep = [date for date in dates if date != self.reference]
+        # if records is None:
+        #     records = self.df
+        
+        # records_ref = self.get_records_ref(records)
+        # refs_dict = {}
+        # for record in records_ref.itertuples():
+        #     refs_dict[record.Index[:2]] = record.Index[2]
+        # #print ('refs_dict', refs_dict)
+        # records_rep = self.get_records_rep(records)
+        # reps_dict = {}
+        # for record in records_rep.itertuples():
+        #     reps_dict[record.Index[2]] = record.Index[:2]
+        # #print ('reps_dict', reps_dict)
+
+        rep_ref_dict = self.get_records_rep_ref(records)
+
+        # bursts_ref = records[records.startTime.dt.date.astype(str)==self.reference].index.get_level_values(2)
+        # print ('bursts_ref', bursts_ref)
+        # bursts_rep = records[records.startTime.dt.date.astype(str)!=self.reference].index.get_level_values(2)
+        # print ('bursts_rep', bursts_rep)
 
         if n_jobs is None or debug == True:
             print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
@@ -303,17 +320,13 @@ class S1_align(S1_dem):
         else:
             joblib_backend = None
 
-        # prepare reference scene
-        #self.stack_ref()
-        with self.tqdm_joblib(tqdm(desc='Preparing Reference', total=len(bursts))) as progress_bar:
+        # get list of unique sorted reference bursts
+        bursts_ref = sorted(set(rep_ref_dict.values()))
+        with self.tqdm_joblib(tqdm(desc='Preparing Reference', total=len(bursts_ref))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self._align_ref)(burst, debug=debug) for burst in bursts)
+                (joblib.delayed(self._align_ref)(burst_ref, debug=debug) for burst_ref in bursts_ref)
 
         # prepare secondary images
-        with self.tqdm_joblib(tqdm(desc='Aligning Repeat', total=len(dates_rep)*len(bursts))) as progress_bar:
-            # threading backend is the only one working inside Docker container to run multiple binaries in parallel
+        with self.tqdm_joblib(tqdm(desc='Aligning Repeat', total=len(rep_ref_dict))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self._align_rep)(burst, date, degrees=degrees, debug=debug) \
-                    for date in dates_rep for burst in bursts)
-
-        
+                (joblib.delayed(self._align_rep)(burst_rep, burst_ref, degrees=degrees, debug=debug) for burst_rep, burst_ref in rep_ref_dict.items())

@@ -9,7 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from insardev_toolkit import tqdm_dask
-from .datagrid import datagrid
+from insardev_toolkit import datagrid
 
 class dataset(datagrid):
 
@@ -41,7 +41,7 @@ class dataset(datagrid):
         filenames = filter(re.compile(name).match, os.listdir(basedir))
         return sorted([os.path.join(basedir, filename) for filename in filenames])
 
-    def get_filename(self, name, basedir='auto'):
+    def _get_filename(self, name, basedir='auto'):
         """
         Generate a NetCDF filename by appending .nc extension.
 
@@ -65,7 +65,7 @@ class dataset(datagrid):
         filename = os.path.join(basedir, f'{name}.nc')
         return filename
 
-    def get_filenames(self, pairs, name, basedir='auto'):
+    def _get_filenames(self, pairs, name, basedir='auto'):
         """
         Get the filenames of the data grids based on pairs and name parameters.
 
@@ -122,7 +122,7 @@ class dataset(datagrid):
                 filenames.append(filename)
         return filenames
 
-    def open_cube(self, name, basedir='auto'):
+    def cube_open(self, name, basedir='auto'):
         """
         Opens an xarray 2D/3D Dataset or DataArray from a NetCDF file.
 
@@ -153,7 +153,7 @@ class dataset(datagrid):
         import numpy as np
         import os
 
-        filename = self.get_filename(name, basedir=basedir)
+        filename = self._get_filename(name, basedir=basedir)
         assert os.path.exists(filename), f'ERROR: The NetCDF file is missed: {filename}'
 
         # Workaround: open the dataset without chunking
@@ -190,7 +190,7 @@ class dataset(datagrid):
 
         return data
 
-    def sync_cube(self, data, name=None, spatial_ref=None, caption='Syncing NetCDF 2D/3D Dataset', basedir='auto'):
+    def cube_sync(self, data, name=None, spatial_ref=None, caption='Syncing NetCDF 2D/3D Dataset', basedir='auto'):
         """
         Save and reload a 2D/3D xarray Dataset or DataArray to/from a NetCDF file.
 
@@ -226,10 +226,10 @@ class dataset(datagrid):
             name = data.name
         elif name is None:
             raise ValueError('Specify name for the output NetCDF file')
-        self.save_cube(data, name, spatial_ref, caption, basedir=basedir)
-        return self.open_cube(name, basedir=basedir)
+        self.cube_save(data, name, spatial_ref, caption, basedir=basedir)
+        return self.cube_open(name, basedir=basedir)
 
-    def save_cube(self, data, name=None, spatial_ref=None, caption='Saving NetCDF 2D/3D Dataset', basedir='auto'):
+    def cube_save(self, data, name=None, spatial_ref=None, caption='Saving NetCDF 2D/3D Dataset', basedir='auto'):
         """
         Save a lazy or non-lazy 2D/3D xarray Dataset or DataArray to a NetCDF file.
 
@@ -322,7 +322,7 @@ class dataset(datagrid):
         #print ('is_dask', is_dask, 'encoding', encoding)
 
         # save to NetCDF file
-        filename = self.get_filename(name, basedir=basedir)
+        filename = self._get_filename(name, basedir=basedir)
         if os.path.exists(filename):
             os.remove(filename)
         delayed = self.spatial_ref(data, spatial_ref).to_netcdf(filename,
@@ -337,7 +337,7 @@ class dataset(datagrid):
             del delayed, result
             import gc; gc.collect()
 
-    def delete_cube(self, name, basedir='auto'):
+    def cube_drop(self, name, basedir='auto'):
         """
         Delete a NetCDF cube file.
 
@@ -350,12 +350,12 @@ class dataset(datagrid):
         """
         import os
 
-        filename = self.get_filename(name, basedir=basedir)
+        filename = self._get_filename(name, basedir=basedir)
         #print ('filename', filename)
         if os.path.exists(filename):
             os.remove(filename)
 
-    def sync_stack(self, data, name=None, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=300):
+    def stack_sync(self, data, name=None, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=300):
         """
         Synchronize stack data by deleting existing files and saving new data.
 
@@ -387,11 +387,11 @@ class dataset(datagrid):
             name = data.name
         elif name is None:
             raise ValueError('Specify name for the output NetCDF files')
-        self.delete_stack(name, basedir=basedir)
-        self.save_stack(data, name, spatial_ref, caption, basedir=basedir, queue=queue, timeout=timeout)
-        return self.open_stack(name, basedir=basedir)
+        self.stack_drop(name, basedir=basedir)
+        self.stack_save(data, name, spatial_ref, caption, basedir=basedir, queue=queue, timeout=timeout)
+        return self.stack_open(name, basedir=basedir)
 
-    def open_stack(self, name, stack=None, basedir='auto'):
+    def stack_open(self, name, stack=None, basedir='auto'):
         """
         Open a stack of NetCDF files.
 
@@ -431,16 +431,16 @@ class dataset(datagrid):
 
         if stack is None:
             # look for all stack files
-            #filenames = self.get_filenames(['*'], name)[0]
-            #filenames = self.get_filename(f'{name}_????????_????????')
+            #filenames = self._get_filenames(['*'], name)[0]
+            #filenames = self._get_filename(f'{name}_????????_????????')
             # like data_20180323.nc or intf60m_20230114_20230219.nc
             filenames = self._glob_re(name + '[0-9]{8}(_[0-9]{8})*.nc', basedir=basedir)
         elif isinstance(stack, (list, tuple, np.ndarray)) and len(np.asarray(stack).shape) == 1:
             # dates
-            filenames = self.get_filenames(np.asarray(stack), name, basedir=basedir)
+            filenames = self._get_filenames(np.asarray(stack), name, basedir=basedir)
         else:
             # pairs
-            filenames = self.get_filenames(stack, name, basedir=basedir)
+            filenames = self._get_filenames(stack, name, basedir=basedir)
         #print ('filenames', filenames)
 
         data = xr.open_mfdataset(
@@ -489,7 +489,7 @@ class dataset(datagrid):
     
         return data
 
-    def save_stack(self, data, name, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=None):
+    def stack_save(self, data, name, spatial_ref=None, caption='Saving 2D Stack', basedir='auto', queue=None, timeout=None):
         """
         Save stack data to multiple 2D NetCDF files.
 
@@ -575,7 +575,7 @@ class dataset(datagrid):
             else:
                 stackvals = [ds[stackvar].item().split(' ') for ds in dss]
             # save to NetCDF file
-            filenames = self.get_filenames(stackvals, name, basedir=basedir)
+            filenames = self._get_filenames(stackvals, name, basedir=basedir)
             #[os.remove(filename) for filename in filenames if os.path.exists(filename)]
             delayeds = xr.save_mfdataset(self.spatial_ref(dss, spatial_ref),
                                          filenames,
@@ -604,7 +604,7 @@ class dataset(datagrid):
             # update chunks counter
             counter += len(chunk)
 
-    def delete_stack(self, name, basedir='auto'):
+    def stack_drop(self, name, basedir='auto'):
         """
         Delete all 2D NetCDF files in a stack.
 

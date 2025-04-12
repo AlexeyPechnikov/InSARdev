@@ -16,71 +16,9 @@ class Stack(Stack_export):
     netcdf_complevel = -1
 
     def __repr__(self):
-        return 'Object %s %d bursts %d dates' % (self.__class__.__name__, len(self.ds), len(self.ds[0].date))
+        return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
 
-    def to_dataset(self):
-        import numpy as np
-        import xarray as xr
-        data = xr.concat(xr.align(*self.ds, join='outer'), dim='stack_dim').mean('stack_dim')
-        return data
-
-    def __init__(self, basedir, pattern_burst='*_*_?W?', pattern_date = '[0-9]{8}\.nc'):
-        """
-        Initialize an instance of the Stack class.
-        """
-        #import numpy as np
-        import xarray as xr
-        import geopandas as gpd
-        import pandas as pd
-        from shapely import wkt
-        from tqdm.auto import tqdm
-        import joblib
-        import glob
-        import os
-
-        def read_netcdf_attributes(filename, attr_start='BPR'):
-            with xr.open_dataset(filename, engine=self.netcdf_engine_read, format=self.netcdf_format) as ds:
-                attrs = dict(ds.attrs)
-            # remove attributes before geometry
-            keys = list(attrs.keys())
-            idx = keys.index(attr_start)
-            attrs = {k: attrs[k] for k in keys[idx:]}
-            return attrs
-
-        self.basedir = basedir
-        
-        bursts = glob.glob(pattern_burst, root_dir=self.basedir)
-        filenames = []
-        for burst in bursts:
-            basedir = os.path.join(self.basedir, burst)
-            fnames = self._glob_re(pattern_date, basedir=basedir)
-            filenames.extend(fnames)
-            #print ('fnames', fnames)
-
-        with self.tqdm_joblib(tqdm(desc='TODO fnames', total=len(filenames))) as progress_bar:
-            attrs = joblib.Parallel(n_jobs=-1, backend=None)\
-                (joblib.delayed(read_netcdf_attributes)(filename) for filename in filenames)
-        #print ('attrs', attrs)
-
-        processed_attrs = []
-        for attr in attrs:
-            processed_attr = {}
-            for key, value in list(attr.items())[::-1]:
-                #print (key, value)
-                if hasattr(value, 'item'):
-                    processed_attr[key] = value.item()
-                elif key == 'geometry':
-                    processed_attr[key] = wkt.loads(value)
-                else:
-                    processed_attr[key] = value
-            processed_attrs.append(processed_attr)
-        df = gpd.GeoDataFrame(processed_attrs)
-        #df = df.sort_values(by=['fullBurstID', 'date']).set_index(['fullBurstID', 'date'])
-        df = df.sort_values(by=df.columns[:2].tolist()).set_index(df.columns[:2].tolist())
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        self.df = df
-
-    def to_dataframe(self):
+    def to_dataframe(self, id=None, date=None):
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -93,7 +31,164 @@ class Stack(Stack_export):
         --------
         df = stack.to_dataframe()
         """
-        return self.df
+
+        df = self.df
+        if id is not None:
+            df = df[df.index.get_level_values(0).isin([id] if isinstance(id, str) else id)]
+        if date is not None:
+            df = df[df.index.get_level_values(2).isin([date] if isinstance(date, str) else date)]
+        return df
+
+    def to_datasets(self, records=None):
+        import pandas as pd
+        #import numpy as np
+        #import xarray as xr
+        #data = xr.concat(xr.align(*self.dss, join='outer'), dim='stack_dim').mean('stack_dim')
+        #print ('to_dataset', records, dates)
+
+        if records is None:
+            # list of datasets
+            return self.dss
+            #if dates is None else [ds.sel(date=dates) for ds in self.dss]
+        
+        assert isinstance(records, pd.DataFrame)
+        
+        dss = []
+        for id in records.index.get_level_values(0).unique():
+            dates = records[records.index.get_level_values(0)==id].index.get_level_values(2).astype(str)
+            #print ('id', id, 'dates', dates)
+            ds = [ds for ds in self.dss if ds.id==id][0].sel(date=dates)
+            dss.append(ds)
+        return dss
+
+    def to_dataset(self, records=None):
+        dss = self.to_datasets(records)
+        if len(dss) > 1:
+            return self.to_datasets(records)[0]
+
+    def __init__(self, basedir, pattern_burst='*_*_?W?',
+                 pattern_date = 'S1_[0-9]+_IW[0-9]_[0-9]{8}T[0-9]{6}_[HV]{2}_.*-BURST\.nc',
+                 attr_start='BPR', debug=False):
+        import numpy as np
+        import xarray as xr
+        import pandas as pd
+        import geopandas as gpd
+        from shapely import wkt
+        import glob
+        import os
+
+        def ds_preprocess(ds, attr_start='BPR', debug=False):
+            process_attr = True if debug else False
+            for key in ds.attrs:
+                if key==attr_start:
+                    process_attr = True
+                if not process_attr and not key in ['SLC_scale']:
+                    continue
+                #print ('key', key)
+                if key not in ['Conventions', 'spatial_ref']:
+                    # Create a new DataArray with the original value
+                    ds[key] = xr.DataArray(ds.attrs[key], dims=[])
+                    # remove the attribute
+                    del ds.attrs[key]
+
+            #polarization = ds['polarization'].values.item(0)
+            scale = ds['SLC_scale'].values.item(0)
+            #print ('scale', scale)
+            ds['data'] = (scale*(ds.re + 1j*ds.im)).astype(np.complex64).where(ds.re != 0)
+            if not debug:
+                del ds['re'], ds['im'], ds['SLC_scale']
+            date = pd.to_datetime(ds['startTime'].item())
+            return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
+        
+        self.basedir = basedir
+
+        dss = []
+        bursts = glob.glob(pattern_burst, root_dir=self.basedir)
+        #print ('bursts', bursts)
+        for burst in bursts:
+            basedir = os.path.join(self.basedir, burst)
+            filenames = self._glob_re(pattern_date, basedir=basedir)
+            #print ('\tfilenames', filenames)
+            filename = os.path.join(basedir, f'trans.nc')
+
+            ds = xr.open_mfdataset(
+                filenames,
+                engine=self.netcdf_engine_read,
+                format=self.netcdf_format,
+                parallel=True,
+                concat_dim='date',
+                chunks={'date': 1, 'y': self.chunksize, 'x': self.chunksize},
+                combine='nested',
+                preprocess=ds_preprocess,
+            )
+
+            # in case of multiple polarizations, merge them into a single dataset
+            polarizations = np.unique(ds.polarization)
+            if len(polarizations) > 1:
+                datas = []
+                for polarization in polarizations:
+                    data = ds.isel(date=ds.polarization == polarization).rename({'data': polarization})
+                    del data['polarization'], data['burst']
+                    datas.append(data)
+                ds = xr.merge(datas)
+
+            trans = xr.open_dataset(filename, engine=self.netcdf_engine_read, format=self.netcdf_format)
+
+            #scale = data.attrs['SLC_scale']
+            #scale = ds['SLC_scale'].values.item(0)
+            #print ('scale', scale)
+            # Create complex data while preserving attributes
+            #ds_complex = self.spatial_ref(
+            #    (scale*(ds.re + 1j*ds.im)).astype(np.complex64).where(ds.re != 0).rename(burst),
+            #    ds
+            #).to_dataset(name='data')
+
+            #ds_complex.attrs.update(ds.attrs)
+
+            # for var in ds.data_vars:
+            #     if var not in ['re', 'im']:
+            #         ds_complex[var] = ds[var]
+            for var in trans.data_vars:
+                if var not in ['re', 'im']:
+                    ds[var] = trans[var]
+            del trans
+
+            #ds_complex.attrs = ds_complex.data.attrs
+            #ds_complex.data.attrs = {}
+            dss.append(ds.assign_attrs({'id': burst}))
+        self.dss = dss
+
+        # make attributes dataframe from datas
+        processed_attrs = []
+        for ds in dss:
+            #print (data.id)
+            attrs = [data_var for data_var in ds if ds[data_var].dims==('date',)][::-1]
+            attr_start_idx = attrs.index(attr_start)
+            for date_idx, date in enumerate(ds.date.values):
+                processed_attr = {}
+                for attr in attrs[:attr_start_idx+1]:
+                    value = ds[attr].item(date_idx)
+                    #print (attr, date_idx, date, value)
+                    processed_attr['date'] = date
+                    if hasattr(value, 'item'):
+                        processed_attr[attr] = value.item()
+                    elif attr == 'geometry':
+                        processed_attr[attr] = wkt.loads(value)
+                    else:
+                        processed_attr[attr] = value
+                processed_attrs.append(processed_attr)
+                #print (processed_attr)
+        df = gpd.GeoDataFrame(processed_attrs)
+        del df['date']
+        df['polarization'] = ','.join(polarizations)
+        burst_col = df.columns[0]
+        #print ('df.columns[0]', df.columns[0])
+        #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
+        df['startTime'] = pd.to_datetime(df['startTime'])
+        df['date'] = df['startTime'].dt.date.astype(str)
+        df = df.sort_values(by=[burst_col, 'polarization', 'date']).set_index([burst_col, 'polarization', 'date'])
+        
+        self.df = df
 
     # def baseline_table(self):
     #     import xarray as xr
@@ -142,3 +237,26 @@ class Stack(Stack_export):
                          baseline=df.rep_baseline - df.ref_baseline,
                          duration=(df['rep'] - df['ref']).dt.days,
                          rel=np.datetime64('nat'))
+
+    def plot(self, records=None):
+        import pandas as pd
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        if records is None:
+            records = self.df
+
+        df = records.reset_index()
+
+        df['label'] = df.apply(lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} {rec['date']} [{rec['pathNumber']}]", axis=1)
+        unique_labels = sorted(df['label'].unique())
+        unique_paths = sorted(df['pathNumber'].astype(str).unique())
+        colors = {label[-4:-1]: 'orange' if label[0] == 'A' else 'cyan' for i, label in enumerate(unique_labels)}
+        fig, ax = plt.subplots(figsize=(10, 8))
+        for label, group in df.groupby('label'):
+            group.plot(ax=ax, edgecolor=colors[label[-4:-1]], facecolor='none', linewidth=1, alpha=1, label=label)
+        handles = [matplotlib.lines.Line2D([0], [0], color=colors[label[-4:-1]], lw=1, label=label) for label in unique_labels]
+        ax.legend(handles=handles, loc='upper right')
+        ax.set_title('Sentinel-1 Burst Footprints')
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')

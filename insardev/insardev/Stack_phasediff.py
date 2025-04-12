@@ -13,34 +13,19 @@ from insardev_toolkit import tqdm_dask
 
 class Stack_phasediff(Stack_base):
 
-    def compute_interferogram(self, pairs, name, weight=None, topo=None, phase=None, method=None,
+    def interferogram(self, pairs, weight=None, phase=None,
                               resolution=None, wavelength=None, psize=None, coarsen=None, real=None,
-                              stack=None, queue=None, timeout=None,
-                              skip_exist=False, joblib_backend=None, debug=False):
+                              stack=None, debug=False):
         import xarray as xr
         import numpy as np
         import dask
-        # cleanup unused resources before start
-        import gc; gc.collect()
-    
-        if not skip_exist:
-            # delete stack files if exist
-            self.delete_stack(name)
     
         # define anti-aliasing filter for the specified output resolution
         if wavelength is None:
             wavelength = resolution
 
-        if isinstance(weight, str) and weight == 'auto':
-            weight = self.psfunction()
-        elif weight is not None:
-            weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
-
-        if queue is None:
-            queue = self.netcdf_queue
-        if queue is None:
-            # process all the pairs in a single operation
-            queue = len(pairs)
+        #if weight is not None:
+        #    weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
     
         # decimate the 1:4 multilooking grids to specified resolution
         if resolution is not None:
@@ -48,32 +33,16 @@ class Stack_phasediff(Stack_base):
         else:
             decimator = None
         
-        # Applying iterative processing to prevent Dask scheduler deadlocks.
-        counter = 0
-        digits = len(str(len(pairs)))
-        # Splitting all the pairs into chunks, each containing approximately queue pairs.
-        #n_chunks = len(pairs) // queue if len(pairs) >= queue else 1
-        if len(pairs) > queue:
-            chunks = [pairs[i:i + queue] for i in range(0, len(pairs), queue)]
-            n_chunks = len(chunks)
-        else:
-            chunks = [pairs]
-            n_chunks = 1
-        #for chunk in np.array_split(pairs, n_chunks):
-        for chunk in chunks:
-            #print (f'Interferogram pairs: {len(pairs)}')
-            chunk, dates = self.get_pairs(chunk, dates=True)
-            # load Sentinel-1 data
-            data = self.open_data(dates, debug=debug)
+        datas = []
+        for data in self.dss:
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
-            intensity = np.square(np.abs(data))
-            # Gaussian filtering 200m cut-off wavelength with optional range multilooking on Sentinel-1 amplitudes
+            intensity = np.square(np.abs(data.data if isinstance(data, xr.Dataset) else data))
+            # Gaussian filtering cut-off wavelength with optional range multilooking on Sentinel-1 amplitudes
             intensity_look = self.multilooking(intensity, wavelength=wavelength, coarsen=coarsen, debug=debug)
             del intensity
             # calculate phase difference with topography correction
-            phasediff = self.phasediff(chunk, data, topo=topo, phase=phase, method=method, joblib_backend=joblib_backend, debug=debug)
-            del data
+            phasediff = self.phasediff(pairs, data.data if isinstance(data, xr.Dataset) else data, phase=phase, debug=debug)
             # Gaussian filtering 200m cut-off wavelength with optional range multilooking
             phasediff_look = self.multilooking(phasediff, weight=weight,
                                                wavelength=wavelength, coarsen=coarsen, debug=debug)
@@ -97,12 +66,8 @@ class Stack_phasediff(Stack_base):
                 corr_look = corr_look.where(np.isfinite(weight_look))
                 del weight_look
                 
-            if real:
-                # convert complex phase difference to interferogram
-                intf_look = self.interferogram(phasediff_look, debug=debug)
-            else:
-                # output complex phase
-                intf_look = phasediff_look
+            # convert complex phase difference to interferogram
+            intf_look = self.phase2interferogram(phasediff_look, debug=debug)
             del phasediff_look
     
             # compute together because correlation depends on phase, and filtered phase depends on correlation.
@@ -113,44 +78,40 @@ class Stack_phasediff(Stack_base):
             if decimator is not None:
                 intf_dec = decimator(intf_look)
                 corr_dec = decimator(corr_look)
-                out = xr.merge([intf_dec, corr_dec])
+                ds = xr.merge([intf_dec, corr_dec])
                 del intf_dec, corr_dec
             else:
-                out = xr.merge([intf_look, corr_look])
+                ds = xr.merge([intf_look, corr_look])
             del corr_look, intf_look
 
             if isinstance(stack, xr.DataArray):
-                out = out.interp(y=stack.y, x=stack.x, method='nearest')
+                ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
 
-            caption = f'Saving Interferogram {(counter+1):0{digits}}...{(counter+len(chunk)):0{digits}} from {len(pairs)}'
-            self.save_stack(out, name, caption=caption, queue=queue, timeout=timeout)
-            counter += len(chunk)
-            del out, chunk, dates
+            datas.append(ds)
+            del ds
+        return datas
+
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
-    def compute_interferogram_singlelook(self, pairs, name, weight=None, topo='auto', phase=None,
-                                         wavelength=None, method='nearest', psize=None, real=True,
-                                         stack=None, queue=16, timeout=None,
-                                         skip_exist=False, joblib_backend=None, debug=False):
-        self.compute_interferogram(pairs, name, weight=weight, topo=topo, phase=phase, method=method,
-                                   wavelength=wavelength, psize=psize, real=real,
-                                   stack=stack, queue=queue, timeout=timeout,
-                                   skip_exist=skip_exist, joblib_backend=joblib_backend, debug=debug)
+    def interferogram_singlelook(self, pairs, weight=None, phase=None,
+                                         wavelength=None, psize=None,
+                                         stack=None, debug=False):
+        return self.interferogram(pairs, weight=weight, phase=phase,
+                                   wavelength=wavelength, psize=psize,
+                                   stack=stack, debug=debug)
 
     # Goldstein filter requires square grid cells means 1:4 range multilooking.
     # For multilooking interferogram we can use square grid always using coarsen = (1,4)
-    def compute_interferogram_multilook(self, pairs, name, weight=None, topo='auto', phase=None,
-                                        resolution=None, wavelength=None, method='nearest', psize=None, coarsen=(1,4), real=True,
-                                        stack=None, queue=16, timeout=None,
-                                        skip_exist=False, joblib_backend=None, debug=False):
-        self.compute_interferogram(pairs, name, weight=weight, topo=topo, phase=phase, method=method,
-                                   resolution=resolution,  wavelength=wavelength, psize=psize, coarsen=coarsen, real=real,
-                                   stack=stack, queue=queue, timeout=timeout,
-                                   skip_exist=skip_exist, joblib_backend=joblib_backend, debug=debug)
+    def interferogram_multilook(self, pairs, weight=None, phase=None,
+                                        resolution=None, wavelength=None, psize=None, coarsen=(1,4),
+                                        stack=None, debug=False):
+        return self.interferogram(pairs, weight=weight, phase=phase,
+                                   resolution=resolution,  wavelength=wavelength, psize=psize, coarsen=coarsen,
+                                   stack=stack, debug=debug)
 
     @staticmethod
-    def interferogram(phase, debug=False):
+    def phase2interferogram(phase, debug=False):
         import numpy as np
 
         if debug:
@@ -215,7 +176,7 @@ class Stack_phasediff(Stack_base):
         corr = xr.concat(stack, dim='pair')
         return self.spatial_ref(corr.rename('correlation'), phase)
 
-    def phasediff(self, pairs, data='auto', phase=None, debug=False):
+    def phasediff(self, pairs, data, phase=None, debug=False):
         import dask.array as da
         import xarray as xr
         import numpy as np
@@ -236,10 +197,6 @@ class Stack_phasediff(Stack_base):
         coord_ref = xr.DataArray(pd.to_datetime(pairs[:,0]), coords={'pair': coord_pair})
         coord_rep = xr.DataArray(pd.to_datetime(pairs[:,1]), coords={'pair': coord_pair})
 
-        if isinstance(data, str) and data == 'auto':
-            # open datafiles required for all the pairs
-            data = self.open_data(dates)
-
         # calculate phase difference
         data1 = data.sel(date=pairs[:,0]).drop_vars('date').rename({'date': 'pair'})
         data2 = data.sel(date=pairs[:,1]).drop_vars('date').rename({'date': 'pair'})
@@ -250,11 +207,11 @@ class Stack_phasediff(Stack_base):
             # convert real phase values to complex if needed 
             phase_correction = np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase
 
-        out = (phase_correction * data1 * data2.conj())\
+        da = (phase_correction * data1 * data2.conj())\
                .assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
         del phase_correction, data1, data2
         
-        return self.spatial_ref(out.rename('phase'), data)
+        return self.spatial_ref(da.rename('phase'), data)
 
     def goldstein(self, phase, corr, psize=32, debug=False):
         import xarray as xr
@@ -434,9 +391,16 @@ class Stack_phasediff(Stack_base):
         #self.plots_POI(fg, **kwargs)
 
     def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
+        import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
+
+        if isinstance(data, xr.Dataset):
+            data = data.phase
+
+        if data.dims == ('pair', 'y', 'x'):
+            data = data.isel(pair=0)
 
         if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
             data = data.unstack('stack')
@@ -473,8 +437,15 @@ class Stack_phasediff(Stack_base):
         #self.plots_POI(fg, **kwargs)
 
     def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
+        import xarray as xr
         import pandas as pd
         import matplotlib.pyplot as plt
+
+        if isinstance(data, xr.Dataset):
+            data = data.correlation
+
+        if data.dims == ('pair', 'y', 'x'):
+            data = data.isel(pair=0)
 
         if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
             data = data.unstack('stack')

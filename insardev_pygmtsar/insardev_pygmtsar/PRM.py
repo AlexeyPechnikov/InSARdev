@@ -859,3 +859,8 @@ class PRM(datagrid, PRM_gmtsar):
                        )
 
         return prm
+
+    def bounds(self):
+        maxx, yvalid, num_patch = self.get('num_rng_bins', 'num_valid_az', 'num_patches')
+        maxy = yvalid * num_patch
+        return [maxy, maxx]

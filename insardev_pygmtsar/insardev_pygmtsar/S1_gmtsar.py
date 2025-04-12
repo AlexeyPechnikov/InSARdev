@@ -12,7 +12,7 @@ from .PRM import PRM
 
 class S1_gmtsar(S1_prm):
 
-    def _ext_orb_s1a(self, burst, date=None, debug=False):
+    def _ext_orb_s1a(self, burst, debug=False):
         """
         Extracts orbital data for the Sentinel-1A satellite by running GMTSAR binary `ext_orb_s1a`.
 
@@ -33,28 +33,15 @@ class S1_gmtsar(S1_prm):
         import os
         import subprocess
 
-        if date is None or date == self.reference:
-            date == self.reference
-            df = self.get_reference(burst)
-        else:
-            df = self.get_repeat(burst, date)
-        #print ('df', df)
+        df = self.get_record(burst)
+        prefix = self.get_prefix(burst)
+        basedir = os.path.join(self.basedir, prefix)
 
-        prefix = self.get_prefix(burst, date)
-        #print ('prefix', prefix)
-        if os.path.dirname(prefix) == '':
-            basedir = self.basedir
-        else:
-            basedir = os.path.join(self.basedir, os.path.dirname(prefix))
-            prefix = os.path.basename(prefix)
-        #print ('basedir', basedir)
-
-        path = df['path'].iloc[0]
         orbit = df['orbit'].iloc[0]
-        orbitfile = os.path.join(path, orbit)
+        orbitfile = os.path.join(self.datadir, orbit)
         orbitfile = os.path.relpath(orbitfile, basedir)
 
-        argv = ['ext_orb_s1a', f'{prefix}.PRM', orbitfile, prefix]
+        argv = ['ext_orb_s1a', f'{burst}.PRM', orbitfile, burst]
         if debug:
             print ('DEBUG: argv', argv)
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8', cwd=basedir)
@@ -68,7 +55,7 @@ class S1_gmtsar(S1_prm):
 
     # produce LED and PRM in basedir
     # when date=None work on reference scene
-    def _make_s1a_tops(self, burst, date=None, mode=0, rshift_fromfile=None, ashift_fromfile=None, debug=False):
+    def _make_s1a_tops(self, burst, mode=0, rshift_fromfile=None, ashift_fromfile=None, debug=False):
         """
         Produces LED and PRM in the base directory by executing GMTSAR binary `make_s1a_tops`.
 
@@ -103,34 +90,29 @@ class S1_gmtsar(S1_prm):
         import os
         import subprocess
 
-        #or date == self.reference
-        if date is None:
-            date = self.reference
-            df = self.get_reference(burst)
-            # for reference image mode should be 1
-            mode = 1
-        else:
-            df = self.get_repeat(burst, date)
-        
-        prefix = self.get_prefix(burst, date)
-        if os.path.dirname(prefix) == '':
-            basedir = self.basedir
-        else:
-            basedir = os.path.join(self.basedir, os.path.dirname(prefix))
-            prefix = os.path.basename(prefix)
-            if rshift_fromfile is not None:
-                rshift_fromfile = os.path.basename(rshift_fromfile)
-            if ashift_fromfile is not None:
-                ashift_fromfile = os.path.basename(ashift_fromfile)
+        df = self.get_record(burst)
+        prefix = self.get_prefix(burst)
+        basedir = os.path.join(self.basedir, prefix)
 
-        name = df['burst'].iloc[0]
-        path = df['path'].iloc[0]
-        xmlfile = os.path.join(path, burst, 'annotation', name + '.xml')
+        # if os.path.dirname(prefix_path) == '':
+        #     basedir = self.basedir
+        # else:
+        #     basedir = os.path.join(self.basedir, os.path.dirname(prefix))
+        #     prefix = os.path.basename(prefix)
+        #     if rshift_fromfile is not None:
+        #         rshift_fromfile = os.path.basename(rshift_fromfile)
+        #     if ashift_fromfile is not None:
+        #         ashift_fromfile = os.path.basename(ashift_fromfile)
+
+        #basedir = os.path.join(self.basedir, os.path.dirname(prefix))
+        #print ('basedir', basedir)
+        xmlfile = os.path.join(self.datadir, prefix, 'annotation', f'{burst}.xml')
         xmlfile = os.path.relpath(xmlfile, basedir)
-        tiffile = os.path.join(path, burst, 'measurement', name + '.tiff')
+        tiffile = os.path.join(self.datadir, prefix, 'measurement', f'{burst}.tiff')
         tiffile = os.path.relpath(tiffile, basedir)
 
-        argv = ['make_s1a_tops', xmlfile, tiffile, prefix, str(mode)]
+        #argv = ['make_s1a_tops', xmlfile, tiffile, f'{prefix}/{burst}', str(mode)]
+        argv = ['make_s1a_tops', xmlfile, tiffile, burst, str(mode)]
         if rshift_fromfile is not None:
             argv.append(rshift_fromfile)
         if ashift_fromfile is not None:
@@ -144,7 +126,7 @@ class S1_gmtsar(S1_prm):
         if len(stdout_data) > 0 and debug:
             print ('DEBUG: make_s1a_tops', stdout_data)
 
-        self._ext_orb_s1a(burst, date, debug=debug)
+        self._ext_orb_s1a(burst, debug=debug)
 
         return
 

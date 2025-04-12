@@ -65,7 +65,7 @@ class S1_topo(S1_geocode):
         plt.ylabel('Azimuth')
         plt.title(caption)
 
-    def topo_phase(self, burst, date, topo='auto', grid=None, method='nearest'):
+    def topo_phase(self, burst_rep, burst_ref, topo='auto', grid=None, method='nearest'):
         """
         np.arctan2(np.sin(topo_phase), np.cos(topo_phase))[0].plot.imshow()
         """
@@ -82,7 +82,7 @@ class S1_topo(S1_geocode):
         warnings.filterwarnings('ignore', module='dask.core')
 
         if isinstance(topo, str) and topo == 'auto':
-            topo = self.get_topo(burst)
+            topo = self.get_topo(burst_ref)
 
         # calculate the combined earth curvature and topography correction
         def calc_drho(rho, topo, earth_radius, height, b, alpha, Bx):
@@ -185,16 +185,16 @@ class S1_topo(S1_geocode):
             #return phase_shift.astype(np.complex64)
             return phase_shift.astype(np.float32)
 
-        def prepare_prms(burst, date):
-            if date == self.reference:
+        def prepare_prms(burst_rep, burst_ref):
+            if burst_rep == burst_ref:
                 return (None, None)
-            prm1 = self.PRM(burst)
-            prm2 = self.PRM(burst, date)
-            prm2.set(prm1.SAT_baseline(prm2, tail=9)).fix_aligned()
-            prm1.set(prm1.SAT_baseline(prm1).sel('SC_height','SC_height_start','SC_height_end')).fix_aligned()
-            return (prm1, prm2)
+            prm_ref = self.PRM(burst_ref)
+            prm_rep = self.PRM(burst_rep)
+            prm_rep.set(prm_ref.SAT_baseline(prm_rep, tail=9)).fix_aligned()
+            prm_ref.set(prm_ref.SAT_baseline(prm_ref).sel('SC_height','SC_height_start','SC_height_end')).fix_aligned()
+            return (prm_ref, prm_rep)
 
-        prms = prepare_prms(burst, date)
+        prms = prepare_prms(burst_rep, burst_ref)
         # fill NaNs by 0 and expand to 3d
         topo2d = da.where(da.isnan(topo.data), 0, topo.data)
         out = da.blockwise(

@@ -15,9 +15,9 @@ class EOF(tqdm_joblib):
     from datetime import timedelta
 
     http_timeout = 30
-    #https://s1orbits.pechnikov.workers.dev/S1A/2014/04/07/index.csv
-    #https://s1orbits.pechnikov.workers.dev/S1A/2014/04/07/S1A_OPER_AUX_POEORB_OPOD_20210301T130653_V20140406T225944_20140408T005944.EOF.zip
-    orbits_url = 'https://s1orbits.pechnikov.workers.dev/{mission}/{year}/{month:02}/{day:02}/'
+    #https://s1orbits.insar.dev/S1A/2014/04/07/index.csv
+    #https://s1orbits.insar.dev/S1A/2014/04/07/S1A_OPER_AUX_POEORB_OPOD_20210301T130653_V20140406T225944_20140408T005944.EOF.zip
+    orbits_url = 'https://s1orbits.insar.dev/{mission}/{year}/{month:02}/{day:02}/'
     # see _select_orbit.py in sentineleof package
     #Orbital period of Sentinel-1 in seconds
     #T_ORBIT = (12 * 86400.0) / 175.0
@@ -83,10 +83,10 @@ class EOF(tqdm_joblib):
         if isinstance(scenes, pd.DataFrame):
             if skip_exist:
                 # ignore scenes with orbits
-                df_data = scenes[scenes.orbit.isnull()][['mission', 'datetime']].values
+                df_data = scenes[scenes.orbit.isnull()][['mission', 'startTime']].values
             else:
                 # process all the scenes
-                df_data = scenes[['mission', 'datetime']].values
+                df_data = scenes[['mission', 'startTime']].values
         elif isinstance(scenes, list):
             df_data = [(scene.split('_')[0], datetime.strptime(scene.split('_')[5],'%Y%m%dT%H%M%S')) for scene in scenes]
         else:
@@ -94,9 +94,9 @@ class EOF(tqdm_joblib):
         # nothing to do
         if len(df_data) == 0:
             return
-        df = pd.DataFrame(df_data, columns=['mission', 'datetime'])
-        df['date'] = df['datetime'].dt.date
-        df = df.groupby(['date', 'mission'])['datetime'].first().reset_index()
+        df = pd.DataFrame(df_data, columns=['mission', 'startTime'])
+        df['date'] = df['startTime'].dt.date
+        df = df.groupby(['date', 'mission'])['startTime'].first().reset_index()
         del df['date']
         
         def download_index(mission, dt, orbit_offset_start, orbit_offset_end):
@@ -171,7 +171,7 @@ class EOF(tqdm_joblib):
             orbits = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_with_retry)\
                                     (download_index, retries, timeout_second,
                                     mission=scene.mission,
-                                    dt=scene.datetime,
+                                    dt=scene.startTime,
                                     orbit_offset_start=EOF.orbit_offset_start,
                                     orbit_offset_end=EOF.orbit_offset_end) for scene in df.itertuples())
         # convert to dataframe for processing

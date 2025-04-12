@@ -211,7 +211,7 @@ class S1_dem(S1_tidal):
 
         # crop to reference scene extent
         geometry_auto = type(geometry) == str and geometry == 'auto'
-        bounds = self.get_bounds(self.get_reference() if geometry_auto else geometry)
+        bounds = self.get_bounds(self.df if geometry_auto else geometry)
         ortho = ortho\
                .transpose('lat','lon')\
                .sel(lat=slice(bounds[1] - self.buffer_degrees, bounds[3] + self.buffer_degrees),

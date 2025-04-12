@@ -12,7 +12,7 @@ from .PRM import PRM
 
 class S1_prm(S1_slc):
 
-    def PRM(self, burst, date=None):
+    def PRM(self, burst):
         """
         Open a PRM (Parameter) file.
 
@@ -30,27 +30,10 @@ class S1_prm(S1_slc):
         """
         import os
 
-        # TODO
-        assert len(burst)!=10, 'ERROR: mixed burst and date arguments (burst={burst} date={date})'
-
-        if date is None:
-            date == self.reference
-
-        prefix = self.get_prefix(burst, date)
-        filename = os.path.join(self.basedir, f'{prefix}.PRM')
+        prefix = self.get_prefix(burst)
+        #print ('PRM prefix', prefix)
+        filename = os.path.join(self.basedir, prefix, f'{burst}.PRM')
         #print ('PRM filename', filename)
         return PRM.from_file(filename)
 
-    def prm_offsets(self, burst, debug=False):
-        import xarray as xr
-        import numpy as np
-        from scipy import constants
-
-        prm = self.PRM(burst)
-        maxx, yvalid, num_patch = prm.get('num_rng_bins', 'num_valid_az', 'num_patches')
-        maxy = yvalid * num_patch
-        offsets = {'extent': [maxy, maxx]}
-        if debug:
-            print ('offsets', offsets)
-        return offsets
 
