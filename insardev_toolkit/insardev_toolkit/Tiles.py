@@ -245,8 +245,8 @@ class Tiles(datagrid, tqdm_joblib):
         Tiles().download_landmask(S1.scan_slc(DATADIR), 'landmask.nc')
         """
         return self.download(
-                         base_url       = 'https://gmtlandmask.pechnikov.workers.dev/{product}',
                          #base_url       = 'https://alexeypechnikov.github.io/gmtlandmask/{product}',
+                         base_url       = 'https://gmtlandmask.insar.dev/{product}',
                          path_id        = '{SN2}',
                          tile_id        = '{SN2}{WE3}.nc.gz',
                          archive        = 'gz',
@@ -274,7 +274,7 @@ class Tiles(datagrid, tqdm_joblib):
         assert product in ['1s', '3s'], f'ERROR: product name is invalid: {product} for Copernicus GLO DEM. Expected names are "1s", "3s".'
         return self.download(
                          #base_url       = 'https://copernicus-dem-{resolution}m.s3.amazonaws.com',
-                         base_url       = 'https://copernicusdem{product1}s.pechnikov.workers.dev',
+                         base_url       = 'https://copernicusdem{product1}s.insar.dev',
                          path_id        = 'Copernicus_DSM_COG_{product1}0_{SN2}_00_{WE3}_00_DEM',
                          tile_id        = 'Copernicus_DSM_COG_{product1}0_{SN2}_00_{WE3}_00_DEM.tif',
                          archive        = None,
@@ -301,7 +301,7 @@ class Tiles(datagrid, tqdm_joblib):
         assert product in ['1s'], f'ERROR: only product="1s" is supported for NASA SRTM DEM.'
         return self.download(
                          #base_url       = 'https://s3.amazonaws.com/elevation-tiles-prod/skadi',
-                         base_url       = 'https://srtmdem1s.pechnikov.workers.dev',
+                         base_url       = 'https://srtmdem1s.insar.dev',
                          path_id        = '{SN2}',
                          tile_id        = '{SN2}{WE3}.hgt.gz',
                          archive        = 'gz',
@@ -325,7 +325,7 @@ class Tiles(datagrid, tqdm_joblib):
             assert product in ['1s'], f'ERROR: only product="1s" is supported for JAXA ALOS DEM.'
             return self.download(
                              #base_url       = 'https://www.eorc.jaxa.jp/ALOS/aw3d30/data/release_v2404/',
-                             base_url       = 'https://alosdem1s.pechnikov.workers.dev',
+                             base_url       = 'https://alosdem1s.insar.dev',
                              path_id        = '{SN3x5alt}{WE3x5alt}',
                              tile_id        = '{SN3}{WE3}.zip',
                              file_id        = '{SN3}{WE3}/ALPSMLC30_{SN3}{WE3}_DSM.tif',
