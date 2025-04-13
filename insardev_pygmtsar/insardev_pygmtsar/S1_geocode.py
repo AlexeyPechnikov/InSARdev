@@ -12,7 +12,7 @@ from insardev_toolkit import tqdm_dask
 
 class S1_geocode(S1_align):
 
-    def geocode(self, records=None, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
+    def geocode(self, records=None, dem='auto', resolution=(15, 5), epsg='auto'):
         """
         Perform geocoding from radar to projected coordinates.
 
@@ -26,9 +26,6 @@ class S1_geocode(S1_align):
         resolution : tuple, optional
             The resolution in the azimuth and range direction.
             Default is (15, 5).
-        coarsen : int or (int, int), optional
-            The decimation factor in the azimuth and range direction.
-            Default is 'auto'.
         epsg : str, optional
             The EPSG code to use. If 'auto', the EPSG code will be computed.
             Default is 'auto'.
@@ -42,9 +39,9 @@ class S1_geocode(S1_align):
         #import joblib
 
         #print ('bursts', bursts)
-        def burst_geocode(burst_ref, dem, resolution, coarsen, epsg):
+        def burst_geocode(burst_ref, dem, resolution, epsg):
             #print ('burst', burst)
-            self.compute_trans(burst_ref, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
+            self.compute_trans(burst_ref, dem=dem, resolution=resolution, epsg=epsg)
             # do not save the grid
             #trans_inv = self.compute_trans_inv(burst, interactive=True)
             #topo = self.get_topo(burst, trans_inv)
@@ -55,7 +52,7 @@ class S1_geocode(S1_align):
         bursts_ref = self.get_records_ref(records).index.get_level_values(2)
         # use sequential processing as geocoding is well parallelized internally
         for burst_ref in tqdm(bursts_ref, desc='Geocoding transform'):
-            burst_geocode(burst_ref, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
+            burst_geocode(burst_ref, dem=dem, resolution=resolution, epsg=epsg)
 
     def transform(self, records=None, clean=True):
         """
@@ -315,7 +312,7 @@ class S1_geocode(S1_align):
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), coarsen='auto', epsg='auto', interactive=False):
+    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), epsg='auto', interactive=False):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -509,27 +506,25 @@ class S1_geocode(S1_align):
         dem_corners = dem[::dem.lat.size-1, ::dem.lon.size-1].compute()
         lats, lons = xr.broadcast(dem_corners.lat, dem_corners.lon)
         yy, xx = self.proj(lats, lons, from_epsg=4326, to_epsg=epsg)
-        y_min = np.min(resolution[0] * ((yy/resolution[0]).round() + 0.5))
-        y_max = np.max(resolution[0] * ((yy/resolution[0]).round() - 0.5))
-        x_min = np.min(resolution[1] * ((xx/resolution[1]).round() + 0.5))
-        x_max = np.max(resolution[1] * ((xx/resolution[1]).round() - 0.5))
-        ys = np.arange(y_min, y_max + resolution[0], resolution[0])
-        xs = np.arange(x_min, x_max + resolution[1], resolution[1])
+        dem_y_min = np.min(resolution[0] * ((yy/resolution[0]).round() + 0.5))
+        dem_y_max = np.max(resolution[0] * ((yy/resolution[0]).round() - 0.5))
+        dem_x_min = np.min(resolution[1] * ((xx/resolution[1]).round() + 0.5))
+        dem_x_max = np.max(resolution[1] * ((xx/resolution[1]).round() - 0.5))
+        #print ('dem_y_min', dem_y_min, 'dem_y_max', dem_y_max, 'dem_x_min', dem_x_min, 'dem_x_max', dem_x_max)
+        ys = np.arange(dem_y_min, dem_y_max + resolution[0], resolution[0])
+        xs = np.arange(dem_x_min, dem_x_max + resolution[1], resolution[1])
         #print ('ys', ys, 'xs', xs, 'sizes', ys.size, xs.size)
         
-        dem_spacing = ((y_max - y_min)/dem.lat.size, (x_max - x_min)/dem.lon.size)
+        dem_spacing = ((dem_y_max - dem_y_min)/dem.lat.size, (dem_x_max - dem_x_min)/dem.lon.size)
         #print (f'DEM spacing: {dem_spacing}')
-        if isinstance(coarsen, str) and coarsen == 'auto':
-            coarsen = (
-                max(1, int(np.round(dem_spacing[0]/resolution[0]))),
-                max(1, int(np.round(dem_spacing[1]/resolution[1])))
-            )
-        if not isinstance(coarsen, (str, list,tuple, np.ndarray)):
-            coarsen = (coarsen, coarsen)
-        #print ('coarsen', coarsen)
-        coarsen = [v if type(coarsen[0]) == int else np.round(coarsen[0]/resolution[0]) for v in coarsen]
-        #print (f'coarsen auto: {coarsen}')
 
+        # transform user-specified grid resolution to proccoarsen factor
+        coarsen = (
+            max(1, int(np.round(dem_spacing[0]/resolution[0]))),
+            max(1, int(np.round(dem_spacing[1]/resolution[1])))
+        )
+        #print ('coarsen', coarsen)
+        
         # estimate the radar extent on decimated grid
         decimation = 10
         trans_est = trans_blocks(ys[::decimation], xs[::decimation], self.netcdf_chunksize).compute()
@@ -541,6 +536,8 @@ class S1_geocode(S1_align):
         ys = ys[(ys>=y_min)&(ys<=y_max)]
         xs = xs[(xs>=x_min)&(xs<=x_max)]
         #print ('ys', ys, 'xs', xs, 'sizes', ys.size, xs.size)
+        #print ('ys[0]', ys[0], 'ys[-1]', ys[-1], 'xs[0]', xs[0], 'xs[-1]', xs[-1])
+        #print ('y pixels offset', (dem_y_min-ys[0])/resolution[0], 'x pixels offset', (dem_x_min-xs[0])/resolution[1])
         del trans_est
 
         # compute for the radar extent
