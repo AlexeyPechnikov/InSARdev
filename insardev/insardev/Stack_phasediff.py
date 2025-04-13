@@ -35,7 +35,7 @@ class Stack_phasediff(Stack_base):
             for pol in polarizations:
                 intfs, corrs = self.interferogram(pairs, weight=weight, phase=phase,
                                             resolution=resolution, wavelength=wavelength, psize=psize, coarsen=coarsen,
-                                            stack=stack, polarizations=pol, debug=debug)
+                                            stack=stack, polarizations=pol, compute=compute, debug=debug)
                 #print ('intfs', intfs)
                 intfs_total.append(intfs)
                 corrs_total.append(corrs)
@@ -57,11 +57,14 @@ class Stack_phasediff(Stack_base):
            # convert to lazy data
            weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
     
+        # Initialize decimators to None by default
+        decimator_intf = None
+        decimator_corr = None
+        
         # decimate the 1:4 multilooking grids to specified resolution
         if resolution is not None:
-            decimator = self.decimator(resolution=resolution, grid=coarsen, debug=debug)
-        else:
-            decimator = None
+            decimator_intf = self.decimator(resolution=resolution, grid=datas, coarsen=coarsen, wrap=True,  debug=debug)
+            decimator_corr = self.decimator(resolution=resolution, grid=datas, coarsen=coarsen, wrap=False, debug=debug)
         
         intfs = []
         corrs = []
@@ -106,9 +109,9 @@ class Stack_phasediff(Stack_base):
             # unpack results for a single interferogram
             #corr90m, intf90m = [grid[0] for grid in result]
             # anti-aliasing filter for the output resolution is applied above
-            if decimator is not None:
+            if decimator_intf is not None and decimator_corr is not None:
                 #ds = xr.merge([intf_dec, corr_dec])
-                das = (decimator(intf_look),  decimator(corr_look))
+                das = (decimator_intf(intf_look),  decimator_corr(corr_look))
             else:
                 #ds = xr.merge([intf_look, corr_look])
                 das = (intf_look,  corr_look)
@@ -123,22 +126,11 @@ class Stack_phasediff(Stack_base):
                 corrs.append(das[1].to_dataset(name=polarization))
             del das
 
-        compute = True
-        print ('compute', compute)
+        # clean up decimators after all iterations are complete
+        del decimator_intf, decimator_corr
+
         if compute:
-            print ('Compute Interferogram and Correlation')
-            tqdm_dask(result := dask.persist(intfs, corrs), desc='Compute Interferogram and Correlation')
-            print ()
-            print ()
-            print ()
-            print ()
-            print ()
-            print ('result', result)
-            print ()
-            print ()
-            print ()
-            print ()
-            print ()
+            tqdm_dask(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram and Correlation')
             del intfs, corrs
             return result
         return (intfs, corrs)
@@ -159,7 +151,7 @@ class Stack_phasediff(Stack_base):
                                         resolution=None, wavelength=None, psize=None, coarsen=(1,4),
                                         stack=None, polarizations=None, compute=False, debug=False):
         return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                   resolution=resolution,  wavelength=wavelength, psize=psize, coarsen=coarsen,
+                                   resolution=resolution, wavelength=wavelength, psize=psize, coarsen=coarsen,
                                    stack=stack, polarizations=polarizations, compute=compute, debug=debug)
 
     @staticmethod
@@ -378,35 +370,35 @@ class Stack_phasediff(Stack_base):
         # replace zeros produces in NODATA areas
         return self.spatial_ref(ds.where(ds).rename('phase'), phase)
 
-    def plot_phase(self, data, caption='Phase, [rad]',
-                   quantile=None, vmin=None, vmax=None, symmetrical=False,
-                   cmap='turbo', aspect=None, **kwargs):
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    # def plot_phase(self, data, caption='Phase, [rad]',
+    #                quantile=None, vmin=None, vmax=None, symmetrical=False,
+    #                cmap='turbo', aspect=None, **kwargs):
+    #     import numpy as np
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
 
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
+    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
+    #         data = data.unstack('stack')
 
-        if quantile is not None:
-            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
+    #     if quantile is not None:
+    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if quantile is not None:
-            vmin, vmax = np.nanquantile(data, quantile)
+    #     if quantile is not None:
+    #         vmin, vmax = np.nanquantile(data, quantile)
 
-        # define symmetrical boundaries
-        if symmetrical is True and vmax > 0:
-            minmax = max(abs(vmin), vmax)
-            vmin = -minmax
-            vmax =  minmax
+    #     # define symmetrical boundaries
+    #     if symmetrical is True and vmax > 0:
+    #         minmax = max(abs(vmin), vmax)
+    #         vmin = -minmax
+    #         vmax =  minmax
 
-        plt.figure()
-        data.plot.imshow(vmin=vmin, vmax=vmax, cmap=cmap)
-        #self.plot_AOI(**kwargs)
-        #self.plot_POI(**kwargs)
-        if aspect is not None:
-            plt.gca().set_aspect(aspect)
-        plt.title(caption)
+    #     plt.figure()
+    #     data.plot.imshow(vmin=vmin, vmax=vmax, cmap=cmap)
+    #     #self.plot_AOI(**kwargs)
+    #     #self.plot_POI(**kwargs)
+    #     if aspect is not None:
+    #         plt.gca().set_aspect(aspect)
+    #     plt.title(caption)
 
     def plot_phases(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
                     quantile=None, vmin=None, vmax=None, symmetrical=False, **kwargs):
@@ -466,7 +458,7 @@ class Stack_phasediff(Stack_base):
     #         plt.gca().set_aspect(aspect)
     #     plt.title(caption)
 
-    def plot_stack(self, data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
+    def plot_stack(self, data, polarizations, caption, cmap, limits, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
         import xarray as xr
         import numpy as np
         import pandas as pd
@@ -477,15 +469,24 @@ class Stack_phasediff(Stack_base):
                 da = data[polarization].isel(pair=slice(0, rows))
             else:
                 das = [da[polarization].isel(pair=slice(0, rows)) for da in data]
-                da = xr.concat(xr.align(*das, join='outer'), dim='stack_dim').mean('stack_dim')
+                if not wrap:
+                    # calculate mean for phase and correlation data
+                    da = xr.concat(xr.align(*das, join='outer'), dim='stack_dim').mean('stack_dim')
+                else:
+                    # calculate circular mean for interferogram data
+                    das_complex = [np.exp(1j * da) for da in das]
+                    da_complex = xr.concat(xr.align(*das_complex, join='outer'), dim='stack_dim').mean('stack_dim')
+                    da = np.arctan2(da_complex.imag, da_complex.real)
+                    del das_complex, da_complex
+                del das
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
                 da = da.unstack('stack')
             # multi-plots ineffective for linked lazy data
-            fg = (self.wrap(da) if wrap else da)\
+            fg = (self.wrap(da) if wrap else da).rename(caption)\
                 .plot.imshow(
                 col='pair',
                 col_wrap=cols, size=size, aspect=aspect,
-                vmin=-np.pi, vmax=np.pi, cmap=cmap
+                vmin=limits[0], vmax=limits[1], cmap=cmap
             )
             #fg.set_axis_labels('Range', 'Azimuth')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
@@ -506,9 +507,10 @@ class Stack_phasediff(Stack_base):
             plot_polarization(data, polarization=pol)
 
     def plot_interferogram(self, data, polarizations=None, caption='Phase, [rad]', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+        import numpy as np
         if isinstance(cmap, str) and cmap == 'auto':
             cmap='gist_rainbow_r'
-        self.plot_stack(data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, True, **kwargs)
+        self.plot_stack(data, polarizations, caption, cmap, (-np.pi, np.pi), cols, rows, size, nbins, aspect, y, True, **kwargs)
 
     def plot_correlation(self, data, polarizations=None, caption='Correlation', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
         import matplotlib.colors as mcolors
@@ -517,7 +519,7 @@ class Stack_phasediff(Stack_base):
                 name='custom_gray', 
                 colors=['black', 'whitesmoke']
             )
-        self.plot_stack(data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, False, **kwargs)
+        self.plot_stack(data, polarizations, caption, cmap, (0, 1), cols, rows, size, nbins, aspect, y, False, **kwargs)
 
     # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
     #     import xarray as xr

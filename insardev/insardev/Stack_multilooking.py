@@ -14,7 +14,7 @@ from .utils import utils
 class Stack_multilooking(Stack_phasediff):
 
     #decimator = lambda da: da.coarsen({'y': 2, 'x': 2}, boundary='trim').mean()
-    def decimator(self, grid, resolution=60, func='mean', debug=False):
+    def decimator(self, grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
         """
         Return function for pixel decimation to the specified output resolution.
 
@@ -46,7 +46,7 @@ class Stack_multilooking(Stack_phasediff):
         warnings.filterwarnings('ignore', module='dask')
         warnings.filterwarnings('ignore', module='dask.core')
 
-        dy, dx = self.get_spacing(grid)
+        dy, dx = self.get_spacing(grid, coarsen)
         yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
         if debug:
             print (f'DEBUG: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
@@ -83,9 +83,22 @@ class Stack_multilooking(Stack_phasediff):
                 #    raise ValueError(f"Unsupported function {func}. Should be 'mean','min','max','count', or 'sum'")
                 # return getattr(da.coarsen(coarsen_args, boundary='trim'), func)()\
                 #        .chunk({yname: self.chunksize, xname: self.chunksize})
-                return getattr(da.isel({yname: slice(y0, None), xname: slice(x0, None)})\
-                       .coarsen(coarsen_args, boundary='trim'), func)()\
-                       .chunk({yname: self.chunksize, xname: self.chunksize})
+                if wrap:
+
+                    # complex_das = [np.exp(1j * da) for da in das]
+                    # da_complex = xr.concat(xr.align(*complex_das, join='outer'), dim='stack_dim').mean('stack_dim')
+                    # da = np.arctan2(da_complex.imag, da_complex.real)
+                    da_complex = np.exp(1j * da.isel({yname: slice(y0, None), xname: slice(x0, None)}))
+                    da_complex_agg = getattr(da_complex\
+                           .coarsen(coarsen_args, boundary='trim'), func)()\
+                           .chunk({yname: self.chunksize, xname: self.chunksize})
+                    da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real)
+                    del da_complex, da_complex_agg
+                    return da_decimated
+                else:
+                    return getattr(da.isel({yname: slice(y0, None), xname: slice(x0, None)})\
+                           .coarsen(coarsen_args, boundary='trim'), func)()\
+                           .chunk({yname: self.chunksize, xname: self.chunksize})
 
         # return callback function and set common chunk size
         return lambda da: decimator(da)
