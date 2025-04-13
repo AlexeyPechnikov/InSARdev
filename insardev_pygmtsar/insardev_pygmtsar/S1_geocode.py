@@ -13,6 +13,26 @@ from insardev_toolkit import tqdm_dask
 class S1_geocode(S1_align):
 
     def geocode(self, records=None, dem='auto', resolution=(15, 5), coarsen='auto', epsg='auto'):
+        """
+        Perform geocoding from radar to projected coordinates.
+
+        Parameters
+        ----------
+        records : pandas.DataFrame, optional
+            The records to process. If None, all records will be processed.
+        dem : str, optional
+            The DEM to use. If 'auto', the DEM will be computed.
+            Default is 'auto'.
+        resolution : tuple, optional
+            The resolution in the azimuth and range direction.
+            Default is (15, 5).
+        coarsen : int or (int, int), optional
+            The decimation factor in the azimuth and range direction.
+            Default is 'auto'.
+        epsg : str, optional
+            The EPSG code to use. If 'auto', the EPSG code will be computed.
+            Default is 'auto'.
+        """
         import warnings
         # suppress Dask warning "RuntimeWarning: All-NaN slice encountered"
         warnings.filterwarnings('ignore')
@@ -37,7 +57,18 @@ class S1_geocode(S1_align):
         for burst_ref in tqdm(bursts_ref, desc='Geocoding transform'):
             burst_geocode(burst_ref, dem=dem, resolution=resolution, coarsen=coarsen, epsg=epsg)
 
-    def transform(self, records=None):
+    def transform(self, records=None, clean=True):
+        """
+        Perform geocoding from radar to projected coordinates.
+
+        Parameters
+        ----------
+        records : pandas.DataFrame, optional
+            The records to process. If None, all records will be processed.
+        clean : bool, optional
+            If True, the source SLC, LED and PRM files will be deleted.
+            Default is True.
+        """
         from tqdm.auto import tqdm
         #import joblib
 
@@ -52,14 +83,37 @@ class S1_geocode(S1_align):
         # process as repeat as reference bursts
         rep_ref_dict = rep_ref_dict | dict(zip(rep_ref_dict.values(), rep_ref_dict.values()))
         for burst_rep, burst_ref in tqdm(rep_ref_dict.items(), desc='Geocoding bursts'):
-            self.transform_slc(burst_rep, burst_ref)
+            self.transform_slc(burst_rep, burst_ref, clean=clean)
 
-    def transform_slc(self, burst_rep, burst_ref, topo='auto', phase='auto', scale=2.5e-07, interactive=False):
+    def transform_slc(self, burst_rep, burst_ref, topo='auto', phase='auto', scale=2.5e-07, clean=True, interactive=False):
+        """
+        Perform geocoding from radar to geographic coordinates.
+
+        Parameters
+        ----------
+        burst_rep : str
+            The repeat burst name.
+        burst_ref : str
+            The reference burst name.
+        topo : str, optional
+            The topographic data to use. If 'auto', the topographic data will be computed.
+            Default is 'auto'.
+        phase : str, optional
+            The topographic phase to use. If 'auto', the topographic phase will be computed.
+            Default is 'auto'.
+        scale : float, optional
+            The scale to use. Default is 2.5e-07.
+        clean : bool, optional
+            If True, the source SLC, LED and PRM files will be deleted.
+            Default is True.
+        interactive : bool, optional
+            If True, the computation will be performed interactively and the result will be returned as a delayed object.
+            Default is False.
+        """
         import pandas as pd
         import numpy as np
         import xarray as xr
         import dask
-        import os
 
         if isinstance(phase, str) and phase == 'auto':
             phase = self.topo_phase(burst_rep, burst_ref, topo=topo)
@@ -117,10 +171,7 @@ class S1_geocode(S1_align):
         if interactive:
             return data_proj
 
-        prefix = self.get_prefix(burst_rep)
-        filename = os.path.join(self.basedir, prefix, f'{burst_rep}.nc')
-        if os.path.exists(filename):
-            os.remove(filename)
+        filename = self.get_burstfile(burst_rep, clean=True)
         #encoding = {'data': self._compression(data_proj.shape)}
         encoding = {varname: self._compression(data_proj[varname].shape) for varname in data_proj.data_vars}
         #print ('encoding', encoding)
@@ -128,7 +179,11 @@ class S1_geocode(S1_align):
                             encoding=encoding,
                             engine=self.netcdf_engine_write,
                             format=self.netcdf_format)
-        
+
+        if clean:
+            for ext in ['SLC', 'LED', 'PRM']:                
+                self.get_burstfile(burst_rep, ext, clean=True)
+
     def project(self, burst, data, trans='auto'):
         """
         Perform geocoding from radar to geographic coordinates.
@@ -237,6 +292,9 @@ class S1_geocode(S1_align):
 
         Parameters
         ----------
+        burst : str
+            The burst name.
+
         Returns
         -------
         xarray.Dataset or list of xarray.Dataset
@@ -247,11 +305,13 @@ class S1_geocode(S1_align):
         Get the inverse transform data:
         get_trans()
         """
-        import os
-
-        prefix = self.get_prefix(burst)
-        filename = os.path.join(prefix, 'trans')
-        return self.open_cube(filename)
+        import xarray as xr
+        filename = self.get_filename(burst, 'trans')
+        return xr.open_dataset(filename,
+                               engine=self.netcdf_engine_read,
+                               format=self.netcdf_format,
+                               chunks=self.chunksize)
+        #return self.open_cube(filename)
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
@@ -266,8 +326,14 @@ class S1_geocode(S1_align):
 
         Parameters
         ----------
-        coarsen : int or (int, int)
-            The decimation factor in the azimuth and range direction.
+        burst_ref : str
+            The reference burst name.
+        dem : str, optional
+            The DEM to use. If 'auto', the DEM will be computed.
+            Default is 'auto'.
+        resolution : tuple, optional
+            The resolution in the azimuth and range direction.
+            Default is (10, 2.5).
 
         Returns
         -------
@@ -483,9 +549,12 @@ class S1_geocode(S1_align):
         if interactive:
             return trans
 
-        prefix = self.get_prefix(burst_ref)
-        filename = os.path.join(prefix, 'trans')
-        self.save_cube(trans, filename, epsg, None)
+        filename = self.get_filename(burst_ref, 'trans', clean=True)
+        encoding = {varname: self._compression(trans[varname].shape) for varname in trans.data_vars}
+        self.spatial_ref(trans, epsg).to_netcdf(filename,
+                        encoding=encoding,
+                        engine=self.netcdf_engine_write,
+                        format=self.netcdf_format)
         del trans
 
     def get_trans_inv(self, burst):
@@ -497,6 +566,9 @@ class S1_geocode(S1_align):
 
         Parameters
         ----------
+        burst : str
+            The burst name.
+
         Returns
         -------
         xarray.Dataset
@@ -507,11 +579,12 @@ class S1_geocode(S1_align):
         Get the inverse transform data:
         get_trans_inv()
         """
-        import os
-
-        prefix = self.get_prefix(burst)
-        filename = os.path.join(prefix, 'trans_inv')
-        return self.open_cube(filename)
+        import xarray as xr
+        filename = self.get_filename(burst, 'trans_inv')
+        return xr.open_dataset(filename,
+                               engine=self.netcdf_engine_read,
+                               format=self.netcdf_format,
+                               chunks=self.chunksize)
 
     def compute_trans_inv(self, burst_ref, trans='auto', interactive=False):
         """
@@ -523,6 +596,11 @@ class S1_geocode(S1_align):
 
         Parameters
         ----------
+        burst_ref : str
+            The reference burst name.
+        trans : str, optional
+            The transform data to use. If 'auto', the transform data will be computed.
+            Default is 'auto'.
         interactive : bool, optional
             If True, the computation will be performed interactively and the result will be returned as a delayed object.
             Default is False.
@@ -681,7 +759,10 @@ class S1_geocode(S1_align):
         if interactive:
             return trans_inv
         
-        prefix = self.get_prefix(burst_ref)
-        filename = os.path.join(prefix, 'trans_inv')
-        self.save_cube(trans_inv, filename, None, None)
+        filename = self.get_filename(burst_ref, 'trans_inv', clean=True)
+        encoding = {varname: self._compression(trans_inv[varname].shape) for varname in trans_inv.data_vars}
+        trans_inv.to_netcdf(filename,
+                        encoding=encoding,
+                        engine=self.netcdf_engine_write,
+                        format=self.netcdf_format)
         del trans_inv

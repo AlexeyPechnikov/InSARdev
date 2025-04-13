@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from insardev_toolkit import tqdm_joblib, tqdm_dask
-from .dataset import dataset
+from insardev_toolkit import datagrid
 
-class S1_base(tqdm_joblib, dataset):
+class S1_base(tqdm_joblib, datagrid):
 
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
@@ -30,58 +30,47 @@ class S1_base(tqdm_joblib, dataset):
         """
         return self.df
 
-#     def get_prefix(self, burst, date=None):
-#         """
-#         Get the path prefix for a burst and date combination.
-
-#         Parameters
-#         ----------
-#         burst : str
-#             The burst identifier.
-#         date : str, optional
-#             Date string in yyyy-mm-dd format. If None, uses reference date.
-#             If False, returns only burst path.
-
-#         Returns
-#         -------
-#         str
-#             Path prefix combining burst and date information.
-
-#         Examples
-#         --------
-#         Get prefix for burst '173_370325_IW1' and date '2022-01-20':
-#         prefix = stack.get_prefix('173_370325_IW1', '2022-01-20')
-#         """
-#         import os
-
-#         print ('get_prefix', burst, date)
-
-#         assert date is None or date is False or len(date)==10, f'ERROR: date format is not yyyy-mm-dd (burst={burst} date={date})'
-#         # TODO
-#         assert len(burst)!=10, 'ERROR: mixed burst and date arguments (burst={burst} date={date})'
-
-#         path = os.path.join(self.basedir, burst)
-#         if not os.path.isdir(path):
-#             os.makedirs(path)
-
-#         if date == False:
-#             return os.path.join(burst, '')
-            
-#         # use reference datetime if not defined
-# #         if date is None or date  == self.reference:
-# #             df = self.get_reference(burst)
-# #         else:
-# #             df = self.get_repeat(burst, date)    
-# #         name = df.burst.iloc[0]
-#         if date is None:
-#             date = self.reference
-#         df = self.get_record(burst, date)
-#         prefix = df.burst.iloc[0]
-#         return os.path.join(burst, prefix)
-
     def get_prefix(self, burst):
         df = self.get_record(burst)
         return df.index.get_level_values(0)[0]
+
+    def get_burstfile(self, burst, ext='nc', clean=False):
+        import os
+        prefix = self.get_prefix(burst)
+        filename = os.path.join(self.basedir, prefix, f'{burst}.{ext}')
+        #print ('get_burstfile', filename)
+        if clean:
+            if os.path.exists(filename):
+                os.remove(filename)
+        else:
+            if not os.path.exists(filename):
+                assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
+        return filename
+
+    def get_filename(self, burst, name, ext='nc', clean=False):
+        import os
+        prefix = self.get_prefix(burst)
+        filename = os.path.join(self.basedir, prefix, f'{name}.{ext}')
+        #print ('get_filename', filename)
+        if clean:
+            if os.path.exists(filename):
+                os.remove(filename)
+        else:
+            if not os.path.exists(filename):
+                assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
+        return filename
+   
+    def get_basename(self, burst):
+        import os
+        prefix = self.get_prefix(burst)
+        basename = os.path.join(self.basedir, prefix, burst)
+        return basename
+    
+    def get_dirname(self, burst):
+        import os
+        prefix = self.get_prefix(burst)
+        dirname = os.path.join(self.basedir, prefix)
+        return dirname
 
     def get_reference(self):
         """
@@ -116,45 +105,6 @@ class S1_base(tqdm_joblib, dataset):
         assert reference in self.df.startTime.dt.date.astype(str).values, f'Reference burst(s) not found: {reference}'
         self.reference = reference
         return self
-
-    # def get_reference(self, burst):
-    #     """
-    #     Return dataframe reference record.
-
-    #     Parameters
-    #     ----------
-    #     None
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame
-    #         The DataFrame containing reference record.
-    #     """
-    #     df = self.df.loc[[(burst, self.reference)]]
-    #     assert len(df) > 0, f'Reference record not found'
-    #     return df
-        
-    # def get_repeat(self, burst, date=None):
-    #     """
-    #     Return dataframe repeat records (excluding reference).
-
-    #     Parameters
-    #     ----------
-    #     date : datetime, optional
-    #         The date for which to return repeat records. If None, all dates are considered. Default is None.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame
-    #         The DataFrame containing repeat records for the specified date.
-    #     """
-    #     if date is None:
-    #         df_filtered = self.df[self.df.index.get_level_values(0) == burst]
-    #         idx_reference = self.df.index[self.df.index.get_level_values(1) == self.reference]
-    #         return df_filtered.loc[df_filtered.index.difference(idx_reference)]
-
-    #     assert not date == self.reference, f'ERROR: repeat date cannot be equal to reference date "{date}"'
-    #     return self.df.loc[[(burst, date)]]
 
     def get_record(self, burst):
         """
