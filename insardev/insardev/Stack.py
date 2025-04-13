@@ -44,7 +44,6 @@ class Stack(Stack_export):
         #import numpy as np
         #import xarray as xr
         #data = xr.concat(xr.align(*self.dss, join='outer'), dim='stack_dim').mean('stack_dim')
-        #print ('to_dataset', records, dates)
 
         if records is None:
             # list of datasets
@@ -77,7 +76,8 @@ class Stack(Stack_export):
         import glob
         import os
 
-        def ds_preprocess(ds, attr_start='BPR', debug=False):
+        # use oter variables attr_start, debug
+        def ds_preprocess(ds):
             process_attr = True if debug else False
             for key in ds.attrs:
                 if key==attr_start:
@@ -90,6 +90,11 @@ class Stack(Stack_export):
                     ds[key] = xr.DataArray(ds.attrs[key], dims=[])
                     # remove the attribute
                     del ds.attrs[key]
+            
+            # remove attributes for repeat bursts
+            BPR = ds['BPR'].values.item(0)
+            if BPR != 0:
+                ds.attrs = {}
 
             #polarization = ds['polarization'].values.item(0)
             scale = ds['SLC_scale'].values.item(0)
@@ -131,6 +136,8 @@ class Stack(Stack_export):
                     del data['polarization'], data['burst']
                     datas.append(data)
                 ds = xr.merge(datas)
+            else:
+                ds = ds.rename({'data': polarizations[0]})
 
             trans = xr.open_dataset(filename, engine=self.netcdf_engine_read, format=self.netcdf_format)
 

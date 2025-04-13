@@ -13,19 +13,49 @@ from insardev_toolkit import tqdm_dask
 
 class Stack_phasediff(Stack_base):
 
-    def interferogram(self, pairs, weight=None, phase=None,
-                              resolution=None, wavelength=None, psize=None, coarsen=None, real=None,
-                              stack=None, debug=False):
+    def interferogram(self, pairs, datas=None, weight=None, phase=None,
+                              resolution=None, wavelength=None, psize=None, coarsen=None,
+                              stack=None, polarizations=None, compute=False, debug=False):
         import xarray as xr
         import numpy as np
         import dask
-    
+
+        if datas is None:
+            # list of datasets to process
+            datas = self.dss
+
+        if polarizations is None:
+            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+        elif isinstance(polarizations, str):
+            polarizations = [polarizations]
+        
+        if len(polarizations) > 1:
+            intfs_total = []
+            corrs_total = []
+            for pol in polarizations:
+                intfs, corrs = self.interferogram(pairs, weight=weight, phase=phase,
+                                            resolution=resolution, wavelength=wavelength, psize=psize, coarsen=coarsen,
+                                            stack=stack, polarizations=pol, debug=debug)
+                #print ('intfs', intfs)
+                intfs_total.append(intfs)
+                corrs_total.append(corrs)
+                del intfs, corrs
+
+            intfs_total = [xr.merge([das[idx] for das in intfs_total]) for idx in range(len(intfs_total[0]))]
+            corrs_total = [xr.merge([das[idx] for das in corrs_total]) for idx in range(len(corrs_total[0]))]
+            #print ('intfs_total', intfs_total)
+            return (intfs_total, corrs_total)
+        
+        # process single polarization
+        polarization = polarizations[0] if isinstance(polarizations, (list, tuple)) else polarizations
+
         # define anti-aliasing filter for the specified output resolution
         if wavelength is None:
             wavelength = resolution
 
-        #if weight is not None:
-        #    weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
+        if weight is not None:
+           # convert to lazy data
+           weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
     
         # decimate the 1:4 multilooking grids to specified resolution
         if resolution is not None:
@@ -33,16 +63,17 @@ class Stack_phasediff(Stack_base):
         else:
             decimator = None
         
-        datas = []
-        for data in self.dss:
+        intfs = []
+        corrs = []
+        for data in datas:
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
-            intensity = np.square(np.abs(data.data if isinstance(data, xr.Dataset) else data))
+            intensity = np.square(np.abs(data[polarization]))
             # Gaussian filtering cut-off wavelength with optional range multilooking on Sentinel-1 amplitudes
             intensity_look = self.multilooking(intensity, wavelength=wavelength, coarsen=coarsen, debug=debug)
             del intensity
             # calculate phase difference with topography correction
-            phasediff = self.phasediff(pairs, data.data if isinstance(data, xr.Dataset) else data, phase=phase, debug=debug)
+            phasediff = self.phasediff(pairs, data[polarization], phase=phase, debug=debug)
             # Gaussian filtering 200m cut-off wavelength with optional range multilooking
             phasediff_look = self.multilooking(phasediff, weight=weight,
                                                wavelength=wavelength, coarsen=coarsen, debug=debug)
@@ -76,39 +107,60 @@ class Stack_phasediff(Stack_base):
             #corr90m, intf90m = [grid[0] for grid in result]
             # anti-aliasing filter for the output resolution is applied above
             if decimator is not None:
-                intf_dec = decimator(intf_look)
-                corr_dec = decimator(corr_look)
-                ds = xr.merge([intf_dec, corr_dec])
-                del intf_dec, corr_dec
+                #ds = xr.merge([intf_dec, corr_dec])
+                das = (decimator(intf_look),  decimator(corr_look))
             else:
-                ds = xr.merge([intf_look, corr_look])
+                #ds = xr.merge([intf_look, corr_look])
+                das = (intf_look,  corr_look)
             del corr_look, intf_look
 
             if isinstance(stack, xr.DataArray):
-                ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
+                #ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
+                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization))
+                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization))
+            else:
+                intfs.append(das[0].to_dataset(name=polarization))
+                corrs.append(das[1].to_dataset(name=polarization))
+            del das
 
-            datas.append(ds)
-            del ds
-        return datas
+        compute = True
+        print ('compute', compute)
+        if compute:
+            print ('Compute Interferogram and Correlation')
+            tqdm_dask(result := dask.persist(intfs, corrs), desc='Compute Interferogram and Correlation')
+            print ()
+            print ()
+            print ()
+            print ()
+            print ()
+            print ('result', result)
+            print ()
+            print ()
+            print ()
+            print ()
+            print ()
+            del intfs, corrs
+            return result
+        return (intfs, corrs)
 
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
-    def interferogram_singlelook(self, pairs, weight=None, phase=None,
+    def interferogram_singlelook(self, pairs, datas=None, weight=None, phase=None,
                                          wavelength=None, psize=None,
-                                         stack=None, debug=False):
-        return self.interferogram(pairs, weight=weight, phase=phase,
+                                         stack=None, polarizations=None, compute=False, debug=False):
+        return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
                                    wavelength=wavelength, psize=psize,
-                                   stack=stack, debug=debug)
+                                   stack=stack, polarizations=polarizations, compute=compute, debug=debug)
 
     # Goldstein filter requires square grid cells means 1:4 range multilooking.
     # For multilooking interferogram we can use square grid always using coarsen = (1,4)
-    def interferogram_multilook(self, pairs, weight=None, phase=None,
+    def interferogram_multilook(self, pairs, datas=None, weight=None, phase=None,
                                         resolution=None, wavelength=None, psize=None, coarsen=(1,4),
-                                        stack=None, debug=False):
-        return self.interferogram(pairs, weight=weight, phase=phase,
+                                        stack=None, polarizations=None, compute=False, debug=False):
+        return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
                                    resolution=resolution,  wavelength=wavelength, psize=psize, coarsen=coarsen,
-                                   stack=stack, debug=debug)
+                                   stack=stack, polarizations=polarizations, compute=compute, debug=debug)
 
     @staticmethod
     def phase2interferogram(phase, debug=False):
@@ -390,100 +442,104 @@ class Stack_phasediff(Stack_base):
         #self.plots_AOI(fg, **kwargs)
         #self.plots_POI(fg, **kwargs)
 
-    def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
+    # def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
+    #     import xarray as xr
+    #     import numpy as np
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
+
+    #     if isinstance(data, xr.Dataset):
+    #         data = data.phase
+
+    #     if data.dims == ('pair', 'y', 'x'):
+    #         data = data.isel(pair=0)
+
+    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
+    #         data = data.unstack('stack')
+
+    #     plt.figure()
+    #     self.wrap(self.interferogram(data) if np.issubdtype(data.dtype, np.complexfloating) else data)\
+    #         .plot.imshow(vmin=-np.pi, vmax=np.pi, cmap=cmap)
+    #     #self.plot_AOI(**kwargs)
+    #     #self.plot_POI(**kwargs)
+    #     if aspect is not None:
+    #         plt.gca().set_aspect(aspect)
+    #     plt.title(caption)
+
+    def plot_stack(self, data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
         import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
 
-        if isinstance(data, xr.Dataset):
-            data = data.phase
+        def plot_polarization(data, polarization):
+            if isinstance(data, xr.Dataset):
+                da = data[polarization].isel(pair=slice(0, rows))
+            else:
+                das = [da[polarization].isel(pair=slice(0, rows)) for da in data]
+                da = xr.concat(xr.align(*das, join='outer'), dim='stack_dim').mean('stack_dim')
+            if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
+                da = da.unstack('stack')
+            # multi-plots ineffective for linked lazy data
+            fg = (self.wrap(da) if wrap else da)\
+                .plot.imshow(
+                col='pair',
+                col_wrap=cols, size=size, aspect=aspect,
+                vmin=-np.pi, vmax=np.pi, cmap=cmap
+            )
+            #fg.set_axis_labels('Range', 'Azimuth')
+            fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
+            fg.fig.suptitle(f'{polarization} {caption}', y=y)            
+            #self.plots_AOI(fg, **kwargs)
+            #self.plots_POI(fg, **kwargs)
 
-        if data.dims == ('pair', 'y', 'x'):
-            data = data.isel(pair=0)
+        if not isinstance(data, (xr.Dataset, (list, tuple))):
+            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or list of xr.Dataset')
 
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
+        if polarizations is None:
+            polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
+        elif isinstance(polarizations, str):
+            polarizations = [polarizations]
 
-        plt.figure()
-        self.wrap(self.interferogram(data) if np.issubdtype(data.dtype, np.complexfloating) else data)\
-            .plot.imshow(vmin=-np.pi, vmax=np.pi, cmap=cmap)
-        #self.plot_AOI(**kwargs)
-        #self.plot_POI(**kwargs)
-        if aspect is not None:
-            plt.gca().set_aspect(aspect)
-        plt.title(caption)
+        # process polarizations one by one
+        for pol in polarizations:
+            plot_polarization(data, polarization=pol)
 
-    def plot_interferograms(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    def plot_interferogram(self, data, polarizations=None, caption='Phase, [rad]', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+        if isinstance(cmap, str) and cmap == 'auto':
+            cmap='gist_rainbow_r'
+        self.plot_stack(data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, True, **kwargs)
 
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
-
-        # multi-plots ineffective for linked lazy data
-        fg = self.wrap(self.interferogram(data) if np.issubdtype(data.dtype, np.complexfloating) else data)\
-            .plot.imshow(
-            col='pair',
-            col_wrap=cols, size=size, aspect=aspect,
-            vmin=-np.pi, vmax=np.pi, cmap='gist_rainbow_r'
-        )
-        #fg.set_axis_labels('Range', 'Azimuth')
-        fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-        fg.fig.suptitle(caption, y=y)
-        
-        #self.plots_AOI(fg, **kwargs)
-        #self.plots_POI(fg, **kwargs)
-
-    def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
-        import xarray as xr
-        import pandas as pd
-        import matplotlib.pyplot as plt
-
-        if isinstance(data, xr.Dataset):
-            data = data.correlation
-
-        if data.dims == ('pair', 'y', 'x'):
-            data = data.isel(pair=0)
-
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
-
-        plt.figure()
-        data.plot.imshow(vmin=0, vmax=1, cmap=cmap)
-        #self.plot_AOI(**kwargs)
-        #self.plot_POI(**kwargs)
-        if aspect is not None:
-            plt.gca().set_aspect(aspect)
-        plt.title(caption)
-
-    def plot_correlations(self, data, caption='Correlation', cmap='auto', cols=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    def plot_correlation(self, data, polarizations=None, caption='Correlation', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
         import matplotlib.colors as mcolors
-
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
-
         if isinstance(cmap, str) and cmap == 'auto':
             cmap = mcolors.LinearSegmentedColormap.from_list(
                 name='custom_gray', 
                 colors=['black', 'whitesmoke']
             )
+        self.plot_stack(data, polarizations, caption, cmap, cols, rows, size, nbins, aspect, y, False, **kwargs)
 
-        # multi-plots ineffective for linked lazy data
-        fg = data.plot.imshow(
-            col='pair',
-            col_wrap=cols, size=size, aspect=aspect,
-            vmin=0, vmax=1, cmap=cmap
-        )
-        #fg.set_axis_labels('Range', 'Azimuth')
-        fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-        fg.fig.suptitle(caption, y=y)
-        
-        #self.plots_AOI(fg, **kwargs)
-        #self.plots_POI(fg, **kwargs)
+    # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
+    #     import xarray as xr
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
+
+    #     if isinstance(data, xr.Dataset):
+    #         data = data.correlation
+
+    #     if data.dims == ('pair', 'y', 'x'):
+    #         data = data.isel(pair=0)
+
+    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
+    #         data = data.unstack('stack')
+
+    #     plt.figure()
+    #     data.plot.imshow(vmin=0, vmax=1, cmap=cmap)
+    #     #self.plot_AOI(**kwargs)
+    #     #self.plot_POI(**kwargs)
+    #     if aspect is not None:
+    #         plt.gca().set_aspect(aspect)
+    #     plt.title(caption)
 
     def plot_correlation_stack(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto', **kwargs):
         import numpy as np
