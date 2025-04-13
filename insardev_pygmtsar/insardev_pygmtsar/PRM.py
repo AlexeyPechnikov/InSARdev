@@ -14,22 +14,22 @@ class PRM(datagrid, PRM_gmtsar):
     
     int_types = ['num_valid_az', 'num_rng_bins', 'num_patches', 'bytes_per_line', 'good_bytes_per_line', 'num_lines','SC_identity']
 
-    @staticmethod
-    def SC_timestamp(SC_clock):
-        from datetime import datetime, timedelta
-
-        # extract year and Julian day with fractional part
-        year = int(SC_clock // 1000)
-        julian_day = SC_clock % 1000  # Keep fractional part of the day
-
-        # split integer Julian day and fractional day
-        integer_julian_day = int(julian_day)
-        fractional_day = julian_day - integer_julian_day
-
-        # convert integer and fraction parts of Julian day to datetime
-        timestamp = datetime(year, 1, 1) + timedelta(days=integer_julian_day) + timedelta(days=fractional_day)
-
-        return timestamp
+#    @staticmethod
+#    def SC_timestamp(SC_clock):
+#        from datetime import datetime, timedelta
+#
+#        # extract year and Julian day with fractional part
+#        year = int(SC_clock // 1000)
+#        julian_day = SC_clock % 1000  # Keep fractional part of the day
+#
+#        # split integer Julian day and fractional day
+#        integer_julian_day = int(julian_day)
+#        fractional_day = julian_day - integer_julian_day
+#
+#        # convert integer and fraction parts of Julian day to datetime
+#        timestamp = datetime(year, 1, 1) + timedelta(days=integer_julian_day) + timedelta(days=fractional_day)
+#
+#        return timestamp
 
     @staticmethod
     def to_numeric_or_original(val):
@@ -391,60 +391,60 @@ class PRM(datagrid, PRM_gmtsar):
             return out[0]
         return out
 
-    def shift_atime(self, lines, inplace=False):
-        """
-        Shift time in azimuth by a number of lines.
+#    def shift_atime(self, lines, inplace=False):
+#        """
+#        Shift time in azimuth by a number of lines.
+#
+#        Parameters
+#        ----------
+#        lines : float
+#            The number of lines to shift by.
+#        inplace : bool, optional
+#            Whether to modify the PRM object in-place. Default is False.
+#
+#        Returns
+#        -------
+#        PRM
+#            The shifted PRM object or DataFrame. If 'inplace' is True, returns modified PRM object,
+#            otherwise, returns a new PRM with shifted times.
+#        """
+#        prm = self.sel('clock_start','clock_stop','SC_clock_start','SC_clock_stop') + lines/self.get('PRF')/86400.0
+#        if inplace:
+#            return self.set(prm)
+#        else:
+#            return prm
 
-        Parameters
-        ----------
-        lines : float
-            The number of lines to shift by.
-        inplace : bool, optional
-            Whether to modify the PRM object in-place. Default is False.
-
-        Returns
-        -------
-        PRM
-            The shifted PRM object or DataFrame. If 'inplace' is True, returns modified PRM object,
-            otherwise, returns a new PRM with shifted times.
-        """
-        prm = self.sel('clock_start','clock_stop','SC_clock_start','SC_clock_stop') + lines/self.get('PRF')/86400.0
-        if inplace:
-            return self.set(prm)
-        else:
-            return prm
-
-    def diff(self, other, gformat=True):
-        """
-        Compare the PRM object with another PRM object and return the differences.
-
-        Parameters
-        ----------
-        other : PRM
-            The other PRM object to compare with.
-        gformat : bool, optional
-            Whether to use 'g' format for float values. Default is True.
-
-        Returns
-        -------
-        pd.DataFrame
-            A DataFrame containing the differences between the two PRM objects.
-        """
-        import pandas as pd
-        import numpy as np
-
-        if not isinstance(other, PRM):
-            raise Exception('Argument should be PRM class instance')
-
-        df1 = self.df.copy()
-        df2 = other.df.copy()
-
-        if gformat:
-            fmt = lambda v: format(v, 'g') if type(v) in [float, np.float16, np.float32, np.float64] else v
-            df1['value'] = [fmt(value) for value in df1['value']]
-            df2['value'] = [fmt(value) for value in df2['value']]
-
-        return pd.concat([df1, df2]).drop_duplicates(keep=False)
+#    def diff(self, other, gformat=True):
+#        """
+#        Compare the PRM object with another PRM object and return the differences.
+#
+#        Parameters
+#        ----------
+#        other : PRM
+#            The other PRM object to compare with.
+#        gformat : bool, optional
+#            Whether to use 'g' format for float values. Default is True.
+#
+#        Returns
+#        -------
+#        pd.DataFrame
+#            A DataFrame containing the differences between the two PRM objects.
+#        """
+#        import pandas as pd
+#        import numpy as np
+#
+#        if not isinstance(other, PRM):
+#            raise Exception('Argument should be PRM class instance')
+#
+#        df1 = self.df.copy()
+#        df2 = other.df.copy()
+#
+#        if gformat:
+#            fmt = lambda v: format(v, 'g') if type(v) in [float, np.float16, np.float32, np.float64] else v
+#            df1['value'] = [fmt(value) for value in df1['value']]
+#            df2['value'] = [fmt(value) for value in df2['value']]
+#
+#        return pd.concat([df1, df2]).drop_duplicates(keep=False)
 
     def fix_aligned(self):
         """
