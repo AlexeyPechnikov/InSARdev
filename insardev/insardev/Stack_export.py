@@ -458,7 +458,7 @@ class Stack_export(Stack_ps):
         filename = f'{name}.nc'
         if os.path.exists(filename):
             os.remove(filename)
-        encoding = {data.name: self._compression(grid.shape)}
+        encoding = {data.name: self.get_compression(grid.shape)}
         delayed = grid.to_netcdf(filename, engine=engine, encoding=encoding, format=format, compute=False)
         tqdm_dask(dask.persist(delayed), desc=caption)
         del grid

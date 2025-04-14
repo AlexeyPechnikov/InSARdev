@@ -56,7 +56,7 @@ class datagrid:
     basedir = '.'
 
     # define lost class variables due to joblib via arguments
-    def _compression(self, shape=None, chunksize=None):
+    def get_compression(self, shape=None, chunksize=None):
         """
         Return the compression options for a data grid.
 
@@ -415,67 +415,6 @@ class datagrid:
         #print ('bounds', bounds)
         #lon_start, lat_start, lon_end, lat_end
         return bounds
-
-    @staticmethod
-    def calculate_coarsen_start(da, name, spacing, grid_factor=1):
-        """
-        Calculate start coordinate to align coarsened grids.
-        
-        Parameters
-        ----------
-        da : xarray.DataArray
-            Input data array
-        name : str
-            Coordinate name to align
-        spacing : int
-            Coarsening spacing
-        grid_factor : int, optional
-            Grid factor for alignment, default is 1
-            
-        Returns
-        -------
-        int or None
-            Start index for optimal alignment, or None if no good alignment found
-        """
-        import numpy as np
-        
-        # get coordinate values
-        coords = da[name].values
-        if len(coords) < spacing:
-            print(f'calculate_coarsen_start: Not enough points for spacing {spacing}')
-            return None
-            
-        # calculate coordinate differences
-        diffs = np.diff(coords)
-        if not np.allclose(diffs, diffs[0], rtol=1e-5):
-            print(f'calculate_coarsen_start: Non-uniform spacing detected for {name}')
-            return None
-            
-        # calculate target spacing
-        target_spacing = diffs[0] * spacing * grid_factor
-        
-        # find best alignment point
-        best_offset = None
-        min_error = float('inf')
-        
-        for i in range(spacing):
-            # get coarsened coordinates
-            coarse_coords = coords[i::spacing]
-            if len(coarse_coords) < 2:
-                continue
-                
-            # calculate alignment error
-            error = np.abs(coarse_coords[0] % target_spacing)
-            if error < min_error:
-                min_error = error
-                best_offset = i
-                
-        if best_offset is not None:
-            #print(f'calculate_coarsen_start: {name} spacing={spacing} grid_factor={grid_factor} => {best_offset} (error={min_error:.2e})')
-            return best_offset
-            
-        print(f'calculate_coarsen_start: No good alignment found for {name}')
-        return None
 
     # Xarray's interpolation can be inefficient for large grids;
     # this custom function handles the task more effectively.

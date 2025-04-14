@@ -372,6 +372,68 @@ class Stack_phasediff(Stack_base):
         # replace zeros produces in NODATA areas
         return self.spatial_ref(ds.where(ds).rename('phase'), phase)
 
+    def xarray_align_concat(self, datas, wrap=False):
+        """
+        This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
+        xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
+        """
+        import xarray as xr
+        import numpy as np
+        import dask
+
+        if len(datas) == 0:
+            return None
+        elif len(datas) == 1:
+            return datas[0]
+
+        # define unified grid
+        y_min = min(ds.y.min().item() for ds in datas)
+        y_max = max(ds.y.max().item() for ds in datas)
+        x_min = min(ds.x.min().item() for ds in datas)
+        x_max = max(ds.x.max().item() for ds in datas)
+        #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
+        pair = datas[0]['pair']
+        dy = datas[0].y.diff('y').item(0)
+        dx = datas[0].x.diff('x').item(0)
+        #print ('dy, dx', dy, dx)
+        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y']).chunk({'y': self.chunksize})
+        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x']).chunk({'x': self.chunksize})
+        #print ('pair', pair)
+        #print ('ys', ys)
+        #print ('xs', xs)
+        
+        # use outer variable datas
+        def block_dask(pair, y_chunk, x_chunk):
+            #print ('pair', pair)
+            das_slice = [da.sel(y=slice(y_chunk.min(), y_chunk.max()), x=slice(x_chunk.min(), x_chunk.max())).compute(num_workers=1) for da in datas]
+            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=np.nan, copy=False) for da in das_slice if da.y.size > 0 and da.x.size > 0]
+            del das_slice
+            if len(das_block) == 0:
+                # return empty block
+                return np.full((pair.size, y_chunk.size, x_chunk.size), np.nan, dtype=datas[0].dtype)
+            if len(das_block) == 1:
+                # return single block as is
+                return das_block[0].values
+            if not wrap:
+                # calculate arithmetic mean for phase and correlation data
+                return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
+            else:
+                # calculate circular mean for interferogram data
+                block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
+                return np.arctan2(block_complex.imag, block_complex.real)
+
+        data = dask.array.blockwise(
+            block_dask,
+            'zyx',
+            pair, 'z',
+            ys, 'y',
+            xs, 'x',
+            dtype=datas[0].dtype
+        )
+        da = xr.DataArray(data, coords={'pair': pair, 'y': ys, 'x': xs}).rename(datas[0].name)
+        del data
+        return da
+
     # def plot_phase(self, data, caption='Phase, [rad]',
     #                quantile=None, vmin=None, vmax=None, symmetrical=False,
     #                cmap='turbo', aspect=None, **kwargs):
@@ -402,39 +464,39 @@ class Stack_phasediff(Stack_base):
     #         plt.gca().set_aspect(aspect)
     #     plt.title(caption)
 
-    def plot_phases(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
-                    quantile=None, vmin=None, vmax=None, symmetrical=False, **kwargs):
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    # def plot_phases(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
+    #                 quantile=None, vmin=None, vmax=None, symmetrical=False, **kwargs):
+    #     import numpy as np
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
 
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
+    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
+    #         data = data.unstack('stack')
 
-        if quantile is not None:
-            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
+    #     if quantile is not None:
+    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if quantile is not None:
-            vmin, vmax = np.nanquantile(data, quantile)
+    #     if quantile is not None:
+    #         vmin, vmax = np.nanquantile(data, quantile)
 
-        # define symmetrical boundaries
-        if symmetrical is True and vmax > 0:
-            minmax = max(abs(vmin), vmax)
-            vmin = -minmax
-            vmax =  minmax
+    #     # define symmetrical boundaries
+    #     if symmetrical is True and vmax > 0:
+    #         minmax = max(abs(vmin), vmax)
+    #         vmin = -minmax
+    #         vmax =  minmax
 
-        # multi-plots ineffective for linked lazy data
-        fg = data.plot.imshow(
-            col='pair',
-            col_wrap=cols, size=size, aspect=aspect,
-            vmin=vmin, vmax=vmax, cmap='turbo'
-        )
-        #fg.set_axis_labels('Range', 'Azimuth')
-        fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-        fg.fig.suptitle(caption, y=y)
+    #     # multi-plots ineffective for linked lazy data
+    #     fg = data.plot.imshow(
+    #         col='pair',
+    #         col_wrap=cols, size=size, aspect=aspect,
+    #         vmin=vmin, vmax=vmax, cmap='turbo'
+    #     )
+    #     #fg.set_axis_labels('Range', 'Azimuth')
+    #     fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
+    #     fg.fig.suptitle(caption, y=y)
         
-        #self.plots_AOI(fg, **kwargs)
-        #self.plots_POI(fg, **kwargs)
+    #     #self.plots_AOI(fg, **kwargs)
+    #     #self.plots_POI(fg, **kwargs)
 
     # def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
     #     import xarray as xr
@@ -460,41 +522,62 @@ class Stack_phasediff(Stack_base):
     #         plt.gca().set_aspect(aspect)
     #     plt.title(caption)
 
-    def plot_stack(self, data, polarizations, caption, cmap, limits, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
+    def plot_stack(self, data, polarizations,
+                   cmap, vmin, vmax, quantile, symmetrical,
+                   caption, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
         import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
+        # screen size in pixels (width, height) to estimate reasonable number pixels per plot
+        screen_size = (4000,2000)
 
         def plot_polarization(data, polarization):
             if isinstance(data, xr.Dataset):
                 da = data[polarization].isel(pair=slice(0, rows))
             else:
                 das = [da[polarization].isel(pair=slice(0, rows)) for da in data]
-                if not wrap:
-                    # calculate mean for phase and correlation data
-                    da = xr.concat(xr.align(*das, join='outer'), dim='stack_dim').mean('stack_dim')
-                else:
-                    # calculate circular mean for interferogram data
-                    das_complex = [np.exp(1j * da) for da in das]
-                    da_complex = xr.concat(xr.align(*das_complex, join='outer'), dim='stack_dim').mean('stack_dim')
-                    da = np.arctan2(da_complex.imag, da_complex.real)
-                    del das_complex, da_complex
+                da = self.xarray_align_concat(das, wrap=wrap)
                 del das
+
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
                 da = da.unstack('stack')
+            
+            # there is no reason to plot huge arrays much larger than screen size for small plots
+            #print ('screen_size', screen_size)
+            size_y, size_x = da.shape[1:]
+            #print ('size_x, size_y', size_x, size_y)
+            factor_y = int(np.round(size_y / (screen_size[1] / rows)))
+            factor_x = int(np.round(size_x / (screen_size[0] / cols)))
+            #print ('factor_x, factor_y', factor_x, factor_y)
+            # decimate and materialize data for all the calculations and plotting
+            da = da[:,::factor_y,::factor_x].compute()
+
+            # calculate min, max when needed
+            if quantile is not None:
+                _vmin, _vmax = np.nanquantile(da, quantile)
+            else:
+                _vmin, _vmax = vmin, vmax
+            # define symmetrical boundaries
+            if symmetrical is True and _vmax > 0:
+                minmax = max(abs(_vmin), _vmax)
+                _vmin = -minmax
+                _vmax =  minmax
             # multi-plots ineffective for linked lazy data
             fg = (self.wrap(da) if wrap else da).rename(caption)\
                 .plot.imshow(
                 col='pair',
                 col_wrap=cols, size=size, aspect=aspect,
-                vmin=limits[0], vmax=limits[1], cmap=cmap
+                vmin=_vmin, vmax=_vmax, cmap=cmap
             )
             #fg.set_axis_labels('Range', 'Azimuth')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
             fg.fig.suptitle(f'{polarization} {caption}', y=y)            
             #self.plots_AOI(fg, **kwargs)
             #self.plots_POI(fg, **kwargs)
+
+        if quantile is not None:
+            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
         if not isinstance(data, (xr.Dataset, (list, tuple))):
             raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or list of xr.Dataset')
@@ -508,20 +591,32 @@ class Stack_phasediff(Stack_base):
         for pol in polarizations:
             plot_polarization(data, polarization=pol)
 
-    def plot_interferogram(self, data, polarizations=None, caption='Phase, [rad]', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+    def plot_phase(self, data, polarizations=None,
+                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
+                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
         import numpy as np
-        if isinstance(cmap, str) and cmap == 'auto':
-            cmap='gist_rainbow_r'
-        self.plot_stack(data, polarizations, caption, cmap, (-np.pi, np.pi), cols, rows, size, nbins, aspect, y, True, **kwargs)
+        self.plot_stack(data, polarizations,
+                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, **kwargs)
 
-    def plot_correlation(self, data, polarizations=None, caption='Correlation', cmap='auto', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+    def plot_interferogram(self, data, polarizations=None, cmap='gist_rainbow_r', caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+        import numpy as np
+        self.plot_stack(data, polarizations,
+                        cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, **kwargs)
+
+    def plot_correlation(self, data, polarizations=None,
+                         cmap='auto', vmin=0, vmax=1, quantile=None, symmetrical=False,
+                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
         import matplotlib.colors as mcolors
         if isinstance(cmap, str) and cmap == 'auto':
             cmap = mcolors.LinearSegmentedColormap.from_list(
                 name='custom_gray', 
                 colors=['black', 'whitesmoke']
             )
-        self.plot_stack(data, polarizations, caption, cmap, (0, 1), cols, rows, size, nbins, aspect, y, False, **kwargs)
+        self.plot_stack(data, polarizations,
+                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, **kwargs)
 
     # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
     #     import xarray as xr
@@ -545,7 +640,7 @@ class Stack_phasediff(Stack_base):
     #         plt.gca().set_aspect(aspect)
     #     plt.title(caption)
 
-    def plot_correlation_stack(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto', **kwargs):
+    def plot_stack_correlation(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto', **kwargs):
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt

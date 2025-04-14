@@ -221,7 +221,7 @@ class S1_dem(S1_tidal):
         geoid = self.get_geoid(ortho)
         if os.path.exists(dem_filename):
             os.remove(dem_filename)
-        encoding = {'dem': self._compression(ortho.shape)}
+        encoding = {'dem': self.get_compression(ortho.shape)}
 
         delayed = self.spatial_ref((ortho + geoid).to_dataset(name='dem'), 4326)\
             .to_netcdf(dem_filename,

@@ -212,6 +212,6 @@ class XYZTiles(datagrid, tqdm_joblib):
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
-            encoding = {'colors': self._compression(da.shape)}
+            encoding = {'colors': self.get_compression(da.shape)}
             da.to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da

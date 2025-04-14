@@ -13,6 +13,66 @@ from .utils import utils
 
 class Stack_multilooking(Stack_phasediff):
 
+    @staticmethod
+    def coarsen_start(da, name, spacing, grid_factor=1):
+        """
+        Calculate start coordinate to align coarsened grids.
+        
+        Parameters
+        ----------
+        da : xarray.DataArray
+            Input data array
+        name : str
+            Coordinate name to align
+        spacing : int
+            Coarsening spacing
+        grid_factor : int, optional
+            Grid factor for alignment, default is 1
+            
+        Returns
+        -------
+        int or None
+            Start index for optimal alignment, or None if no good alignment found
+        """
+        import numpy as np
+        
+        # get coordinate values
+        coords = da[name].values
+        if len(coords) < spacing:
+            print(f'calculate_coarsen_start: Not enough points for spacing {spacing}')
+            return None
+            
+        # calculate coordinate differences
+        diffs = np.diff(coords)
+        if not np.allclose(diffs, diffs[0], rtol=1e-5):
+            print(f'calculate_coarsen_start: Non-uniform spacing detected for {name}')
+            return None
+            
+        # calculate target spacing
+        target_spacing = diffs[0] * spacing * grid_factor
+        
+        # find best alignment point
+        best_offset = None
+        min_error = float('inf')
+        
+        for i in range(spacing):
+            # get coarsened coordinates
+            coarse_coords = coords[i::spacing]
+            if len(coarse_coords) < 2:
+                continue
+                
+            # calculate alignment error
+            error = np.abs(coarse_coords[0] % target_spacing)
+            if error < min_error:
+                min_error = error
+                best_offset = i
+                
+        if best_offset is not None:
+            #print(f'calculate_coarsen_start: {name} spacing={spacing} grid_factor={grid_factor} => {best_offset} (error={min_error:.2e})')
+            return best_offset
+            
+        print(f'calculate_coarsen_start: No good alignment found for {name}')
+        return None
 
     @staticmethod
     def nanconvolve2d_gaussian(data,
@@ -174,8 +234,8 @@ class Stack_multilooking(Stack_phasediff):
             xname = [varname for varname in ['x', 'lon', 'r'] if varname in da.dims][0]
             coarsen_args = {yname: yscale, xname: xscale}
             # calculate coordinate offsets to align coarsened grids
-            y0 = self.calculate_coarsen_start(da, yname, yscale)
-            x0 = self.calculate_coarsen_start(da, xname, xscale)
+            y0 = self.coarsen_start(da, yname, yscale)
+            x0 = self.coarsen_start(da, xname, xscale)
             # avoid creating the large chunks
             with dask.config.set(**{'array.slicing.split_large_chunks': True}):
                 #if func not in ['mean', 'min', 'max', 'count', 'sum']:
@@ -288,8 +348,8 @@ class Stack_multilooking(Stack_phasediff):
 
         if coarsen:
             # calculate coordinate offsets to align coarsened grids
-            y0 = self.calculate_coarsen_start(ds, 'y', coarsen[0])
-            x0 = self.calculate_coarsen_start(ds, 'x', coarsen[1])
+            y0 = self.coarsen_start(ds, 'y', coarsen[0])
+            x0 = self.coarsen_start(ds, 'x', coarsen[1])
             ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})\
                      .coarsen({'y': coarsen[0], 'x': coarsen[1]}, boundary='trim')\
                      .mean()

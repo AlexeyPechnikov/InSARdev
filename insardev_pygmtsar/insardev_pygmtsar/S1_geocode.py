@@ -12,7 +12,7 @@ from insardev_toolkit import tqdm_dask
 
 class S1_geocode(S1_align):
 
-    def geocode(self, records=None, dem='auto', resolution=(15, 5), epsg='auto'):
+    def geocode(self, records=None, dem='auto', resolution=(20, 5), epsg='auto'):
         """
         Perform geocoding from radar to projected coordinates.
 
@@ -169,8 +169,8 @@ class S1_geocode(S1_align):
             return data_proj
 
         filename = self.get_burstfile(burst_rep, clean=True)
-        #encoding = {'data': self._compression(data_proj.shape)}
-        encoding = {varname: self._compression(data_proj[varname].shape) for varname in data_proj.data_vars}
+        #encoding = {'data': self.get_compression(data_proj.shape)}
+        encoding = {varname: self.get_compression(data_proj[varname].shape) for varname in data_proj.data_vars}
         #print ('encoding', encoding)
         data_proj.to_netcdf(filename,
                             encoding=encoding,
@@ -547,7 +547,7 @@ class S1_geocode(S1_align):
             return trans
 
         filename = self.get_filename(burst_ref, 'trans', clean=True)
-        encoding = {varname: self._compression(trans[varname].shape) for varname in trans.data_vars}
+        encoding = {varname: self.get_compression(trans[varname].shape) for varname in trans.data_vars}
         self.spatial_ref(trans, epsg).to_netcdf(filename,
                         encoding=encoding,
                         engine=self.netcdf_engine_write,
@@ -757,7 +757,7 @@ class S1_geocode(S1_align):
             return trans_inv
         
         filename = self.get_filename(burst_ref, 'trans_inv', clean=True)
-        encoding = {varname: self._compression(trans_inv[varname].shape) for varname in trans_inv.data_vars}
+        encoding = {varname: self.get_compression(trans_inv[varname].shape) for varname in trans_inv.data_vars}
         trans_inv.to_netcdf(filename,
                         encoding=encoding,
                         engine=self.netcdf_engine_write,
