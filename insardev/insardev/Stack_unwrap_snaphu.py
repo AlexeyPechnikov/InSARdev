@@ -210,3 +210,107 @@ class Stack_unwrap_snaphu(Stack_multilooking):
                 value = 'TRUE' if value else 'FALSE'
             conf_custom += f'        {key} {value}\n'
         return conf_basic + conf_custom
+
+
+    # Backward compatibility wrapper
+    def nearest_grid(self, in_grid, search_radius_pixels=None):
+        print('WARNING: nearest_grid() is deprecated. Use fill_nan_nearest() instead.')
+        return self.fill_nan_nearest(in_grid, search_radius_pixels)
+
+    def fill_nan_nearest(self, in_grid, search_radius_pixels=None):
+        """
+        Perform nearest neighbor interpolation on a 2D grid.
+
+        Parameters
+        ----------
+        in_grid : xarray.DataArray
+            The input 2D grid to be interpolated.
+        search_radius_pixels : int, optional
+            The interpolation distance in pixels. If not provided, the default is set to the chunksize of the Stack object.
+
+        Returns
+        -------
+        xarray.DataArray
+            The interpolated 2D grid.
+
+        Examples
+        --------
+        Fill gaps in the specified grid using nearest neighbor interpolation:
+        stack.fill_nan_nearest(grid)
+
+        Notes
+        -----
+        This method performs nearest neighbor interpolation on a 2D grid. It replaces the NaN values in the input grid with
+        the nearest non-NaN values. The interpolation is performed within a specified search radius in pixels.
+        If a search radius is not provided, the default search radius is set to the chunksize of the Stack object.
+        """
+        from scipy.spatial import cKDTree
+        import xarray as xr
+        import numpy as np
+
+        assert in_grid.chunks is not None, 'fill_nan_nearest() input grid chunks are not defined'
+
+        if search_radius_pixels is None:
+            search_radius_pixels = self.chunksize
+        elif search_radius_pixels <= 0:
+            print (f'NOTE: interpolation ignored for search_radius_pixels={search_radius_pixels}')
+            return in_grid
+        else:
+            assert search_radius_pixels <= self.chunksize, \
+                f'ERROR: apply fill_nan_nearest() multiple times to fill gaps more than {self.chunksize} pixels chunk size'
+
+        def func(grid, y, x, distance, scaley, scalex):
+
+            grid1d = grid.reshape(-1).copy()
+            nanmask0 = np.isnan(grid1d)
+            # all the pixels already defined
+            if np.all(~nanmask0):
+                return grid
+
+            # crop full grid subset to search for missed values neighbors
+            ymin = y.min()-scaley*distance-1
+            ymax = y.max()+scaley*distance+1
+            xmin = x.min()-scalex*distance-1
+            xmax = x.max()+scalex*distance+1
+            data = in_grid.sel(y=slice(ymin, ymax), x=slice(xmin, xmax))
+            ys, xs = data.y, data.x
+            # compute dask arrays to prevent ineffective index lookup
+            ys, xs = [vals.values.reshape(-1) for vals in xr.broadcast(ys, xs)]
+            data1d = data.values.reshape(-1)
+            nanmask = np.isnan(data1d)
+            # all the subset pixels are empty, the search is useless
+            if np.all(nanmask):
+                return grid
+
+            # build index tree for all the valid subset values
+            source_yxs = np.stack([ys[~nanmask]/scaley, xs[~nanmask]/scalex], axis=1)
+            tree = cKDTree(source_yxs, compact_nodes=False, balanced_tree=False)
+
+            # query the index tree for all missed values neighbors
+            target_yxs = np.stack([(y/scaley).reshape(-1)[nanmask0], (x/scalex).reshape(-1)[nanmask0]], axis=1)
+            #assert 0, target_yxs
+            d, inds = tree.query(target_yxs, k = 1, distance_upper_bound=distance, workers=1)
+            # fill missed values using neighbors when these ones are found
+            inds = np.where(np.isinf(d), 0, inds)
+            grid1d[nanmask0] = np.where(np.isinf(d), np.nan, data1d[~nanmask][inds])
+            return grid1d.reshape(grid.shape)
+
+        coords = ['y', 'x']
+        scale = [in_grid[coord].diff(coord).item(0) for coord in coords]
+        yy = xr.DataArray(in_grid[coords[0]]).chunk(-1)
+        xx = xr.DataArray(in_grid[coords[1]]).chunk(-1)
+        ys, xs = xr.broadcast(yy,xx)
+
+        # xarray wrapper
+        grid = xr.apply_ufunc(
+            func,
+            in_grid,
+            ys.chunk(in_grid.chunks),
+            xs.chunk(in_grid.chunks),
+            dask='parallelized',
+            vectorize=False,
+            output_dtypes=[np.float32],
+            dask_gufunc_kwargs={'distance': search_radius_pixels, 'scaley': scale[0], 'scalex': scale[1]},
+        )
+        assert grid.chunks is not None, 'fill_nan_nearest() output grid chunks are not defined'
+        return grid

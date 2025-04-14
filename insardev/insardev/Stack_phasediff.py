@@ -13,9 +13,9 @@ from insardev_toolkit import tqdm_dask
 
 class Stack_phasediff(Stack_base):
 
-    def interferogram(self, pairs, datas=None, weight=None, phase=None,
-                              resolution=None, wavelength=None, psize=None, coarsen=None,
-                              stack=None, polarizations=None, compute=False, debug=False):
+    def interferogram(self, pairs, datas, weight, phase,
+                              resolution, wavelength, gaussian_threshold, psize, coarsen,
+                              stack, polarizations, compute, debug):
         import xarray as xr
         import numpy as np
         import dask
@@ -33,8 +33,9 @@ class Stack_phasediff(Stack_base):
             intfs_total = []
             corrs_total = []
             for pol in polarizations:
-                intfs, corrs = self.interferogram(pairs, weight=weight, phase=phase,
-                                            resolution=resolution, wavelength=wavelength, psize=psize, coarsen=coarsen,
+                intfs, corrs = self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
+                                            resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold,
+                                            psize=psize, coarsen=coarsen,
                                             stack=stack, polarizations=pol, compute=compute, debug=debug)
                 #print ('intfs', intfs)
                 intfs_total.append(intfs)
@@ -72,14 +73,15 @@ class Stack_phasediff(Stack_base):
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
             intensity = np.square(np.abs(data[polarization]))
-            # Gaussian filtering cut-off wavelength with optional range multilooking on Sentinel-1 amplitudes
-            intensity_look = self.multilooking(intensity, wavelength=wavelength, coarsen=coarsen, debug=debug)
+            # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
+            intensity_look = self.multilooking(intensity, weight=weight,
+                                               wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
             del intensity
             # calculate phase difference with topography correction
             phasediff = self.phasediff(pairs, data[polarization], phase=phase, debug=debug)
-            # Gaussian filtering 200m cut-off wavelength with optional range multilooking
+            # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
             phasediff_look = self.multilooking(phasediff, weight=weight,
-                                               wavelength=wavelength, coarsen=coarsen, debug=debug)
+                                               wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
             del phasediff
             # correlation with optional range decimation
             corr_look = self.correlation(phasediff_look, intensity_look, debug=debug)
@@ -139,19 +141,19 @@ class Stack_phasediff(Stack_base):
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
     def interferogram_singlelook(self, pairs, datas=None, weight=None, phase=None,
-                                         wavelength=None, psize=None,
+                                         wavelength=None, gaussian_threshold=0.5, psize=None,
                                          stack=None, polarizations=None, compute=False, debug=False):
         return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                   wavelength=wavelength, psize=psize,
+                                   wavelength=wavelength, gaussian_threshold=gaussian_threshold, psize=psize,
                                    stack=stack, polarizations=polarizations, compute=compute, debug=debug)
 
     # Goldstein filter requires square grid cells means 1:4 range multilooking.
     # For multilooking interferogram we can use square grid always using coarsen = (1,4)
     def interferogram_multilook(self, pairs, datas=None, weight=None, phase=None,
-                                        resolution=None, wavelength=None, psize=None, coarsen=(1,4),
+                                        resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=(1,4),
                                         stack=None, polarizations=None, compute=False, debug=False):
         return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                   resolution=resolution, wavelength=wavelength, psize=psize, coarsen=coarsen,
+                                   resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold, psize=psize, coarsen=coarsen,
                                    stack=stack, polarizations=polarizations, compute=compute, debug=debug)
 
     @staticmethod
