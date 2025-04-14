@@ -45,7 +45,7 @@ class datagrid:
     netcdf_engine_read = 'h5netcdf'
     netcdf_engine_write = 'netcdf4'
     netcdf_format = 'NETCDF4'
-    netcdf_chunksize = 512
+    netcdf_chunksize = 1024
     netcdf_chunksize1d = 65536
     netcdf_compression_algorithm = 'zlib'
     netcdf_complevel = 3
