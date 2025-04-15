@@ -229,6 +229,6 @@ class S1_dem(S1_tidal):
                        engine=self.netcdf_engine_write,
                        format=self.netcdf_format,
                        compute=False)
-        tqdm_dask(result := dask.persist(delayed), desc='Save DEM on WGS84 Ellipsoid')
+        tqdm_dask(result := dask.persist(delayed), desc='DEM on WGS84 Ellipsoid'.ljust(25))
 
         self.dem_filename = dem_filename

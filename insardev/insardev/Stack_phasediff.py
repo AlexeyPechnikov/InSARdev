@@ -70,6 +70,9 @@ class Stack_phasediff(Stack_base):
         intfs = []
         corrs = []
         for data in datas:
+            # copy id from the data to the result
+            id = data.attrs.get('id', None)
+
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
             intensity = np.square(np.abs(data[polarization]))
@@ -121,18 +124,18 @@ class Stack_phasediff(Stack_base):
 
             if isinstance(stack, xr.DataArray):
                 #ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
-                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization))
-                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization))
+                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization).assign_attrs(id=id))
+                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization).assign_attrs(id=id))
             else:
-                intfs.append(das[0].to_dataset(name=polarization))
-                corrs.append(das[1].to_dataset(name=polarization))
+                intfs.append(das[0].to_dataset(name=polarization).assign_attrs(id=id))
+                corrs.append(das[1].to_dataset(name=polarization).assign_attrs(id=id))
             del das
 
         # clean up decimators after all iterations are complete
         del decimator_intf, decimator_corr
 
         if compute:
-            tqdm_dask(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram and Correlation')
+            tqdm_dask(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram'.ljust(25))
             del intfs, corrs
             return result
         return (intfs, corrs)
@@ -372,7 +375,7 @@ class Stack_phasediff(Stack_base):
         # replace zeros produces in NODATA areas
         return self.spatial_ref(ds.where(ds).rename('phase'), phase)
 
-    def xarray_align_concat(self, datas, wrap=False):
+    def concat(self, datas, wrap=False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
         xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
@@ -524,20 +527,23 @@ class Stack_phasediff(Stack_base):
 
     def plot_stack(self, data, polarizations,
                    cmap, vmin, vmax, quantile, symmetrical,
-                   caption, cols, rows, size, nbins, aspect, y, wrap, **kwargs):
+                   caption, cols, rows, size, nbins, aspect, y, wrap, screen=None, **kwargs):
         import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
+
         # screen size in pixels (width, height) to estimate reasonable number pixels per plot
-        screen_size = (4000,2000)
+        # this is quite large to prevent aliasing on 600dpi plots without additional processing
+        if screen is None:
+            screen = (8000,4000)
 
         def plot_polarization(data, polarization):
             if isinstance(data, xr.Dataset):
                 da = data[polarization].isel(pair=slice(0, rows))
             else:
                 das = [da[polarization].isel(pair=slice(0, rows)) for da in data]
-                da = self.xarray_align_concat(das, wrap=wrap)
+                da = self.concat(das, wrap=wrap)
                 del das
 
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
@@ -547,11 +553,11 @@ class Stack_phasediff(Stack_base):
             #print ('screen_size', screen_size)
             size_y, size_x = da.shape[1:]
             #print ('size_x, size_y', size_x, size_y)
-            factor_y = int(np.round(size_y / (screen_size[1] / rows)))
-            factor_x = int(np.round(size_x / (screen_size[0] / cols)))
+            factor_y = int(np.round(size_y / (screen[1] / rows)))
+            factor_x = int(np.round(size_x / (screen[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
             # decimate and materialize data for all the calculations and plotting
-            da = da[:,::factor_y,::factor_x].compute()
+            da = da[:,::max(1, factor_y),::max(1, factor_x)].compute()
 
             # calculate min, max when needed
             if quantile is not None:
@@ -593,13 +599,15 @@ class Stack_phasediff(Stack_base):
 
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
         import numpy as np
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
 
-    def plot_interferogram(self, data, polarizations=None, cmap='gist_rainbow_r', caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+    def plot_interferogram(self, data, polarizations=None,
+                           cmap='gist_rainbow_r',
+                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
         import numpy as np
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
@@ -607,7 +615,7 @@ class Stack_phasediff(Stack_base):
 
     def plot_correlation(self, data, polarizations=None,
                          cmap='auto', vmin=0, vmax=1, quantile=None, symmetrical=False,
-                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, **kwargs):
+                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
         import matplotlib.colors as mcolors
         if isinstance(cmap, str) and cmap == 'auto':
             cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -616,7 +624,7 @@ class Stack_phasediff(Stack_base):
             )
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, screen=screen, **kwargs)
 
     # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
     #     import xarray as xr

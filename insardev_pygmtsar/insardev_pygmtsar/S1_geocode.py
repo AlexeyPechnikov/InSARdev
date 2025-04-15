@@ -51,7 +51,7 @@ class S1_geocode(S1_align):
 
         bursts_ref = self.get_records_ref(records).index.get_level_values(2)
         # use sequential processing as geocoding is well parallelized internally
-        for burst_ref in tqdm(bursts_ref, desc='Geocoding transform'):
+        for burst_ref in tqdm(bursts_ref, desc='Geocoding transform'.ljust(25)):
             burst_geocode(burst_ref, dem=dem, resolution=resolution, epsg=epsg)
 
     def transform(self, records=None, clean=True):
@@ -79,7 +79,7 @@ class S1_geocode(S1_align):
         rep_ref_dict = self.get_records_rep_ref(records)
         # process as repeat as reference bursts
         rep_ref_dict = rep_ref_dict | dict(zip(rep_ref_dict.values(), rep_ref_dict.values()))
-        for burst_rep, burst_ref in tqdm(rep_ref_dict.items(), desc='Geocoding bursts'):
+        for burst_rep, burst_ref in tqdm(rep_ref_dict.items(), desc='Geocoding bursts'.ljust(25)):
             self.transform_slc(burst_rep, burst_ref, clean=clean)
 
     def transform_slc(self, burst_rep, burst_ref, topo='auto', phase='auto', scale=2.5e-07, clean=True, interactive=False):

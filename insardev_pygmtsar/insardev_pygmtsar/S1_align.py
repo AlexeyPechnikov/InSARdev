@@ -322,11 +322,11 @@ class S1_align(S1_dem):
 
         # get list of unique sorted reference bursts
         bursts_ref = sorted(set(rep_ref_dict.values()))
-        with self.tqdm_joblib(tqdm(desc='Preparing Reference', total=len(bursts_ref))) as progress_bar:
+        with self.tqdm_joblib(tqdm(desc='Preparing Reference'.ljust(25), total=len(bursts_ref))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
                 (joblib.delayed(self._align_ref)(burst_ref, debug=debug) for burst_ref in bursts_ref)
 
         # prepare secondary images
-        with self.tqdm_joblib(tqdm(desc='Aligning Repeat', total=len(rep_ref_dict))) as progress_bar:
+        with self.tqdm_joblib(tqdm(desc='Aligning Repeat'.ljust(25), total=len(rep_ref_dict))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
                 (joblib.delayed(self._align_rep)(burst_rep, burst_ref, degrees=degrees, debug=debug) for burst_rep, burst_ref in rep_ref_dict.items())
