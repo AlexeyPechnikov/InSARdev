@@ -250,6 +250,9 @@ class datagrid:
 
         if target is None:
             return da
+        
+        if isinstance(target, (list, tuple)):
+            target = target[0]
 
         # extract EPSG from target xarray object or use provided EPSG
         if isinstance(target, (xr.DataArray, xr.Dataset)):
@@ -260,7 +263,7 @@ class datagrid:
                 raise ValueError("ERROR: Target CRS is not an EPSG code, consider using PROJ string.")
         else:
             epsg = target
-        #print ('spatial_ref epsg', epsg)
+        #print ('spatial_ref: target epsg', epsg)
 
         if epsg == 4326:
             # EPSG:4326 (WGS84, lat/lon)
