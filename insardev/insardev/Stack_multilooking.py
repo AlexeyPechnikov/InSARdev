@@ -354,4 +354,4 @@ class Stack_multilooking(Stack_phasediff):
                      .coarsen({'y': coarsen[0], 'x': coarsen[1]}, boundary='trim')\
                      .mean()
 
-        return self.spatial_ref(ds.chunk(chunksizes), data)
+        return ds.chunk(chunksizes)
