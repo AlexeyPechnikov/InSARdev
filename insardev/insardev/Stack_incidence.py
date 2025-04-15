@@ -129,7 +129,7 @@ class Stack_incidence(Stack_sbas):
 
         # constant is negative to make LOS = -1 * range change
         # constant is (1000 mm) / (4 * pi)
-        scale = -79.58 * self.PRM().get('radar_wavelength')
+        scale = -79.58 * self.PRM('radar_wavelength')
 
         if isinstance(data, (list, tuple)):
             return scale*np.asarray(data)
