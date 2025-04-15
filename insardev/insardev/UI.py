@@ -1,6 +1,6 @@
 class UI:
 
-    def __init__(self, mode: str = 'dark'):
+    def __init__(self, mode: str = 'dark', dpi=600, delay: int = 1000):
         """
         Set dark mode styling for matplotlib plots and Jupyter widgets.
 
@@ -9,13 +9,13 @@ class UI:
             UI('dark')
         """
         import matplotlib.pyplot as plt
-        from IPython.display import HTML, display
+        from IPython.display import HTML, Javascript, display
         
         if mode not in ['dark', 'light']:
             raise ValueError("Invalid mode. Must be 'dark' or 'light'.")
 
         plt.rcParams['figure.figsize'] = [12, 4]
-        plt.rcParams['figure.dpi'] = 100
+        plt.rcParams['figure.dpi'] = dpi
         plt.rcParams['figure.titlesize'] = 24
         plt.rcParams['axes.titlesize'] = 14
         plt.rcParams['axes.labelsize'] = 12
@@ -37,8 +37,8 @@ class UI:
             'axes.edgecolor': 'lightgray'
         })
         
-        # inject custom CSS for ipywidgets
-        return display(HTML("""
+        # custom CSS for ipywidgets
+        dark_css = """
             <style>
             /* Overall dark theme for containers, input widgets, and cell outputs */
             .widget-box,
@@ -88,9 +88,23 @@ class UI:
             output-ipywidget-background * {
                 color: #333333 !important;
             }
+            .cell-output-ipywidget-background {
+                background: #333333 !important;
+            }
                             
             .jupyter-widget-html-content {
                 font-family: monospace !important;
             }
             </style>
-        """))
+        """
+        
+        # inject CSS
+        display(HTML(dark_css))
+        # inject CSS after delay
+        if delay is not None:
+            js = f"""
+            setTimeout(function(){{
+                document.head.insertAdjacentHTML('beforeend', `{dark_css}`);
+            }}, {delay});
+        """
+        display(Javascript(js))
