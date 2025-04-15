@@ -74,8 +74,7 @@ class Stack_unwrap_snaphu(Stack_multilooking):
         conf += f'    TILEDIR snaphu_tiledir_{str(uuid.uuid4())}'
 
         # define basename for SNAPHU temp files
-        # crop .grd from filename
-        basename = self.get_filename(f'snaphu_{str(uuid.uuid4())}', '')[:-4]
+        basename = os.path.join(self.basedir, f'snaphu_{str(uuid.uuid4())}')
         #print ('basename', basename)
 
         # SNAPHU input files

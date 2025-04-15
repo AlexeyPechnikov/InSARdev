@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 from .datagrid import datagrid
-from .tqdm_joblib import tqdm_joblib
+from .progressbar_joblib import progressbar_joblib
 
-class XYZTiles(datagrid, tqdm_joblib):
+class XYZTiles(datagrid, progressbar_joblib):
 
     http_timeout = 30
     # OSM tiles downloading requires the browser header (otherwise, server returns HTTP 403 code)
@@ -189,18 +189,13 @@ class XYZTiles(datagrid, tqdm_joblib):
                                 coords={'lat': latitudes, 'lon': longitudes}).rename('colors')
 
         if n_jobs is None:
-            # do not use joblib parallel processing
-            tile_xarrays = []
-            with self.tqdm_joblib(tqdm(desc=f'XYZ Tiles Downloading', total=(x_end-x_start+1)*(y_end-y_start+1))) as pbar:
-                for x in range(x_start, x_end + 1):
-                    for y in range(y_start, y_end + 1):
-                        tile = job_tile(x, y, debug=debug)
-                        tile_xarrays.append(tile)     
-                        pbar.update(1)       
+            joblib_backend = 'sequential'     
         else:
-            with self.tqdm_joblib(tqdm(desc='XYZ Tiles Downloading', total=(x_end-x_start+1)*(y_end-y_start+1))) as progress_bar:
-                tile_xarrays = joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(job_tile)(x, y)\
-                                    for x in range(x_start, x_end + 1) for y in range(y_start, y_end + 1))
+            joblib_backend = None
+
+        with self.progressbar_joblib(tqdm(desc='Downloading Map Tiles'.ljust(25), total=(x_end-x_start+1)*(y_end-y_start+1))) as progress_bar:
+            tile_xarrays = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(job_tile)(x, y)\
+                                for x in range(x_start, x_end + 1) for y in range(y_start, y_end + 1))
 
         da = xr.combine_by_coords(tile_xarrays)['colors'].transpose('band', 'lat', 'lon')
         # fix for inverted latitudes

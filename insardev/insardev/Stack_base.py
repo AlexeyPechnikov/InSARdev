@@ -8,10 +8,10 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from insardev_toolkit import tqdm_joblib, tqdm_dask
+from insardev_toolkit import progressbar_joblib
 from .dataset import dataset
 
-class Stack_base(tqdm_joblib, dataset):
+class Stack_base(progressbar_joblib, dataset):
 
     def get_pairs(self, pairs, dates=False):
         """

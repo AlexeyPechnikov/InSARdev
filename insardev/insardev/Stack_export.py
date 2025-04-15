@@ -9,7 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_ps import Stack_ps
-from insardev_toolkit import tqdm_dask
+from insardev_toolkit import progressbar
 
 class Stack_export(Stack_ps):
 
@@ -460,7 +460,7 @@ class Stack_export(Stack_ps):
             os.remove(filename)
         encoding = {data.name: self.get_compression(grid.shape)}
         delayed = grid.to_netcdf(filename, engine=engine, encoding=encoding, format=format, compute=False)
-        tqdm_dask(dask.persist(delayed), desc=caption)
+        progressbar(dask.persist(delayed), desc=caption)
         del grid
 
     def export_vtk(self, data, name, caption='Exporting WGS84 VTK(s)', topo='auto', image=None, mask=None):

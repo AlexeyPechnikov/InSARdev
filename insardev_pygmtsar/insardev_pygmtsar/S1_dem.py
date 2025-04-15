@@ -9,7 +9,7 @@
 # ----------------------------------------------------------------------------
 from .S1_tidal import S1_tidal
 from .PRM import PRM
-from insardev_toolkit import tqdm_dask
+from insardev_toolkit import progressbar
 
 class S1_dem(S1_tidal):
 
@@ -139,7 +139,7 @@ class S1_dem(S1_tidal):
                               chunks=self.chunksize)
         return dem['dem'].transpose('lat','lon')
 
-    def load_dem(self, data, geometry='auto', buffer_degrees=None):
+    def set_dem(self, data, geometry='auto', buffer_degrees=None):
         """
         Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
 
@@ -229,6 +229,6 @@ class S1_dem(S1_tidal):
                        engine=self.netcdf_engine_write,
                        format=self.netcdf_format,
                        compute=False)
-        tqdm_dask(result := dask.persist(delayed), desc='DEM on WGS84 Ellipsoid'.ljust(25))
+        progressbar(result := dask.persist(delayed), desc='Preparing WGS84 DEM'.ljust(25))
 
         self.dem_filename = dem_filename

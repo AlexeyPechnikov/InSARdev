@@ -64,7 +64,6 @@ class UI:
                 color: lightgray !important;
                 border-color: #555555 !important;
             }
-
             
             /* Progress bar: enforce green background, text, and border even within a dark container */
             .cell-output-ipywidget-background .progress-bar {
@@ -88,6 +87,10 @@ class UI:
 
             output-ipywidget-background * {
                 color: #333333 !important;
+            }
+                            
+            .jupyter-widget-html-content {
+                font-family: monospace !important;
             }
             </style>
         """))

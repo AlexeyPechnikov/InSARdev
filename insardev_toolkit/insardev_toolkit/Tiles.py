@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 from .datagrid import datagrid
-from .tqdm_joblib import tqdm_joblib
+from .progressbar_joblib import progressbar_joblib
 
-class Tiles(datagrid, tqdm_joblib):
+class Tiles(datagrid, progressbar_joblib):
 
     http_timeout = 30
 #     http_chunk_size = 8*1024**2
@@ -204,7 +204,7 @@ class Tiles(datagrid, tqdm_joblib):
             print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
             joblib_backend = 'sequential'
 
-        with self.tqdm_joblib(tqdm(desc=f'Tiles Parallel Downloading', total=(right-left+1)*(top-bottom+1))) as progress_bar:
+        with self.progressbar_joblib(tqdm(desc=f'Downloading Raster Tiles'.ljust(25), total=(right-left+1)*(top-bottom+1))) as progress_bar:
             tile_xarrays = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(self._download_tile)\
                                 (base_url, path_id, tile_id, file_id, archive, filetype, product, x, y, debug)\
                                 for x in range(left, right + 1) for y in range(bottom, top + 1))

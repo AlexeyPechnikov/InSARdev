@@ -8,7 +8,7 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 
-class tqdm_joblib:
+class progressbar_joblib:
     """
     Class to provide a context manager for `joblib` that allows progress reporting via `tqdm`.
 
@@ -19,7 +19,7 @@ class tqdm_joblib:
 
     @staticmethod
     @contextlib.contextmanager
-    def tqdm_joblib(tqdm_object):
+    def progressbar_joblib(tqdm_object):
         """
         Context manager to patch `joblib` to report into `tqdm` progress bar given as argument.
 

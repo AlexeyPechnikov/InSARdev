@@ -9,14 +9,13 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_stl import Stack_stl
-from insardev_toolkit import tqdm_dask
+from insardev_toolkit import progressbar
 
 class Stack_ps(Stack_stl):
 
     def get_ps(self, name='ps'):
         return self.open_cube(name)
 
-    #from pygmtsar import tqdm_dask
     #Stack.ps = ps    
     #stack.ps(interactive=True)
     #stack.ps()
@@ -49,7 +48,7 @@ class Stack_ps(Stack_stl):
 
         # normalize image amplitudes (intensities)
         # dask.persist returns tuple
-        tqdm_dask(mean := dask.persist(data.mean(dim=['y','x']))[0], desc='Intensity Normalization')
+        progressbar(mean := dask.persist(data.mean(dim=['y','x']))[0], desc='Intensity Normalization')
         # workaround: apply compute() to calculated mean to prevent weird dask 2025.1.0 error:
         # Exception: 'AttributeError("\'tuple\' object has no attribute \'size\'")'
         mean = mean.compute()
@@ -146,7 +145,7 @@ class Stack_ps(Stack_stl):
 #                 del block
 #     
 #         # materialize the result as a set of numpy arrays
-#         tqdm_dask(model := dask.persist(blocks), desc='Amplitude Dispersion Index (ADI) Threshold')
+#         progressbar(model := dask.persist(blocks), desc='Amplitude Dispersion Index (ADI) Threshold')
 #         del blocks
 #         # the result is already calculated and compute() returns the result immediately
 #         model = np.concatenate(dask.compute(model)[0][0])

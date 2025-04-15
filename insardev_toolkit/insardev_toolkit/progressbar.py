@@ -118,7 +118,7 @@ class TqdmDaskProgress(ProgressBar):
         """
         self.tqdm.close()
 
-def tqdm_dask(futures, **kwargs):
+def progressbar(futures, **kwargs):
     """
     Helper function to track progress of Dask computation using tqdm.
 

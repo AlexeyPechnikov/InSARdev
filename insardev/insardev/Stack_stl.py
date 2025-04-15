@@ -9,7 +9,6 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_lstsq import Stack_lstsq
-from insardev_toolkit import tqdm_dask
 
 class Stack_stl(Stack_lstsq):
 

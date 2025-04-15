@@ -7,9 +7,9 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
-from .tqdm_joblib import tqdm_joblib
+from .progressbar_joblib import progressbar_joblib
 
-class EOF(tqdm_joblib):
+class EOF(progressbar_joblib):
 
     import pandas as pd
     from datetime import timedelta
@@ -167,7 +167,7 @@ class EOF(tqdm_joblib):
         # download orbits index files and detect the orbits.
         # joblib reads the class file from disk,
         # and to allow modification of orbit_offset_* on the fly, add them to the arguments
-        with EOF.tqdm_joblib(tqdm(desc='Downloading Sentinel-1 Orbits Index:', total=len(df))) as progress_bar:
+        with EOF.progressbar_joblib(tqdm(desc='Downloading Orbits List'.ljust(25), total=len(df))) as progress_bar:
             orbits = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_with_retry)\
                                     (download_index, retries, timeout_second,
                                     mission=scene.mission,
@@ -180,7 +180,7 @@ class EOF(tqdm_joblib):
         #orbits = orbits.groupby(['orbit']).first().reset_index()
         
         # download orbits index files and detect the orbits
-        with EOF.tqdm_joblib(tqdm(desc='Downloading Sentinel-1 Orbits:', total=len(orbits))) as progress_bar:
+        with EOF.progressbar_joblib(tqdm(desc='Downloading Orbit Files'.ljust(25), total=len(orbits))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_with_retry)\
                                     (download_orbit, retries, timeout_second,
                                     basedir=basedir,

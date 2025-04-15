@@ -9,7 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_base import Stack_base
-from insardev_toolkit import tqdm_dask
+from insardev_toolkit import progressbar
 
 class Stack_phasediff(Stack_base):
 
@@ -110,7 +110,7 @@ class Stack_phasediff(Stack_base):
             del phasediff_look
     
             # compute together because correlation depends on phase, and filtered phase depends on correlation.
-            #tqdm_dask(result := dask.persist(decimator(corr15m), decimator(intf15m)), desc='Compute Phase and Correlation')
+            #progressbar(result := dask.persist(decimator(corr15m), decimator(intf15m)), desc='Compute Phase and Correlation')
             # unpack results for a single interferogram
             #corr90m, intf90m = [grid[0] for grid in result]
             # anti-aliasing filter for the output resolution is applied above
@@ -135,7 +135,7 @@ class Stack_phasediff(Stack_base):
         del decimator_intf, decimator_corr
 
         if compute:
-            tqdm_dask(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram'.ljust(25))
+            progressbar(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram'.ljust(25))
             del intfs, corrs
             return result
         return (intfs, corrs)

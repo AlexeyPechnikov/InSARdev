@@ -319,7 +319,7 @@ class S1_tidal(S1_gmtsar):
         def tidal(date):
             return self._tidal(date, grid)
 
-        with self.tqdm_joblib(tqdm(desc='Tidal Computation', total=len(dates))) as progress_bar:
+        with self.progressbar_joblib(tqdm(desc='Tidal Computation', total=len(dates))) as progress_bar:
             outs = joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(tidal)(date) for date in dates)
 
         ds = xr.concat(outs, dim='date')

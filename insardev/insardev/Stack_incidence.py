@@ -9,7 +9,6 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_sbas import Stack_sbas
-from insardev_toolkit import tqdm_dask
 
 class Stack_incidence(Stack_sbas):
 

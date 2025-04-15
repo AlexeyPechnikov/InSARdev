@@ -10,8 +10,8 @@
 __version__ = '2025.2.20.dev'
 
 # unified progress indicators
-from .tqdm_joblib import tqdm_joblib
-from .tqdm_dask import tqdm_dask
+from .progressbar_joblib import progressbar_joblib
+from .progressbar import progressbar
 # base NetCDF operations and parameters on NetCDF grid
 from .datagrid import datagrid
 # Sentinel-1 functions

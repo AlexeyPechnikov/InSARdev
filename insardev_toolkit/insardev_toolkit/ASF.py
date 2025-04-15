@@ -7,9 +7,9 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
-from .tqdm_joblib import tqdm_joblib
+from .progressbar_joblib import progressbar_joblib
 
-class ASF(tqdm_joblib):
+class ASF(progressbar_joblib):
     import pandas as pd
     from datetime import timedelta
 
@@ -367,7 +367,7 @@ class ASF(tqdm_joblib):
         if session is None:
             session = self._get_asf_session()
 
-        with tqdm(desc=f'ASF Downloading Bursts Catalog', total=1) as pbar:
+        with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
             results = asf_search.granule_search(bursts_missed)
             pbar.update(1)
 
@@ -387,7 +387,7 @@ class ASF(tqdm_joblib):
                 time.sleep(timeout_second)
 
         # download bursts
-        with self.tqdm_joblib(tqdm(desc='ASF Downloading Sentinel-1 SLC Bursts', total=len(bursts_missed))) as progress_bar:
+        with self.progressbar_joblib(tqdm(desc='Downloading ASF SLC'.ljust(25), total=len(bursts_missed))) as progress_bar:
             statuses = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_burst_with_retry)\
                                     (result, basedir, session, retries=retries, timeout_second=timeout_second) for result in results)
 

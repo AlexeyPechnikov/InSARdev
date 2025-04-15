@@ -7,10 +7,10 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from insardev_toolkit import tqdm_joblib, tqdm_dask
+from insardev_toolkit import progressbar_joblib
 from insardev_toolkit import datagrid
 
-class S1_base(tqdm_joblib, datagrid):
+class S1_base(progressbar_joblib, datagrid):
 
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)

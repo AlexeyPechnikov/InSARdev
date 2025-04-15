@@ -8,7 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from insardev_toolkit import tqdm_dask
+from insardev_toolkit import progressbar
 from insardev_toolkit import datagrid
 
 class dataset(datagrid):
@@ -332,7 +332,7 @@ class dataset(datagrid):
                                  encoding=encoding,
                                  compute=not is_dask)
         if is_dask:
-            tqdm_dask(result := dask.persist(delayed), desc=caption)
+            progressbar(result := dask.persist(delayed), desc=caption)
             # cleanup - sometimes writing NetCDF handlers are not closed immediately and block reading access
             del delayed, result
             import gc; gc.collect()
@@ -590,7 +590,7 @@ class dataset(datagrid):
                     chunk_caption = f'{caption}: {(counter+1):0{digits}}...{(counter+len(chunk)):0{digits}} from {stacksize}'
                 else:
                     chunk_caption = caption
-                tqdm_dask(result := dask.persist(delayeds), desc=chunk_caption)
+                progressbar(result := dask.persist(delayeds), desc=chunk_caption)
                 del delayeds, result
                 # cleanup - sometimes writing NetCDF handlers are not closed immediately and block reading access
                 import gc; gc.collect()
