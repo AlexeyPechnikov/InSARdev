@@ -18,6 +18,12 @@ class Stack(Stack_export):
     def __repr__(self):
         return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
 
+    def PRM(self, key):
+        """
+        Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
+        """
+        return self.dss[0].attrs[key]
+
     def to_dataframe(self, id=None, date=None):
         """
         Return a Pandas DataFrame for all Stack scenes.
