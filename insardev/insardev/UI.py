@@ -65,19 +65,26 @@ class UI:
                 border-color: #555555 !important;
             }
 
+            
             /* Progress bar: enforce green background, text, and border even within a dark container */
-            .progress-bar,
             .cell-output-ipywidget-background .progress-bar {
-                background-color: green !important;
-                color: green !important;
-                border-color: green !important;
+                background-color: #cca700 !important;
+            }
+            /* progress-bar progress-bar-success */
+            .cell-output-ipywidget-background .progress-bar-success {
+                background-color: #4caf50 !important;
             }
 
+            /* progress-bar progress-bar-danger */
+            .cell-output-ipywidget-background .progress-bar-danger {
+                background-color: #f44336 !important;
+            }
+                            
             /* For inner spans within progress bars (if any) */
-            .progress-bar span,
+            /*.progress-bar span,
             .cell-output-ipywidget-background .progress-bar span {
                 color: green !important;
-            }    
+            }*/    
 
             output-ipywidget-background * {
                 color: #333333 !important;
