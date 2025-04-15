@@ -23,6 +23,9 @@ class Stack_phasediff(Stack_base):
         if datas is None:
             # list of datasets to process
             datas = self.dss
+        
+        if not isinstance(datas, (list, tuple)):
+            datas = [datas]
 
         if polarizations is None:
             polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
@@ -37,14 +40,12 @@ class Stack_phasediff(Stack_base):
                                             resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold,
                                             psize=psize, coarsen=coarsen,
                                             stack=stack, polarizations=pol, compute=compute, debug=debug)
-                #print ('intfs', intfs)
                 intfs_total.append(intfs)
                 corrs_total.append(corrs)
                 del intfs, corrs
 
             intfs_total = [xr.merge([das[idx] for das in intfs_total]) for idx in range(len(intfs_total[0]))]
             corrs_total = [xr.merge([das[idx] for das in corrs_total]) for idx in range(len(corrs_total[0]))]
-            #print ('intfs_total', intfs_total)
             return (intfs_total, corrs_total)
         
         # process single polarization
@@ -215,15 +216,17 @@ class Stack_phasediff(Stack_base):
         for stack_idx, pair in enumerate(pairs):
             date1, date2 = pair
             # calculate correlation
-            corr = np.abs(phase.sel(pair=' '.join(pair)) / np.sqrt(intensity.sel(date=date1) * intensity.sel(date=date2)))
-            corr = xr.where(corr < 0, 0, corr)
-            corr = xr.where(corr > 1, 1, corr)
+            corr = (np.abs(phase.sel(pair=' '.join(pair)) / np.sqrt(intensity.sel(date=date1) * intensity.sel(date=date2)))).clip(0, 1)
+            # modify values in place
+            #corr = xr.where(corr < 0, 0, corr)
+            #corr = xr.where(corr > 1, 1, corr)
+            #corr = corr.where(corr.isnull() | (corr >= 0), 0)
+            #corr = corr.where(corr.isnull() | (corr <= 1), 1)
             # add to stack
             stack.append(corr)
             del corr
 
-        corr = xr.concat(stack, dim='pair')
-        return self.spatial_ref(corr.rename('correlation'), phase)
+        return xr.concat(stack, dim='pair').rename('correlation')
 
     def phasediff(self, pairs, data, phase=None, debug=False):
         import dask.array as da
@@ -260,7 +263,7 @@ class Stack_phasediff(Stack_base):
                .assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
         del phase_correction, data1, data2
         
-        return self.spatial_ref(da.rename('phase'), data)
+        return da.rename('phase')
 
     def goldstein(self, phase, corr, psize=32, debug=False):
         import xarray as xr
@@ -373,9 +376,9 @@ class Stack_phasediff(Stack_base):
             ds = xr.DataArray(stack[0], coords=phase.coords)
         del stack
         # replace zeros produces in NODATA areas
-        return self.spatial_ref(ds.where(ds).rename('phase'), phase)
+        return ds.where(ds).rename('phase')
 
-    def concat(self, datas, wrap=False):
+    def concat(self, datas=None, polarizations=None, wrap=False, compute=False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
         xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
@@ -384,10 +387,51 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
-        if len(datas) == 0:
-            return None
-        elif len(datas) == 1:
-            return datas[0]
+        #print ('datas', datas, 'polarizations', polarizations, 'wrap', wrap)
+        #print ()
+        # if datas is None:
+        #     datas = self.dss
+
+        # not iterable data cannot be concatenated
+        if isinstance(datas, (xr.Dataset, xr.DataArray)):
+            if compute:
+                progressbar(result := datas.persist(), desc=f'Compute Data'.ljust(25))
+                return result
+            return datas
+        elif isinstance(datas, (list, tuple)):
+            # empty list or single dataarray do not need to be concatenated
+            if len(datas) == 0:
+                return None
+            if len(datas) == 1:
+                if compute:
+                    progressbar(result := datas[0].persist(), desc=f'Compute Data'.ljust(25))
+                    return result
+                return datas[0]
+        else:
+            raise ValueError(f'ERROR: datas is not a list, tuple, Dataset or DataArray: {type(datas)}')
+
+        # process list of datasets with multiple polarizations
+        if isinstance(datas[0], xr.Dataset):
+            if polarizations is None:
+                polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+            elif isinstance(polarizations, str):
+                polarizations = [polarizations]
+            #print ('polarizations', polarizations)
+            
+            das_total = []
+            for pol in polarizations:
+                das = self.concat([ds[pol] for ds in datas], wrap=wrap)
+                das_total.append(das)
+                del das
+            das_total = xr.merge(das_total)
+            
+            if compute:
+                progressbar(result := das_total.persist(), desc=f'Compute Concatenated Data'.ljust(25))
+                del das_total
+                return result
+            return das_total
+
+        # process single polarization (variable)
 
         # define unified grid
         y_min = min(ds.y.min().item() for ds in datas)
@@ -395,7 +439,9 @@ class Stack_phasediff(Stack_base):
         x_min = min(ds.x.min().item() for ds in datas)
         x_max = max(ds.x.max().item() for ds in datas)
         #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
-        pair = datas[0]['pair']
+        stackvar = list(datas[0].dims)[0]
+        # workaround for dask.array.blockwise
+        stackval = datas[0][stackvar].astype(str)
         dy = datas[0].y.diff('y').item(0)
         dx = datas[0].x.diff('x').item(0)
         #print ('dy, dx', dy, dx)
@@ -406,14 +452,14 @@ class Stack_phasediff(Stack_base):
         #print ('xs', xs)
         
         # use outer variable datas
-        def block_dask(pair, y_chunk, x_chunk):
+        def block_dask(stack, y_chunk, x_chunk):
             #print ('pair', pair)
             das_slice = [da.sel(y=slice(y_chunk.min(), y_chunk.max()), x=slice(x_chunk.min(), x_chunk.max())).compute(num_workers=1) for da in datas]
             das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=np.nan, copy=False) for da in das_slice if da.y.size > 0 and da.x.size > 0]
             del das_slice
             if len(das_block) == 0:
                 # return empty block
-                return np.full((pair.size, y_chunk.size, x_chunk.size), np.nan, dtype=datas[0].dtype)
+                return np.full((stack.size, y_chunk.size, x_chunk.size), np.nan, dtype=datas[0].dtype)
             if len(das_block) == 1:
                 # return single block as is
                 return das_block[0].values
@@ -428,14 +474,22 @@ class Stack_phasediff(Stack_base):
         data = dask.array.blockwise(
             block_dask,
             'zyx',
-            pair, 'z',
+            stackval, 'z',
             ys, 'y',
             xs, 'x',
             dtype=datas[0].dtype
         )
-        da = xr.DataArray(data, coords={'pair': pair, 'y': ys, 'x': xs}).rename(datas[0].name)
+        da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
+            .rename(datas[0].name)\
+            .assign_attrs(datas[0].attrs)
         del data
-        return da
+        return self.spatial_ref(da, datas)
+
+    def concat_interferogram(self, datas=None, polarizations=None, compute=False):
+        return self.concat(datas, polarizations, wrap=True, compute=compute)
+
+    def concat_correlation(self, datas=None, polarizations=None, compute=False):
+        return self.concat(datas, polarizations, wrap=False, compute=compute)
 
     # def plot_phase(self, data, caption='Phase, [rad]',
     #                quantile=None, vmin=None, vmax=None, symmetrical=False,
@@ -569,11 +623,12 @@ class Stack_phasediff(Stack_base):
                 minmax = max(abs(_vmin), _vmax)
                 _vmin = -minmax
                 _vmax =  minmax
+
             # multi-plots ineffective for linked lazy data
             fg = (self.wrap(da) if wrap else da).rename(caption)\
                 .plot.imshow(
                 col='pair',
-                col_wrap=cols, size=size, aspect=aspect,
+                col_wrap=min(cols, da.pair.size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax, cmap=cmap
             )
             #fg.set_axis_labels('Range', 'Azimuth')
@@ -585,8 +640,15 @@ class Stack_phasediff(Stack_base):
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if not isinstance(data, (xr.Dataset, (list, tuple))):
-            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or list of xr.Dataset')
+        if not isinstance(data, (xr.Dataset, xr.DataArray, (list, tuple))):
+            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray or list of xr.Dataset or xr.DataArray')
+
+        # convert DataArray to Dataset to plot a single polarization
+        if isinstance(data, xr.DataArray):
+            data = data.to_dataset()
+        # convert list of DataArray to list of Dataset to plot a single polarization
+        if isinstance(data, (list, tuple)):
+            data = [da.to_dataset() for da in data]
 
         if polarizations is None:
             polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
