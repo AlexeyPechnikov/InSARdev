@@ -39,7 +39,7 @@ class Stack(Stack_export):
             df = df[df.index.get_level_values(2).isin([date] if isinstance(date, str) else date)]
         return df
 
-    def to_datasets(self, records=None):
+    def to_dataset(self, records=None):
         import pandas as pd
         #import numpy as np
         #import xarray as xr
@@ -60,10 +60,10 @@ class Stack(Stack_export):
             dss.append(ds)
         return dss
 
-    def to_dataset(self, records=None):
-        dss = self.to_datasets(records)
-        if len(dss) > 1:
-            return self.to_datasets(records)[0]
+    # def to_dataset(self, records=None):
+    #     dss = self.to_datasets(records)
+    #     if len(dss) > 1:
+    #         return self.to_datasets(records)[0]
 
     def __init__(self, basedir, pattern_burst='*_*_?W?',
                  pattern_date = 'S1_[0-9]+_IW[0-9]_[0-9]{8}T[0-9]{6}_[HV]{2}_.*-BURST\.nc',
