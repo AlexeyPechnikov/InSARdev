@@ -593,10 +593,13 @@ class Stack_phasediff(Stack_base):
             screen = (8000,4000)
 
         def plot_polarization(data, polarization):
+
+            stackvar = list(data.dims)[0]
+
             if isinstance(data, xr.Dataset):
-                da = data[polarization].isel(pair=slice(0, rows))
+                da = data[polarization].isel({stackvar: slice(0, rows)})
             else:
-                das = [da[polarization].isel(pair=slice(0, rows)) for da in data]
+                das = [da[polarization].isel({stackvar: slice(0, rows)}) for da in data]
                 da = self.concat(das, wrap=wrap)
                 del das
 
@@ -627,8 +630,8 @@ class Stack_phasediff(Stack_base):
             # multi-plots ineffective for linked lazy data
             fg = (self.wrap(da) if wrap else da).rename(caption)\
                 .plot.imshow(
-                col='pair',
-                col_wrap=min(cols, da.pair.size), size=size, aspect=aspect,
+                col=stackvar,
+                col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax, cmap=cmap
             )
             #fg.set_axis_labels('Range', 'Azimuth')
@@ -659,10 +662,24 @@ class Stack_phasediff(Stack_base):
         for pol in polarizations:
             plot_polarization(data, polarization=pol)
 
+    def plot_displacement_mm(self, data, polarizations=None,
+                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
+                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+        data_los_mm = self.los_displacement_mm(data)
+        self.plot_stack(data_los_mm, polarizations,
+                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
+
+    def plot_displacement(self, data, polarizations=None,
+                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
+                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+        self.plot_stack(data, polarizations,
+                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
+
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        import numpy as np
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
