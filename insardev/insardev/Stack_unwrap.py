@@ -9,6 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_unwrap_snaphu import Stack_unwrap_snaphu
+from insardev_toolkit import progressbar
 # required for function decorators
 from numba import jit
 # import directive is not compatible to numba
@@ -462,7 +463,7 @@ class Stack_unwrap(Stack_unwrap_snaphu):
     
         return model.rename('unwrap')
 
-    def unwrap_snaphu(self, phase, weight=None, conf=None, conncomp=False):
+    def _unwrap_snaphu(self, phase, weight=None, conf=None, conncomp=False):
         """
         Limit number of processes for tiled multicore SNAPHU configuration:
         with dask.config.set(scheduler='single-threaded'):
@@ -476,16 +477,19 @@ class Stack_unwrap(Stack_unwrap_snaphu):
         import numpy as np
         import dask
 
-        # output dataset variables
-        keys = {0: 'phase', 1: 'conncomp'}
+        #print ('_unwrap_snaphu', phase, weight, conf, conncomp)
+
+        #assert isinstance(phase, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: phase should be a list or tuple or Dataset or DataArray'
+        assert isinstance(phase, xr.DataArray), 'ERROR: phase should be a DataArray'
+        assert len(list(phase.shape)) == 2 or len(list(phase.shape)) == 3, 'ERROR: phase should be 2D or 3D array'
+        assert weight is None or isinstance(weight, xr.DataArray), 'ERROR: optional weight should be a DataArray'
+        assert weight is None or len(list(weight.shape)) == 2 or len(list(weight.shape)) == 3, 'ERROR: optional weight should be 2D or 3D array'
+        assert weight is None or phase.shape == weight.shape, 'ERROR: phase and optional weight variables should have the same shape'
 
         if len(phase.dims) == 2:
             stackvar = None
         else:
             stackvar = phase.dims[0]
-
-        if weight is not None:
-            assert phase.shape == weight.shape, 'ERROR: phase and weight variables have different shape'
 
         def _snaphu(ind):
             ds = self.snaphu(self.wrap(phase.isel({stackvar: ind}) if stackvar is not None else phase),
@@ -511,13 +515,92 @@ class Stack_unwrap(Stack_unwrap_snaphu):
         dask_block = dask.array.concatenate(stack)
         del stack
         if stackvar is not None:
-            ds = xr.merge([xr.DataArray(dask_block[idx::2 if conncomp else 1], coords=phase.coords).rename(keys[idx])
-                               for idx in range(2 if conncomp else 1)])
+            dss = [xr.DataArray(dask_block[idx::2 if conncomp else 1], coords=phase.coords).rename(phase.name)
+                               for idx in range(2 if conncomp else 1)]
         else:
-            ds = xr.merge([xr.DataArray(block, coords=phase.coords).rename(keys[idx])
-                           for idx, block in enumerate(dask_block)])
+            dss = [xr.DataArray(block, coords=phase.coords).rename(phase.name)
+                           for idx, block in enumerate(dask_block)]
         del dask_block
-        return ds
+        # unify the output
+        return dss if len(dss) > 1 else [dss[0], None]
+
+
+    def unwrap_snaphu(self, datas, weights=None, conf=None, conncomp=False, polarizations=None, compute=False, debug=False):
+        import xarray as xr
+        import numpy as np
+        import dask
+
+        assert datas is None or isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: optional datas should be a list or tuple or Dataset or DataArray'
+
+        datas_iterable = isinstance(datas, (list, tuple))
+        #print ('datas_iterable', datas_iterable)
+        datas_dataset = isinstance(datas[0], xr.Dataset) if datas_iterable else isinstance(datas, xr.Dataset)
+        #print ('datas_dataset', datas_dataset)
+
+        if not isinstance(datas, (list, tuple)):
+            assert weights is None or not isinstance(weights, (list, tuple)), 'ERROR: optional weights should be an iterable as datas'
+            if isinstance(datas, xr.Dataset):
+                assert weights is None or isinstance(weights, xr.Dataset), 'ERROR: optional weights should be a Dataset as datas'
+                datas = [datas]
+                weights = [weights] if weights is not None else None
+            elif isinstance(datas, xr.DataArray):
+                assert weights is None or isinstance(weights, xr.DataArray), 'ERROR: optional weights should be a DataArray as datas'
+                datas = [datas.to_dataset()]
+                weights = [weights.to_dataset()] if weights is not None else None
+            else:
+                raise ValueError(f'ERROR: datas is not a Dataset and DataArray or list or tuple of them: {type(datas)}')
+        else:
+            if isinstance(datas[0], xr.Dataset):
+                assert weights is None or isinstance(weights[0], xr.Dataset), 'ERROR: optional weights should be an iterable of Dataset as datas'
+                pass
+            elif isinstance(datas[0], xr.DataArray):
+                assert weights is None or isinstance(weights[0], xr.DataArray), 'ERROR: optional weights should be an iterable of DataArray as datas'
+                datas = [ds.to_dataset() for ds in datas]
+                weights = [weights.to_dataset() for weights in weights] if weights is not None else None
+            else:
+                raise ValueError('ERROR: datas is not a DataArray or Dataset or iterable of them')
+        
+        # copy id from the data to the result
+        ids = [ds.attrs.get('id', None) for ds in datas]
+
+        if polarizations is None:
+            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+        elif isinstance(polarizations, str):
+            polarizations = [polarizations]
+        #print ('polarizations', polarizations)
+        
+        total_unwraps = []
+        total_comps = []
+        for idx in range(len(datas)):
+            data = datas[idx]
+            weight = weights[idx] if weights is not None else None
+            unwraps = []
+            comps = []
+            for pol in polarizations:
+                unwrap, comp = self._unwrap_snaphu(phase=data[pol],
+                                                weight=weight[pol] if weight is not None else None,
+                                                conncomp=conncomp)
+                unwraps.append(unwrap)
+                comps.append(comp)
+            unwraps = xr.merge(unwraps).assign_attrs(id=ids[idx])
+            comps = xr.merge(comps).assign_attrs(id=ids[idx]) if conncomp else None
+            total_unwraps.append(unwraps)
+            total_comps.append(comps)
+
+        if compute:
+            progressbar(result := dask.persist(total_unwraps, total_comps), desc=f'Compute Unwrapping'.ljust(25))
+            unwraps, comps = result
+        else:
+            unwraps, comps = total_unwraps, total_comps
+        del total_unwraps, total_comps
+
+        if datas_dataset:
+            return (unwraps, comps if conncomp else None) if datas_iterable else (unwraps[0], comps[0] if conncomp else None)
+        
+        if datas_iterable:
+            return ([ds[polarizations[0]] for ds in unwraps], [ds[polarizations[0]] for ds in comps] if conncomp else None)
+        else:
+            return (unwraps[0][polarizations[0]], comps[0][polarizations[0]] if conncomp else None)
 
     def interpolate_nearest(self, data, search_radius_pixels=None):
         """
