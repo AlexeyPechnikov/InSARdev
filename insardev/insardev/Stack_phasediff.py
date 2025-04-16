@@ -120,6 +120,8 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
+        assert datas is None or isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: optional datas should be a list or tuple or Dataset or DataArray'
+
         if datas is None:
             datas = self.dss
 
