@@ -57,7 +57,8 @@ setup(
                       'statsmodels>=0.14.0',
                       'matplotlib',
                       'adjustText',
-                      'seaborn'
+                      'seaborn',
+                      'bottleneck'
                       ],
 #    extras_require={
 #                      'vtk_support': ['vtk', 'panel']

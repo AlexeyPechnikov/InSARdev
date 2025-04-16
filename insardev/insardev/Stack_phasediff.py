@@ -413,7 +413,8 @@ class Stack_phasediff(Stack_base):
     def concat(self, datas=None, polarizations=None, wrap=False, compute=False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
-        xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
+        xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
+        #xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
         """
         import xarray as xr
         import numpy as np
@@ -495,13 +496,14 @@ class Stack_phasediff(Stack_base):
             if len(das_block) == 1:
                 # return single block as is
                 return das_block[0].values
-            if not wrap:
-                # calculate arithmetic mean for phase and correlation data
-                return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
-            else:
-                # calculate circular mean for interferogram data
-                block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
-                return np.arctan2(block_complex.imag, block_complex.real)
+            return xr.concat(das_block, dim='stack_dim', join='inner').ffill('stack_dim').isel(stack_dim=-1).values
+            # if not wrap:
+            #     # calculate arithmetic mean for phase and correlation data
+            #     return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
+            # else:
+            #     # calculate circular mean for interferogram data
+            #     block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
+            #     return np.arctan2(block_complex.imag, block_complex.real)
 
         data = dask.array.blockwise(
             block_dask,
