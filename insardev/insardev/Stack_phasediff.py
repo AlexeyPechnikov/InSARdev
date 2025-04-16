@@ -13,43 +13,14 @@ from insardev_toolkit import progressbar
 
 class Stack_phasediff(Stack_base):
 
-    def interferogram(self, pairs, datas, weight, phase,
-                              resolution, wavelength, gaussian_threshold, psize, coarsen,
-                              stack, polarizations, compute, debug):
+
+    # internal method to compute interferogram on single polarization data array(s)
+    def _interferogram(self, pairs, datas, weight=None, phase=None,
+                              resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=None,
+                              stack=None, compute=False, debug=False):
         import xarray as xr
         import numpy as np
         import dask
-
-        if datas is None:
-            # list of datasets to process
-            datas = self.dss
-        
-        if not isinstance(datas, (list, tuple)):
-            datas = [datas]
-
-        if polarizations is None:
-            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
-        elif isinstance(polarizations, str):
-            polarizations = [polarizations]
-        
-        if len(polarizations) > 1:
-            intfs_total = []
-            corrs_total = []
-            for pol in polarizations:
-                intfs, corrs = self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                            resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold,
-                                            psize=psize, coarsen=coarsen,
-                                            stack=stack, polarizations=pol, compute=compute, debug=debug)
-                intfs_total.append(intfs)
-                corrs_total.append(corrs)
-                del intfs, corrs
-
-            intfs_total = [xr.merge([das[idx] for das in intfs_total]) for idx in range(len(intfs_total[0]))]
-            corrs_total = [xr.merge([das[idx] for das in corrs_total]) for idx in range(len(corrs_total[0]))]
-            return (intfs_total, corrs_total)
-        
-        # process single polarization
-        polarization = polarizations[0] if isinstance(polarizations, (list, tuple)) else polarizations
 
         # define anti-aliasing filter for the specified output resolution
         if wavelength is None:
@@ -70,19 +41,16 @@ class Stack_phasediff(Stack_base):
         
         intfs = []
         corrs = []
-        for data in datas:
-            # copy id from the data to the result
-            id = data.attrs.get('id', None)
-
+        for data in (datas if isinstance(datas, (list, tuple)) else [datas]):
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
-            intensity = np.square(np.abs(data[polarization]))
+            intensity = np.square(np.abs(data))
             # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
             intensity_look = self.multilooking(intensity, weight=weight,
                                                wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
             del intensity
             # calculate phase difference with topography correction
-            phasediff = self.phasediff(pairs, data[polarization], phase=phase, debug=debug)
+            phasediff = self.phasediff(pairs, data, phase=phase, debug=debug)
             # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
             phasediff_look = self.multilooking(phasediff, weight=weight,
                                                wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
@@ -125,22 +93,81 @@ class Stack_phasediff(Stack_base):
 
             if isinstance(stack, xr.DataArray):
                 #ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
-                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization).assign_attrs(id=id))
-                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest').to_dataset(name=polarization).assign_attrs(id=id))
+                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest'))
+                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest'))
             else:
-                intfs.append(das[0].to_dataset(name=polarization).assign_attrs(id=id))
-                corrs.append(das[1].to_dataset(name=polarization).assign_attrs(id=id))
+                intfs.append(das[0])
+                corrs.append(das[1])
             del das
 
         # clean up decimators after all iterations are complete
         del decimator_intf, decimator_corr
 
+        if not isinstance(datas, (list, tuple)):
+            intfs = intfs[0]
+            corrs = corrs[0]
+
         if compute:
-            progressbar(result := dask.persist(intfs, corrs), desc=f'Compute {polarization} Interferogram'.ljust(25))
+            progressbar(result := dask.persist(intfs, corrs), desc=f'Compute {data.name} Interferogram'.ljust(25))
             del intfs, corrs
             return result
         return (intfs, corrs)
 
+    def interferogram(self, pairs, datas, weight=None, phase=None,
+                              resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=None,
+                              stack=None, polarizations=None, compute=False, debug=False):
+        import xarray as xr
+        import numpy as np
+        import dask
+
+        if datas is None:
+            datas = self.dss
+
+        datas_iterable = isinstance(datas, (list, tuple))
+        #print ('datas_iterable', datas_iterable)
+        datas_dataset = isinstance(datas[0], xr.Dataset) if datas_iterable else isinstance(datas, xr.Dataset)
+        #print ('datas_dataset', datas_dataset)
+
+        if not isinstance(datas, (list, tuple)):
+            if isinstance(datas, xr.Dataset):
+                datas = [datas]
+            elif isinstance(datas, xr.DataArray):
+                datas = [datas.to_dataset()]
+            else:
+                raise ValueError(f'ERROR: datas is not a Dataset and DataArray or list or tuple of them: {type(datas)}')
+        else:
+            if isinstance(datas[0], xr.DataArray):
+                datas = [ds.to_dataset() for ds in datas]
+        
+        # copy id from the data to the result
+        ids = [ds.attrs.get('id', None) for ds in datas]
+
+        if polarizations is None:
+            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+        elif isinstance(polarizations, str):
+            polarizations = [polarizations]
+        #print ('polarizations', polarizations)
+        
+        intfs_pols = []
+        corrs_pols = []
+        for pol in polarizations:
+            intfs, corrs = self._interferogram(pairs, datas=[ds[pol] for ds in datas], weight=weight, phase=phase,
+                                        resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold,
+                                        psize=psize, coarsen=coarsen,
+                                        stack=stack, compute=compute, debug=debug)
+            intfs_pols.append(intfs)
+            corrs_pols.append(corrs)
+            del intfs, corrs
+
+        # if not datas_iterable:
+        #     intfs_pols = [intfs[0].assign_attrs(id=ids[0]) for intfs in intfs_pols]
+        #     corrs_pols = [corrs[0].assign_attrs(id=ids[0]) for corrs in corrs_pols]
+        #     return (intfs_pols[0], corrs_pols[0]) 
+        #     #return (intfs_pols[0], corrs_pols[0]) if datas_dataset else (intfs_pols[0][polarizations[0]], corrs_pols[0][polarizations[0]])
+
+        intfs_pols = [xr.merge([das[idx].assign_attrs(id=ids[idx]) for das in intfs_pols]) for idx in range(len(intfs_pols[0]))]
+        corrs_pols = [xr.merge([das[idx].assign_attrs(id=ids[idx]) for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
+        return (intfs_pols, corrs_pols) if datas_dataset else ([intf[polarizations[0]] for intf in intfs_pols], [corrs[polarizations[0]] for corrs in corrs_pols])
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
@@ -168,7 +195,7 @@ class Stack_phasediff(Stack_base):
             print ('DEBUG: interferogram')
 
         if np.issubdtype(phase.dtype, np.complexfloating):
-            return np.arctan2(phase.imag, phase.real).rename('phase')
+            return np.arctan2(phase.imag, phase.real)
         return phase
 
 #     @staticmethod
@@ -226,7 +253,7 @@ class Stack_phasediff(Stack_base):
             stack.append(corr)
             del corr
 
-        return xr.concat(stack, dim='pair').rename('correlation')
+        return xr.concat(stack, dim='pair')
 
     def phasediff(self, pairs, data, phase=None, debug=False):
         import dask.array as da
@@ -263,7 +290,7 @@ class Stack_phasediff(Stack_base):
                .assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
         del phase_correction, data1, data2
         
-        return da.rename('phase')
+        return da
 
     def goldstein(self, phase, corr, psize=32, debug=False):
         import xarray as xr
@@ -376,7 +403,7 @@ class Stack_phasediff(Stack_base):
             ds = xr.DataArray(stack[0], coords=phase.coords)
         del stack
         # replace zeros produces in NODATA areas
-        return ds.where(ds).rename('phase')
+        return ds.where(ds).rename(phase.name)
 
     def concat(self, datas=None, polarizations=None, wrap=False, compute=False):
         """
@@ -490,285 +517,3 @@ class Stack_phasediff(Stack_base):
 
     def concat_correlation(self, datas=None, polarizations=None, compute=False):
         return self.concat(datas, polarizations, wrap=False, compute=compute)
-
-    # def plot_phase(self, data, caption='Phase, [rad]',
-    #                quantile=None, vmin=None, vmax=None, symmetrical=False,
-    #                cmap='turbo', aspect=None, **kwargs):
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     if quantile is not None:
-    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
-
-    #     if quantile is not None:
-    #         vmin, vmax = np.nanquantile(data, quantile)
-
-    #     # define symmetrical boundaries
-    #     if symmetrical is True and vmax > 0:
-    #         minmax = max(abs(vmin), vmax)
-    #         vmin = -minmax
-    #         vmax =  minmax
-
-    #     plt.figure()
-    #     data.plot.imshow(vmin=vmin, vmax=vmax, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    # def plot_phases(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
-    #                 quantile=None, vmin=None, vmax=None, symmetrical=False, **kwargs):
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     if quantile is not None:
-    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
-
-    #     if quantile is not None:
-    #         vmin, vmax = np.nanquantile(data, quantile)
-
-    #     # define symmetrical boundaries
-    #     if symmetrical is True and vmax > 0:
-    #         minmax = max(abs(vmin), vmax)
-    #         vmin = -minmax
-    #         vmax =  minmax
-
-    #     # multi-plots ineffective for linked lazy data
-    #     fg = data.plot.imshow(
-    #         col='pair',
-    #         col_wrap=cols, size=size, aspect=aspect,
-    #         vmin=vmin, vmax=vmax, cmap='turbo'
-    #     )
-    #     #fg.set_axis_labels('Range', 'Azimuth')
-    #     fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-    #     fg.fig.suptitle(caption, y=y)
-        
-    #     #self.plots_AOI(fg, **kwargs)
-    #     #self.plots_POI(fg, **kwargs)
-
-    # def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
-    #     import xarray as xr
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if isinstance(data, xr.Dataset):
-    #         data = data.phase
-
-    #     if data.dims == ('pair', 'y', 'x'):
-    #         data = data.isel(pair=0)
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     plt.figure()
-    #     self.wrap(self.interferogram(data) if np.issubdtype(data.dtype, np.complexfloating) else data)\
-    #         .plot.imshow(vmin=-np.pi, vmax=np.pi, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    def plot_stack(self, data, polarizations,
-                   cmap, vmin, vmax, quantile, symmetrical,
-                   caption, cols, rows, size, nbins, aspect, y, wrap, screen=None, **kwargs):
-        import xarray as xr
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
-
-        # screen size in pixels (width, height) to estimate reasonable number pixels per plot
-        # this is quite large to prevent aliasing on 600dpi plots without additional processing
-        if screen is None:
-            screen = (8000,4000)
-
-        def plot_polarization(data, polarization):
-
-            stackvar = list(data.dims)[0]
-
-            if isinstance(data, xr.Dataset):
-                da = data[polarization].isel({stackvar: slice(0, rows)})
-            else:
-                das = [da[polarization].isel({stackvar: slice(0, rows)}) for da in data]
-                da = self.concat(das, wrap=wrap)
-                del das
-
-            if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
-                da = da.unstack('stack')
-            
-            # there is no reason to plot huge arrays much larger than screen size for small plots
-            #print ('screen_size', screen_size)
-            size_y, size_x = da.shape[1:]
-            #print ('size_x, size_y', size_x, size_y)
-            factor_y = int(np.round(size_y / (screen[1] / rows)))
-            factor_x = int(np.round(size_x / (screen[0] / cols)))
-            #print ('factor_x, factor_y', factor_x, factor_y)
-            # decimate and materialize data for all the calculations and plotting
-            da = da[:,::max(1, factor_y),::max(1, factor_x)].compute()
-
-            # calculate min, max when needed
-            if quantile is not None:
-                _vmin, _vmax = np.nanquantile(da, quantile)
-            else:
-                _vmin, _vmax = vmin, vmax
-            # define symmetrical boundaries
-            if symmetrical is True and _vmax > 0:
-                minmax = max(abs(_vmin), _vmax)
-                _vmin = -minmax
-                _vmax =  minmax
-
-            # multi-plots ineffective for linked lazy data
-            fg = (self.wrap(da) if wrap else da).rename(caption)\
-                .plot.imshow(
-                col=stackvar,
-                col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
-                vmin=_vmin, vmax=_vmax, cmap=cmap
-            )
-            #fg.set_axis_labels('Range', 'Azimuth')
-            fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-            fg.fig.suptitle(f'{polarization} {caption}', y=y)            
-            #self.plots_AOI(fg, **kwargs)
-            #self.plots_POI(fg, **kwargs)
-
-        if quantile is not None:
-            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
-
-        if not isinstance(data, (xr.Dataset, xr.DataArray, (list, tuple))):
-            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray or list of xr.Dataset or xr.DataArray')
-
-        # convert DataArray to Dataset to plot a single polarization
-        if isinstance(data, xr.DataArray):
-            data = data.to_dataset()
-        # convert list of DataArray to list of Dataset to plot a single polarization
-        if isinstance(data, (list, tuple)):
-            data = [da.to_dataset() for da in data]
-
-        if polarizations is None:
-            polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
-        elif isinstance(polarizations, str):
-            polarizations = [polarizations]
-
-        # process polarizations one by one
-        for pol in polarizations:
-            plot_polarization(data, polarization=pol)
-
-    def plot_displacement_mm(self, data, polarizations=None,
-                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        data_los_mm = self.los_displacement_mm(data)
-        self.plot_stack(data_los_mm, polarizations,
-                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
-
-    def plot_displacement(self, data, polarizations=None,
-                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        self.plot_stack(data, polarizations,
-                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
-
-    def plot_phase(self, data, polarizations=None,
-                   cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        self.plot_stack(data, polarizations,
-                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
-
-    def plot_interferogram(self, data, polarizations=None,
-                           cmap='gist_rainbow_r',
-                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        import numpy as np
-        self.plot_stack(data, polarizations,
-                        cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, **kwargs)
-
-    def plot_correlation(self, data, polarizations=None,
-                         cmap='auto', vmin=0, vmax=1, quantile=None, symmetrical=False,
-                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
-        import matplotlib.colors as mcolors
-        if isinstance(cmap, str) and cmap == 'auto':
-            cmap = mcolors.LinearSegmentedColormap.from_list(
-                name='custom_gray', 
-                colors=['black', 'whitesmoke']
-            )
-        self.plot_stack(data, polarizations,
-                        cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, screen=screen, **kwargs)
-
-    # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
-    #     import xarray as xr
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if isinstance(data, xr.Dataset):
-    #         data = data.correlation
-
-    #     if data.dims == ('pair', 'y', 'x'):
-    #         data = data.isel(pair=0)
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     plt.figure()
-    #     data.plot.imshow(vmin=0, vmax=1, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    def plot_stack_correlation(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto', **kwargs):
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        import matplotlib.colors as mcolors
-
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
-
-        if isinstance(cmap, str) and cmap == 'auto':
-            cmap = mcolors.LinearSegmentedColormap.from_list(
-                name='custom_gray', 
-                colors=['black', 'whitesmoke']
-            )
-    
-        data_flatten = data.values.ravel()
-    
-        fig, axs = plt.subplots(1, 2)
-    
-        ax2 = axs[0].twinx()
-        axs[0].hist(data_flatten, range=(0, 1), bins=bins, density=False, cumulative=False, color='gray', edgecolor='black', alpha=0.5)
-        ax2.hist(data_flatten, range=(0, 1), bins=bins, density=False, cumulative=True, color='orange', edgecolor='black', alpha=0.25)
-    
-        mean_value = np.nanmean(data_flatten)
-        axs[0].axvline(mean_value, color='b', label=f'Average {mean_value:0.3f}')
-        median_value = np.nanmedian(data_flatten)
-        axs[0].axvline(median_value, color='g', label=f'Median {median_value:0.3f}')
-        axs[0].set_xlim([0, 1])
-        axs[0].grid()
-        axs[0].set_xlabel('Correlation')
-        axs[0].set_ylabel('Count')
-        ax2.set_ylabel('Cumulative Count', color='orange')
-    
-        axs[0].set_title('Histogram')
-        if threshold is not None:
-            data.where(data > threshold).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1])
-            axs[1].set_title(f'Threshold = {threshold:0.3f}')
-            axs[0].axvline(threshold, linestyle='dashed', color='black', label=f'Threshold {threshold:0.3f}')
-        else:
-            data.where(data).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1])
-        axs[0].legend()
-        #self.plot_AOI(ax=axs[1], **kwargs)
-        #self.plot_POI(ax=axs[1], **kwargs)
-        plt.suptitle(caption)
-        plt.tight_layout()

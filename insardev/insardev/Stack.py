@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_export import Stack_export
+from .Stack_plot import Stack_plot
 
-class Stack(Stack_export):
+class Stack(Stack_plot):
 
     # redefine for fast caching
     netcdf_complevel = -1
