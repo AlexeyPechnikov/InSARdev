@@ -103,16 +103,19 @@ class Stack_plot(Stack_export):
 
     def plot_stack(self, data, polarizations,
                    cmap, vmin, vmax, quantile, symmetrical,
-                   caption, cols, rows, size, nbins, aspect, y, wrap, screen=None, **kwargs):
+                   caption, cols, rows, size, nbins, aspect, y, wrap, _screen=None, **kwargs):
         import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
 
+
+        assert isinstance(data, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a list or tuple or Dataset or DataArray'
+
         # screen size in pixels (width, height) to estimate reasonable number pixels per plot
         # this is quite large to prevent aliasing on 600dpi plots without additional processing
-        if screen is None:
-            screen = (8000,4000)
+        if _screen is None:
+            _screen = (8000,4000)
 
         def plot_polarization(data, polarization):
 
@@ -132,11 +135,11 @@ class Stack_plot(Stack_export):
             #print ('screen_size', screen_size)
             size_y, size_x = da.shape[1:]
             #print ('size_x, size_y', size_x, size_y)
-            factor_y = int(np.round(size_y / (screen[1] / rows)))
-            factor_x = int(np.round(size_x / (screen[0] / cols)))
+            factor_y = int(np.round(size_y / (_screen[1] / rows)))
+            factor_x = int(np.round(size_x / (_screen[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
-            # decimate and materialize data for all the calculations and plotting
-            da = da[:,::max(1, factor_y),::max(1, factor_x)].compute()
+            # coarsen and materialize data for all the calculations and plotting
+            da = da.coarsen(y=factor_y, x=factor_x, boundary='trim').mean().compute()
 
             # calculate min, max when needed
             if quantile is not None:
@@ -187,37 +190,37 @@ class Stack_plot(Stack_export):
 
     def plot_displacement_mm(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _screen=None, **kwargs):
         data_los_mm = self.los_displacement_mm(data)
         self.plot_stack(data_los_mm, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _screen=_screen, **kwargs)
 
     def plot_displacement(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _screen=None, **kwargs):
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _screen=_screen, **kwargs)
 
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _screen=None, **kwargs):
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, screen=screen, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _screen=_screen, **kwargs)
 
     def plot_interferogram(self, data, polarizations=None,
                            cmap='gist_rainbow_r',
-                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _screen=None, **kwargs):
         import numpy as np
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _screen=_screen, **kwargs)
 
     def plot_correlation(self, data, polarizations=None,
                          cmap='auto', vmin=0, vmax=1, quantile=None, symmetrical=False,
-                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, screen=None, **kwargs):
+                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _screen=None, **kwargs):
         import matplotlib.colors as mcolors
         if isinstance(cmap, str) and cmap == 'auto':
             cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -226,7 +229,7 @@ class Stack_plot(Stack_export):
             )
         self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, screen=screen, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _screen=_screen, **kwargs)
 
     # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
     #     import xarray as xr
