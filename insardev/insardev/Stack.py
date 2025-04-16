@@ -114,7 +114,7 @@ class Stack(Stack_plot):
         self.basedir = basedir
 
         dss = []
-        bursts = glob.glob(pattern_burst, root_dir=self.basedir)
+        bursts = sorted(glob.glob(pattern_burst, root_dir=self.basedir))
         #print ('bursts', bursts)
         for burst in bursts:
             basedir = os.path.join(self.basedir, burst)
