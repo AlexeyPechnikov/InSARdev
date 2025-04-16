@@ -109,6 +109,9 @@ class Stack_plot(Stack_export):
         import pandas as pd
         import matplotlib.pyplot as plt
 
+        # no data means no plot and no error
+        if data is None:
+            return
 
         assert isinstance(data, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a list or tuple or Dataset or DataArray'
 
@@ -139,7 +142,7 @@ class Stack_plot(Stack_export):
             factor_x = int(np.round(size_x / (_screen[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
             # coarsen and materialize data for all the calculations and plotting
-            da = da.coarsen(y=factor_y, x=factor_x, boundary='trim').mean().compute()
+            da = da.coarsen(y=max(1, factor_y), x=max(1, factor_x), boundary='trim').mean().compute()
 
             # calculate min, max when needed
             if quantile is not None:
