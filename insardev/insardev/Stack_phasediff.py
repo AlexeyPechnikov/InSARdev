@@ -365,13 +365,16 @@ class Stack_phasediff(Stack_base):
                     # Create proocessing windows
                     data_window = data[i:i+psize[0], j:j+psize[1]]
                     corr_window = corr[i:i+psize[0], j:j+psize[1]]
-                    wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
-                    # Apply the filter to the window
-                    filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
-                    # Add the result to the output array
-                    slice_i = slice(i, min(i + psize[0], out.shape[0]))
-                    slice_j = slice(j, min(j + psize[1], out.shape[1]))
-                    out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
+                    # do not process NODATA areas filled with zeros
+                    fraction_valid = np.count_nonzero(data_window != 0) / data_window.size
+                    if fraction_valid >= 0.5:
+                        wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
+                        # Apply the filter to the window
+                        filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
+                        # Add the result to the output array
+                        slice_i = slice(i, min(i + psize[0], out.shape[0]))
+                        slice_j = slice(j, min(j + psize[1], out.shape[1]))
+                        out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
             return out
 
         assert phase.shape == corr.shape, f'ERROR: phase and correlation variables have different shape \
@@ -405,7 +408,7 @@ class Stack_phasediff(Stack_base):
             ds = xr.DataArray(stack[0], coords=phase.coords)
         del stack
         # replace zeros produces in NODATA areas
-        return ds.where(ds).rename(phase.name)
+        return ds.where(np.isfinite(phase)).rename(phase.name)
 
     def concat(self, datas=None, polarizations=None, wrap=False, compute=False):
         """
