@@ -22,6 +22,8 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
+        assert isinstance(datas, (list, tuple, xr.DataArray)), 'ERROR: datas should be a list or tuple or DataArray'
+
         # define anti-aliasing filter for the specified output resolution
         if wavelength is None:
             wavelength = resolution
@@ -120,10 +122,10 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
-        assert datas is None or isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: optional datas should be a list or tuple or Dataset or DataArray'
+        assert isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: datas should be a list or tuple or Dataset or DataArray'
 
-        if datas is None:
-            datas = self.dss
+        # if datas is None:
+        #     datas = self.dss
 
         datas_iterable = isinstance(datas, (list, tuple))
         #print ('datas_iterable', datas_iterable)
@@ -488,7 +490,8 @@ class Stack_phasediff(Stack_base):
         def block_dask(stack, y_chunk, x_chunk):
             #print ('pair', pair)
             das_slice = [da.sel(y=slice(y_chunk.min(), y_chunk.max()), x=slice(x_chunk.min(), x_chunk.max())).compute(num_workers=1) for da in datas]
-            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=np.nan, copy=False) for da in das_slice if da.y.size > 0 and da.x.size > 0]
+            fill_nan = np.nan * np.ones((), dtype=das_slice[0].dtype)
+            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.y.size > 0 and da.x.size > 0]
             del das_slice
             if len(das_block) == 0:
                 # return empty block
@@ -496,7 +499,14 @@ class Stack_phasediff(Stack_base):
             if len(das_block) == 1:
                 # return single block as is
                 return das_block[0].values
-            return xr.concat(das_block, dim='stack_dim', join='inner').ffill('stack_dim').isel(stack_dim=-1).values
+
+            das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+            # ffill does not work correct on complex data and per-component ffill is faster
+            if np.issubdtype(das_block_concat.dtype, np.complexfloating):
+                return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
+                        + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
+            else:
+                return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
             # if not wrap:
             #     # calculate arithmetic mean for phase and correlation data
             #     return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
