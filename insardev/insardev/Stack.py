@@ -45,24 +45,36 @@ class Stack(Stack_plot):
             df = df[df.index.get_level_values(2).isin([date] if isinstance(date, str) else date)]
         return df
 
-    def to_dataset(self, records=None):
+    def to_dataset(self, records=None, polarizations=None, ids=None):
         import pandas as pd
-        #import numpy as np
-        #import xarray as xr
-        #data = xr.concat(xr.align(*self.dss, join='outer'), dim='stack_dim').mean('stack_dim')
+
+        print ('records', records, 'polarizations', polarizations, 'ids', ids)
+        if records is None and polarizations is None and ids is None:
+            return self.dss
+
+        if ids is not None and isinstance(ids, str):
+            ids = [ids]
+        
+        if polarizations is not None and isinstance(polarizations, str):
+            polarizations = [polarizations]
+        polarizations_all = [pol for pol in ['VV','VH','HH','HV'] if pol in self.dss[0].data_vars]
 
         if records is None:
-            # list of datasets
-            return self.dss
+            records = self.df
             #if dates is None else [ds.sel(date=dates) for ds in self.dss]
         
         assert isinstance(records, pd.DataFrame)
         
         dss = []
-        for id in records.index.get_level_values(0).unique():
-            dates = records[records.index.get_level_values(0)==id].index.get_level_values(2).astype(str)
-            #print ('id', id, 'dates', dates)
-            ds = [ds for ds in self.dss if ds.id==id][0].sel(date=dates)
+        for rid in records.index.get_level_values(0).unique():
+            if ids is not None and not rid in ids:
+                continue
+            dates = records[records.index.get_level_values(0)==rid].index.get_level_values(2).astype(str)
+            ds = [ds for ds in self.dss if ds.id==rid][0].sel(date=dates)
+            if polarizations is not None:
+                for pol in polarizations_all:
+                    if pol not in polarizations:
+                        ds = ds.drop(pol)
             dss.append(ds)
         return dss
 
