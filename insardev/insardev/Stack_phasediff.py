@@ -412,7 +412,7 @@ class Stack_phasediff(Stack_base):
         # replace zeros produces in NODATA areas
         return ds.where(np.isfinite(phase)).rename(phase.name)
 
-    def concat(self, datas=None, polarizations=None, wrap=False, compute=False):
+    def union(self, datas=None, polarizations=None, compute=False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
         xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
@@ -422,7 +422,7 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
-        #print ('datas', datas, 'polarizations', polarizations, 'wrap', wrap)
+        #print ('datas', datas, 'polarizations', polarizations)
         #print ()
         # if datas is None:
         #     datas = self.dss
@@ -455,7 +455,7 @@ class Stack_phasediff(Stack_base):
             
             das_total = []
             for pol in polarizations:
-                das = self.concat([ds[pol] for ds in datas], wrap=wrap)
+                das = self.union([ds[pol] for ds in datas])
                 das_total.append(das)
                 del das
             das_total = xr.merge(das_total)
@@ -477,31 +477,47 @@ class Stack_phasediff(Stack_base):
         stackvar = list(datas[0].dims)[0]
         # workaround for dask.array.blockwise
         stackval = datas[0][stackvar].astype(str)
+        stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
         dy = datas[0].y.diff('y').item(0)
         dx = datas[0].x.diff('x').item(0)
         #print ('dy, dx', dy, dx)
-        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y']).chunk({'y': self.chunksize})
-        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x']).chunk({'x': self.chunksize})
-        #print ('pair', pair)
+        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y'])
+        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x'])
+        #print ('stack', stackvar, stackval)
         #print ('ys', ys)
         #print ('xs', xs)
+        # extract extents of all datasets once
+        extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
         
         # use outer variable datas
         def block_dask(stack, y_chunk, x_chunk):
             #print ('pair', pair)
-            das_slice = [da.sel(y=slice(y_chunk.min(), y_chunk.max()), x=slice(x_chunk.min(), x_chunk.max())).compute(num_workers=1) for da in datas]
-            fill_nan = np.nan * np.ones((), dtype=das_slice[0].dtype)
-            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.y.size > 0 and da.x.size > 0]
-            del das_slice
-            if len(das_block) == 0:
+            #print ('concat: block_dask', stackvar, stack)
+            # extract extent of the current chunk once
+            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
+            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
+            # select all datasets overlapping with the current chunk
+            das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute(num_workers=1)
+                         for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
+                         if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
+            #print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
+            
+            fill_dtype = datas[0].dtype
+            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+            if len(das_slice) == 0:
                 # return empty block
-                return np.full((stack.size, y_chunk.size, x_chunk.size), np.nan, dtype=datas[0].dtype)
+                return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
+            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
+            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice]
+            del das_slice
             if len(das_block) == 1:
                 # return single block as is
                 return das_block[0].values
 
             das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
             # ffill does not work correct on complex data and per-component ffill is faster
+            # the magic trick is to use sorting to ensure burst overpapping order
+            # bursts ends should be overlapped by bursts starts
             if np.issubdtype(das_block_concat.dtype, np.complexfloating):
                 return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
                         + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
@@ -515,22 +531,17 @@ class Stack_phasediff(Stack_base):
             #     block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
             #     return np.arctan2(block_complex.imag, block_complex.real)
 
+        # rechunk data for expected usage
         data = dask.array.blockwise(
             block_dask,
             'zyx',
-            stackval, 'z',
-            ys, 'y',
-            xs, 'x',
-            dtype=datas[0].dtype
+            stackidx.chunk(1), 'z',
+            ys.chunk({'y': self.chunksize}), 'y',
+            xs.chunk({'x': self.chunksize}), 'x',
+            meta = np.empty((0, 0, 0), dtype=datas[0].dtype)
         )
         da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
             .rename(datas[0].name)\
             .assign_attrs(datas[0].attrs)
         del data
         return self.spatial_ref(da, datas)
-
-    def concat_interferogram(self, datas=None, polarizations=None, compute=False):
-        return self.concat(datas, polarizations, wrap=True, compute=compute)
-
-    def concat_correlation(self, datas=None, polarizations=None, compute=False):
-        return self.concat(datas, polarizations, wrap=False, compute=compute)
