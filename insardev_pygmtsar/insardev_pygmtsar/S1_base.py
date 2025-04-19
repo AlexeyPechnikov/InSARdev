@@ -15,7 +15,7 @@ class S1_base(progressbar_joblib, datagrid):
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
 
-    def to_dataframe(self):
+    def to_dataframe(self, crs=4326):
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -28,7 +28,14 @@ class S1_base(progressbar_joblib, datagrid):
         --------
         df = stack.to_dataframe()
         """
-        return self.df
+        if self.reference is None:
+            df = self.df
+        else:
+            path_number = self.df[self.df.startTime.dt.date.astype(str)==self.reference].pathNumber.unique()
+            if len(path_number) == 0:
+                return self.df
+            df = self.df[self.df.pathNumber==path_number[0]]
+        return df.set_crs(4326).to_crs(crs)
 
     def get_prefix(self, burst):
         df = self.get_record(burst)
@@ -78,7 +85,7 @@ class S1_base(progressbar_joblib, datagrid):
         """
         return self.reference
 
-    def set_reference(self, reference):
+    def set_reference(self, reference='auto'):
         """
         Define reference date for Stack object.
 
@@ -98,13 +105,21 @@ class S1_base(progressbar_joblib, datagrid):
         stack.set_reference('2022-01-20')
         """
         if reference is None:
-            if self.reference is None:
-                self.reference = self.df.startTime.dt.date.iloc[0]
-                print (f'NOTE: auto set reference date {self.reference}. You can change it like set_reference("{self.reference}")')
-            return self
-        assert reference in self.df.startTime.dt.date.astype(str).values, f'Reference burst(s) not found: {reference}'
+            self.reference = None
+            return
+        elif isinstance(reference, str) and reference == 'auto':
+            reference = str(self.df.startTime.dt.date.min())
+            print (f'NOTE: auto set reference date {reference}.')
+        else:
+            assert reference in self.df.startTime.dt.date.astype(str).values, f'Reference burst(s) not found: {reference}.'
+        path_number = self.df[self.df.startTime.dt.date.astype(str)==reference].pathNumber.unique()[0]
+        total_count = len(self.df)
+        df = self.df[self.df.pathNumber==path_number]
+        count = len(df)
+        if total_count != count:
+            print (f'NOTE: {total_count-count} bursts ignored and {count} bursts used for selected reference date {reference} and corresponding path number {path_number}.')
         self.reference = reference
-        return self
+        return
 
     def get_record(self, burst):
         """
@@ -127,13 +142,13 @@ class S1_base(progressbar_joblib, datagrid):
 
     def get_records_ref(self, records=None):
             if records is None:
-                records = self.df
+                records = self.to_dataframe()
             records_ref = records[records.startTime.dt.date.astype(str)==self.reference]
             return records_ref
 
     def get_records_rep(self, records=None):
             if records is None:
-                records = self.df
+                records = self.to_dataframe()
             records_rep = records[records.startTime.dt.date.astype(str)!=self.reference]
             return records_rep
     
@@ -147,5 +162,4 @@ class S1_base(progressbar_joblib, datagrid):
         reps_dict = {}
         for record in records_rep.itertuples():
             reps_dict[record.Index[2]] = record.Index[:2]
-        
         return {burst_rep: refs_dict[reps_dict[burst_rep]] for burst_rep in reps_dict.keys()}

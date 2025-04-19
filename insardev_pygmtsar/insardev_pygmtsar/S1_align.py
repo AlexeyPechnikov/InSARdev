@@ -49,7 +49,7 @@ class S1_align(S1_dem):
 
     # replacement for gmt grdfilter ../topo/dem.grd -D2 -Fg2 -I12s -Gflt.grd
     # use median decimation instead of average
-    def _get_topo_llt(self, degrees, debug=False):
+    def _get_topo_llt(self, burst, degrees, debug=False):
         """
         Get the topography coordinates (lon, lat, z) for decimated DEM.
 
@@ -72,7 +72,7 @@ class S1_align(S1_dem):
         warnings.filterwarnings('ignore')
 
         # add buffer around the cropped area for borders interpolation
-        dem_area = self.get_dem()
+        dem_area = self.get_dem(burst)
         
         ny = int(np.round(degrees/dem_area.lat.diff('lat')[0]))
         nx = int(np.round(degrees/dem_area.lon.diff('lon')[0]))
@@ -159,7 +159,7 @@ class S1_align(S1_dem):
 
         # prepare coarse DEM for alignment
         # 12 arc seconds resolution is enough, for SRTM 90m decimation is 4x4
-        topo_llt = self._get_topo_llt(degrees=degrees)
+        topo_llt = self._get_topo_llt(burst_ref, degrees=degrees)
         #topo_llt.shape
 
         # define relative filenames for PRM

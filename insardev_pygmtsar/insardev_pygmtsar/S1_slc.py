@@ -15,7 +15,7 @@ class S1_slc(S1_base):
     pattern_burst = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
     pattern_orbit = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
 
-    def __init__(self, datadir):
+    def __init__(self, datadir, workdir, drop_if_exists=False):
         """
         Scans the specified directory for Sentinel-1 SLC (Single Look Complex) data and filters it based on the provided parameters.
     
@@ -45,6 +45,16 @@ class S1_slc(S1_base):
         from dateutil.relativedelta import relativedelta
         oneday = relativedelta(days=1)
 
+        # (re)create basedir only when force=True
+        if os.path.exists(workdir):
+            if drop_if_exists:
+                shutil.rmtree(workdir, ignore_errors=True)
+            else:
+                #raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+                print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+        os.makedirs(workdir, exist_ok=True)
+        
+        self.basedir = workdir
         self.datadir = datadir
 
         orbits = glob(self.pattern_orbit, root_dir=self.datadir)
@@ -102,6 +112,14 @@ class S1_slc(S1_base):
         df = gpd.GeoDataFrame(df, geometry='geometry')\
             .sort_values(by=['fullBurstID','polarization','burst'])\
             .set_index(['fullBurstID','polarization','burst'])
+
+        path_numbers = df.pathNumber.unique().tolist()
+        min_dates = [str(df[df.pathNumber==path].startTime.dt.date.min()) for path in path_numbers]
+        if len(path_numbers) > 1:
+            print (f'WARNING: Multiple path numbers found in the dataset: {", ".join(map(str, path_numbers))}.')
+            print ('WARNING: You can process only one path number at a time selecting the corresponding reference date.')
+            print (f'NOTE: The following reference dates are available: {", ".join(min_dates)}.')
+        print (f'NOTE: Loaded {len(df)} bursts.')
         self.df = df
 
     def geoloc2geometry(self, annotation):

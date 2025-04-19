@@ -37,6 +37,15 @@ class S1_geocode(S1_align):
         from tqdm.auto import tqdm
         #import joblib
 
+        if epsg is None:
+            print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
+        elif isinstance(epsg, str) and epsg == 'auto':
+            epsgs = self.to_dataframe().centroid.apply(lambda geom: self.get_utm_epsg(geom.y, geom.x)).unique()
+            if len(epsgs) > 1:
+                raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
+            epsg = epsgs[0]
+            print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
+
         #print ('bursts', bursts)
         def burst_geocode(burst_ref, dem, resolution, epsg):
             #print ('burst', burst)
@@ -46,6 +55,7 @@ class S1_geocode(S1_align):
             #topo = self.get_topo(burst, trans_inv)
             #self.compute_trans_slc(burst, topo=topo)
             # save the grid (2 times faster)
+            # for topo phase calculation
             self.compute_trans_inv(burst_ref)
 
         bursts_ref = self.get_records_ref(records).index.get_level_values(2)
@@ -311,7 +321,7 @@ class S1_geocode(S1_align):
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), epsg='auto', interactive=False):
+    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), epsg=None, interactive=False):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -492,9 +502,9 @@ class S1_geocode(S1_align):
 
         if isinstance(dem, str) and dem == 'auto':
             # do not use coordinate names lat,lon because the output grid saved as (lon,lon) in this case...
-            dem = self.get_dem()
+            dem = self.get_dem(burst_ref)
 
-        if isinstance(epsg, str) and epsg == 'auto':
+        if epsg is None:
             epsg = self.get_utm_epsg(dem.lat.mean(), dem.lon.mean())
 
         a_max, r_max = prm.bounds()
@@ -517,7 +527,7 @@ class S1_geocode(S1_align):
         dem_spacing = ((dem_y_max - dem_y_min)/dem.lat.size, (dem_x_max - dem_x_min)/dem.lon.size)
         #print (f'DEM spacing: {dem_spacing}')
 
-        # transform user-specified grid resolution to proccoarsen factor
+        # transform user-specified grid resolution to coarsen factor
         coarsen = (
             max(1, int(np.round(dem_spacing[0]/resolution[0]))),
             max(1, int(np.round(dem_spacing[1]/resolution[1])))

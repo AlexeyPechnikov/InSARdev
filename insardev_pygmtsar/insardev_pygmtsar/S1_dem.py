@@ -15,17 +15,17 @@ class S1_dem(S1_tidal):
 
     buffer_degrees = 0.02
 
-    def get_extent_ra(self):
-        """
-        minx, miny, maxx, maxy = np.round(geom.bounds).astype(int)
-        """
-        import numpy as np
-        from shapely.geometry import LineString
+    # def get_extent_ra(self):
+    #     """
+    #     minx, miny, maxx, maxy = np.round(geom.bounds).astype(int)
+    #     """
+    #     import numpy as np
+    #     from shapely.geometry import LineString
 
-        dem = self.get_dem()
-        df = dem.isel(lon=[0,-1]).to_dataframe().reset_index()
-        geom = self.geocode(LineString(np.column_stack([df.lon, df.lat])))
-        return geom
+    #     dem = self.get_dem()
+    #     df = dem.isel(lon=[0,-1]).to_dataframe().reset_index()
+    #     geom = self.geocode(LineString(np.column_stack([df.lon, df.lat])))
+    #     return geom
 
     def get_geoid(self, grid=None):
         """
@@ -58,46 +58,46 @@ class S1_dem(S1_tidal):
             return self.interp2d_like(geoid, grid)
         return geoid
 
-    def set_dem(self, dem_filename):
-        """
-        Set the filename of the digital elevation model (DEM) in WGS84 NetCDF grid.
+    # def set_dem(self, dem_filename):
+    #     """
+    #     Set the filename of the digital elevation model (DEM) in WGS84 NetCDF grid.
 
-        Parameters
-        ----------
-        dem_filename : str or None
-            Path to the WGS84 NetCDF DEM file. If provided, the DEM filename will be set. If None, the DEM filename will be cleared.
+    #     Parameters
+    #     ----------
+    #     dem_filename : str or None
+    #         Path to the WGS84 NetCDF DEM file. If provided, the DEM filename will be set. If None, the DEM filename will be cleared.
 
-        Returns
-        -------
-        self
-            Returns the modified instance of the class.
+    #     Returns
+    #     -------
+    #     self
+    #         Returns the modified instance of the class.
 
-        Examples
-        --------
-        Set the DEM filename:
-        stack = stack.set_dem('data/DEM_WGS84.nc')
+    #     Examples
+    #     --------
+    #     Set the DEM filename:
+    #     stack = stack.set_dem('data/DEM_WGS84.nc')
 
-        Notes
-        -----
-        This method sets the filename of the digital elevation model (DEM) data to be used in the SAR processing.
-        The DEM file is a NetCDF dataset in geographical coordinates containing elevation values for the Earth's surface.
-        By setting the DEM filename, it allows SAR processing algorithms to utilize the DEM data for geocoding, topographic
-        correction, and other applications. If `dem_filename` is None, the DEM filename will be cleared.
-        """
-        import os
-        if dem_filename is not None:
-            assert os.path.exists(dem_filename), f'DEM file not found: {dem_filename}'
-            assert os.path.isfile(dem_filename) and os.access(dem_filename, os.R_OK), f'DEM file is not readable: {dem_filename}'
-            self.dem_filename = os.path.relpath(dem_filename,'.')
-        else:
-            self.dem_filename = None
-        return self
+    #     Notes
+    #     -----
+    #     This method sets the filename of the digital elevation model (DEM) data to be used in the SAR processing.
+    #     The DEM file is a NetCDF dataset in geographical coordinates containing elevation values for the Earth's surface.
+    #     By setting the DEM filename, it allows SAR processing algorithms to utilize the DEM data for geocoding, topographic
+    #     correction, and other applications. If `dem_filename` is None, the DEM filename will be cleared.
+    #     """
+    #     import os
+    #     if dem_filename is not None:
+    #         assert os.path.exists(dem_filename), f'DEM file not found: {dem_filename}'
+    #         assert os.path.isfile(dem_filename) and os.access(dem_filename, os.R_OK), f'DEM file is not readable: {dem_filename}'
+    #         self.dem_filename = os.path.relpath(dem_filename,'.')
+    #     else:
+    #         self.dem_filename = None
+    #     return self
 
     # buffer required to get correct (binary) results from SAT_llt2rat tool
     # small buffer produces incomplete area coverage and restricted NaNs
     # 0.02 degrees works well worldwide but not in Siberia
     # minimum buffer size: 8 arc seconds for 90 m DEM
-    def get_dem(self):
+    def get_dem(self, burst=None, buffer_degrees=None):
         """
         Retrieve the digital elevation model (DEM) data.
 
@@ -133,13 +133,25 @@ class S1_dem(S1_tidal):
         if self.dem_filename is None:
             raise Exception('Set DEM first')
 
+        if buffer_degrees is None:
+            buffer_degrees = self.buffer_degrees
+
+        bounds = None
+        if burst is not None:
+            record = self.get_record(burst)
+            geometry = record.geometry.buffer(self.buffer_degrees)
+            bounds = geometry.bounds.values.flatten()
+
         dem = xr.open_dataset(self.dem_filename,
                               engine=self.netcdf_engine_read,
                               format=self.netcdf_format,
                               chunks=self.chunksize)
+
+        if bounds is not None:
+            dem = dem.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
         return dem['dem'].transpose('lat','lon')
 
-    def set_dem(self, data, geometry='auto', buffer_degrees=None):
+    def load_dem(self, data, geometry=None, buffer_degrees=None):
         """
         Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
 
@@ -177,10 +189,14 @@ class S1_dem(S1_tidal):
         import pandas as pd
         import os
 
+        if data is None:
+            self.dem_filename = None
+            return
+
         dem_filename = os.path.join(self.basedir, 'DEM_WGS84.nc')
 
         if self.dem_filename is not None:
-            print ('NOTE: DEM exists, ignore the command. Use Stack.set_dem(None) to allow new DEM downloading')
+            print ('NOTE: DEM exists, ignore the command. Use Stack.load_dem(None) to allow new DEM loading')
             return
 
         if buffer_degrees is not None:
@@ -202,18 +218,18 @@ class S1_dem(S1_tidal):
             print ('ERROR: filename extension is not recognized. Should be one from .tiff, .tif, .TIF, .nc, .netcdf, .grd')
         else:
             print ('ERROR: argument is not an Xarray object and it is not a file name')
-
+        ortho = ortho.transpose('lat','lon')
+        
         # unique indices required for interpolation
         lat_index = pd.Index(ortho.coords['lat'])
         lon_index = pd.Index(ortho.coords['lon'])
         duplicates = lat_index[lat_index.duplicated()].tolist() + lon_index[lon_index.duplicated()].tolist()
         assert len(duplicates) == 0, 'ERROR: DEM grid includes duplicated coordinates, possibly on merged tiles edges'
 
-        # crop to reference scene extent
-        geometry_auto = type(geometry) == str and geometry == 'auto'
-        bounds = self.get_bounds(self.df if geometry_auto else geometry)
-        ortho = ortho\
-               .transpose('lat','lon')\
+        # crop to the geometry extent
+        if geometry is not None:
+            bounds = self.get_bounds(geometry)
+            ortho = ortho\
                .sel(lat=slice(bounds[1] - self.buffer_degrees, bounds[3] + self.buffer_degrees),
                     lon=slice(bounds[0] - self.buffer_degrees, bounds[2] + self.buffer_degrees))
 
@@ -222,7 +238,6 @@ class S1_dem(S1_tidal):
         if os.path.exists(dem_filename):
             os.remove(dem_filename)
         encoding = {'dem': self.get_compression(ortho.shape)}
-
         delayed = self.spatial_ref((ortho + geoid).to_dataset(name='dem'), 4326)\
             .to_netcdf(dem_filename,
                        encoding=encoding,

@@ -24,7 +24,13 @@ class Stack(Stack_plot):
         """
         return self.dss[0].attrs[key]
 
-    def to_dataframe(self, id=None, date=None):
+    def crs(self):
+        return self.dss[0].rio.crs
+
+    def epsg(self):
+        return self.dss[0].rio.crs.to_epsg()
+
+    def to_dataframe(self, id=None, date=None, pathNumber=None, crs='auto'):
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -38,17 +44,21 @@ class Stack(Stack_plot):
         df = stack.to_dataframe()
         """
 
+        if crs is not None and isinstance(crs, str) and crs == 'auto':
+            crs = self.crs()
+
         df = self.df
         if id is not None:
             df = df[df.index.get_level_values(0).isin([id] if isinstance(id, str) else id)]
         if date is not None:
             df = df[df.index.get_level_values(2).isin([date] if isinstance(date, str) else date)]
-        return df
+        if pathNumber is not None:
+            df = df[df.pathNumber==pathNumber]
+        return df.set_crs(4326).to_crs(crs)
 
     def to_dataset(self, records=None, polarizations=None, ids=None):
         import pandas as pd
 
-        print ('records', records, 'polarizations', polarizations, 'ids', ids)
         if records is None and polarizations is None and ids is None:
             return self.dss
 
@@ -181,6 +191,8 @@ class Stack(Stack_plot):
             #ds_complex.attrs = ds_complex.data.attrs
             #ds_complex.data.attrs = {}
             dss.append(ds.assign_attrs({'id': burst}))
+
+        assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
         self.dss = dss
 
         # make attributes dataframe from datas

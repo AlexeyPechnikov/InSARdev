@@ -390,26 +390,50 @@ class datagrid:
 #         return matrix2d
 
     @staticmethod
-    def get_bounds(geometry):
+    def get_bounds(geometry, epsg=4326):
         import geopandas as gpd
         import xarray as xr
+        from shapely.geometry import Polygon
     
         if isinstance(geometry, (xr.DataArray, xr.Dataset)) and ('lat' in geometry.dims and 'lon' in geometry.dims):
+            # WGS84 coordinates expected
             lon_start = geometry.lon.min().item()
             lat_start = geometry.lat.min().item()
             lon_end   = geometry.lon.max().item()
             lat_end   = geometry.lat.max().item()
             bounds = lon_start, lat_start, lon_end, lat_end
         elif isinstance(geometry, (xr.DataArray, xr.Dataset)):
-            x_start = geometry.x.min().item()
-            y_start = geometry.y.min().item()
-            x_end   = geometry.x.max().item()
-            y_end   = geometry.y.max().item()
-            bounds = x_start, y_start, x_end, y_end
-        elif isinstance(geometry, gpd.GeoDataFrame):
-            bounds = geometry.dissolve().envelope.item().bounds
-        elif isinstance(geometry, gpd.GeoSeries):
-            bounds = geometry.union_all().envelope.bounds
+            # x_start = geometry.x.min().item()
+            # y_start = geometry.y.min().item()
+            # x_end   = geometry.x.max().item()
+            # y_end   = geometry.y.max().item()
+            # bounds = x_start, y_start, x_end, y_end
+            xmin, xmax = float(geometry.x.min()), float(geometry.x.max())
+            ymin, ymax = float(geometry.y.min()), float(geometry.y.max())
+            corners = [
+                (xmin, ymin),
+                (xmin, ymax),
+                (xmax, ymax),
+                (xmax, ymin),
+                (xmin, ymin),
+            ]
+            geom = gpd.GeoDataFrame({'geometry': [Polygon(corners)]})
+            if epsg is not None:
+                try:
+                    epsg_code = int(geometry.rio.crs.to_epsg())
+                    geom = geom.set_crs(epsg_code).to_crs(epsg)
+                except Exception:
+                    pass
+            bounds = geom.dissolve().envelope.item().bounds
+        elif isinstance(geometry, (gpd.GeoDataFrame, gpd.GeoSeries)):
+            #print ('Geometry is a GeoDataFrame')
+            geom = geometry
+            if epsg is not None:
+                try:
+                    geom = geometry.to_crs(epsg)
+                except:
+                    pass
+            bounds = geom.union_all().envelope.bounds if isinstance(geometry, gpd.GeoSeries) else geom.dissolve().envelope.item().bounds 
         elif isinstance(geometry, tuple):
             # geometry is already bounds
             bounds = geometry

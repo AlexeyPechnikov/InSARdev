@@ -21,18 +21,19 @@ class S1(S1_topo):
     dem_filename = None
     landmask_filename = None
     
-    def set_workdir(self, workdir, drop_if_exists=False):
-        import os
-        import shutil
+    # def set_workdir(self, workdir, drop_if_exists=False):
+    #     import os
+    #     import shutil
 
-        # (re)create basedir only when force=True
-        if os.path.exists(workdir):
-            if drop_if_exists:
-                shutil.rmtree(workdir)
-            else:
-                raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
-        os.makedirs(workdir)
-        self.basedir = workdir
+    #     # (re)create basedir only when force=True
+    #     if os.path.exists(workdir):
+    #         if drop_if_exists:
+    #             shutil.rmtree(workdir, ignore_errors=True)
+    #         else:
+    #             #raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+    #             print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+    #     os.makedirs(workdir, exist_ok=True)
+    #     self.basedir = workdir
 
     # def set_bursts(self, scenes, reference=None):
     #     assert len(scenes), 'ERROR: the scenes list is empty.'
@@ -55,20 +56,34 @@ class S1(S1_topo):
 #        matrix = np.array(coeffs[1:]).astype(float).reshape((shape[1],shape[0]))
 #        return (gauss_dec, matrix)
 
-    def plot(self, records=None, dem='auto', image=None, alpha=0.7, caption='Estimated Bursts Locations', cmap='turbo', aspect=None):
+    def plot(self, records=None, dem='auto', image=None, alpha=0.7, caption='Estimated Bursts Locations', cmap='turbo', aspect=None, _size=None):
+        import numpy as np
         import matplotlib.pyplot as plt
         import matplotlib
 
-        if records is None:
-            records = self.df
+        # screen size in pixels (width, height) to estimate reasonable number pixels per plot
+        # this is quite large to prevent aliasing on 600dpi plots without additional processing
+        if _size is None:
+            _size = (2000,1000)
 
+        if records is None:
+            records = self.to_dataframe()
+        
         plt.figure()
         if image is not None:
             image.plot.imshow(cmap='gray', alpha=alpha, add_colorbar=False)
         if isinstance(dem, str) and dem == 'auto':
             if self.dem_filename is not None:
                 dem = self.get_dem()
-                # TODO: check shape and decimate large grids
+                # there is no reason to plot huge arrays much larger than screen size for small plots
+                #print ('screen_size', screen_size)
+                size_y, size_x = dem.shape
+                #print ('size_x, size_y', size_x, size_y)
+                factor_y = int(np.round(size_y / _size[1]))
+                factor_x = int(np.round(size_x / _size[0]))
+                #print ('factor_x, factor_y', factor_x, factor_y)
+                # coarsen and materialize data for all the calculations and plotting
+                dem = dem[::max(1, factor_y), ::max(1, factor_x)].load()
                 dem.plot.imshow(cmap='gray', alpha=alpha, add_colorbar=True)
         elif dem is not None:
             dem.plot.imshow(cmap='gray', alpha=alpha, add_colorbar=True)
