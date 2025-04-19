@@ -1,6 +1,6 @@
 class UI:
 
-    def __init__(self, mode: str = 'dark', dpi=600, delay: int = 1000):
+    def __init__(self, mode: str = 'dark', dpi=150, delay: int = 1000):
         """
         Set dark mode styling for matplotlib plots and Jupyter widgets.
 
@@ -91,7 +91,8 @@ class UI:
             .cell-output-ipywidget-background {
                 background: #333333 !important;
             }
-                            
+            
+            .jupyter-widgets .widget-html-content,
             .jupyter-widget-html-content {
                 font-family: monospace !important;
             }
