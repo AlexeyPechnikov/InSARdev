@@ -11,9 +11,11 @@ from .S1_dem import S1_dem
 from .PRM import PRM
 
 class S1_align(S1_dem):
-
+    import numpy as np
+    import xarray as xr
+    import pandas as pd
     @staticmethod
-    def _offset2shift(xyz, rmax, amax, method='linear'):
+    def _offset2shift(xyz: np.ndarray, rmax: int, amax: int, method: str='linear') -> xr.DataArray:
         """
         Convert offset coordinates to shift values on a grid.
 
@@ -49,7 +51,7 @@ class S1_align(S1_dem):
 
     # replacement for gmt grdfilter ../topo/dem.grd -D2 -Fg2 -I12s -Gflt.grd
     # use median decimation instead of average
-    def _get_topo_llt(self, burst, degrees, debug=False):
+    def _get_topo_llt(self, burst: str, degrees: float, debug: bool=False) -> np.ndarray:
         """
         Get the topography coordinates (lon, lat, z) for decimated DEM.
 
@@ -86,7 +88,7 @@ class S1_align(S1_dem):
         return topo_llt[~np.isnan(topo_llt[:, 2])]
 
     # aligning for reference image
-    def _align_ref(self, burst, debug=False):
+    def align_ref(self, burst: str, debug: bool=False):
         """
         Align and stack the reference scene.
 
@@ -110,9 +112,6 @@ class S1_align(S1_dem):
         prefix = self.get_prefix(burst)
         path_prefix = os.path.join(self.basedir, prefix)
 
-        if not os.path.isdir(path_prefix):
-            os.makedirs(path_prefix)
-
         # generate PRM, LED, SLC
         self._make_s1a_tops(burst, mode=1, debug=debug)
 
@@ -120,7 +119,7 @@ class S1_align(S1_dem):
             .calc_dop_orb(inplace=True).update()
 
     # aligning for secondary image
-    def _align_rep(self, burst_rep, burst_ref, degrees=12.0/3600, debug=False):
+    def align_rep(self, burst_rep: str, burst_ref: str, degrees: float=12.0/3600, debug: bool=False):
         """
         Align and stack secondary images.
 
@@ -264,69 +263,3 @@ class S1_align(S1_dem):
         for filename in cleanup:
             #if os.path.exists(filename):
             os.remove(filename)
-
-    # 'threading' for Docker and 'loky' by default
-    def align(self, records=None, n_jobs=-1, degrees=12.0/3600, debug=False):
-        """
-        Stack and align scenes.
-
-        Parameters
-        ----------
-        dates : list or None, optional
-            List of dates to process. If None, process all scenes. Default is None.
-        n_jobs : int, optional
-            Number of parallel processing jobs. n_jobs=-1 means all processor cores are used. Default is -1.
-
-        Returns
-        -------
-        None
-
-        Examples
-        --------
-        stack.align()
-        """
-        import numpy as np
-        import geopandas as gpd
-        from tqdm.auto import tqdm
-        import joblib
-        import warnings
-        # supress warnings about unary_union/union_all() future behaviour to replace None by empty collection
-        warnings.filterwarnings('ignore')
-
-        # if records is None:
-        #     records = self.df
-        
-        # records_ref = self.get_records_ref(records)
-        # refs_dict = {}
-        # for record in records_ref.itertuples():
-        #     refs_dict[record.Index[:2]] = record.Index[2]
-        # #print ('refs_dict', refs_dict)
-        # records_rep = self.get_records_rep(records)
-        # reps_dict = {}
-        # for record in records_rep.itertuples():
-        #     reps_dict[record.Index[2]] = record.Index[:2]
-        # #print ('reps_dict', reps_dict)
-
-        rep_ref_dict = self.get_records_rep_ref(records)
-
-        # bursts_ref = records[records.startTime.dt.date.astype(str)==self.reference].index.get_level_values(2)
-        # print ('bursts_ref', bursts_ref)
-        # bursts_rep = records[records.startTime.dt.date.astype(str)!=self.reference].index.get_level_values(2)
-        # print ('bursts_rep', bursts_rep)
-
-        if n_jobs is None or debug == True:
-            print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
-            joblib_backend = 'sequential'
-        else:
-            joblib_backend = None
-
-        # get list of unique sorted reference bursts
-        bursts_ref = sorted(set(rep_ref_dict.values()))
-        with self.progressbar_joblib(tqdm(desc='Preparing Reference'.ljust(25), total=len(bursts_ref))) as progress_bar:
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self._align_ref)(burst_ref, debug=debug) for burst_ref in bursts_ref)
-
-        # prepare secondary images
-        with self.progressbar_joblib(tqdm(desc='Aligning Repeat'.ljust(25), total=len(rep_ref_dict))) as progress_bar:
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self._align_rep)(burst_rep, burst_ref, degrees=degrees, debug=debug) for burst_rep, burst_ref in rep_ref_dict.items())

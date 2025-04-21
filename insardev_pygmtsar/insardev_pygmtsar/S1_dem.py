@@ -12,8 +12,11 @@ from .PRM import PRM
 from insardev_toolkit import progressbar
 
 class S1_dem(S1_tidal):
+    import geopandas as gpd
+    import xarray as xr
+    import pandas as pd
 
-    buffer_degrees = 0.02
+    buffer_degrees = 0.04
 
     # def get_extent_ra(self):
     #     """
@@ -27,7 +30,7 @@ class S1_dem(S1_tidal):
     #     geom = self.geocode(LineString(np.column_stack([df.lon, df.lat])))
     #     return geom
 
-    def get_geoid(self, grid=None):
+    def get_geoid(self, grid: xr.DataArray|xr.Dataset=None) -> xr.DataArray:
         """
         Get EGM96 geoid heights.
 
@@ -97,7 +100,7 @@ class S1_dem(S1_tidal):
     # small buffer produces incomplete area coverage and restricted NaNs
     # 0.02 degrees works well worldwide but not in Siberia
     # minimum buffer size: 8 arc seconds for 90 m DEM
-    def get_dem(self, burst=None, buffer_degrees=None):
+    def get_dem(self, burst: str=None, buffer_degrees: float=None) -> xr.DataArray:
         """
         Retrieve the digital elevation model (DEM) data.
 
@@ -151,7 +154,7 @@ class S1_dem(S1_tidal):
             dem = dem.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
         return dem['dem'].transpose('lat','lon')
 
-    def load_dem(self, data, geometry=None, buffer_degrees=None):
+    def load_dem(self, data: xr.DataArray|str, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=None):
         """
         Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
 
@@ -159,6 +162,10 @@ class S1_dem(S1_tidal):
         ----------
         data : xarray dataarray or str
             DEM filename or variable.
+        geometry : geopandas.GeoDataFrame, optional
+            The geometry of the area to crop the DEM.
+        buffer_degrees : float, optional
+            The buffer in degrees to add to the geometry.
 
         Returns
         -------

@@ -12,7 +12,7 @@ from .PRM import PRM
 
 class S1_prm(S1_slc):
 
-    def PRM(self, burst):
+    def PRM(self, burst: str) -> PRM:
         """
         Open a PRM (Parameter) file.
 

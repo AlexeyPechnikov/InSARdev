@@ -10,8 +10,9 @@
 from .S1_geocode import S1_geocode
 
 class S1_topo(S1_geocode):
+    import xarray as xr
 
-    def get_topo(self, burst, trans_inv='auto'):
+    def get_topo(self, burst: str, resolution: tuple[int, int]) -> xr.DataArray:
         """
         Get the radar topography grid.
 
@@ -29,19 +30,16 @@ class S1_topo(S1_geocode):
         -----
         This method returns 'topo' variable from inverse radar transform grid.
         """
-        if isinstance(trans_inv, str) and trans_inv == 'auto':
-            trans_inv = self.get_trans_inv(burst)
+        return self.get_transform_inverse(burst, resolution)['ele'].rename('topo')
 
-        return trans_inv['ele'].rename('topo')
 
-    def plot_topo(self, burst, data='auto', caption='Topography on WGS84 ellipsoid, [m]',
-                  quantile=None, vmin=None, vmax=None, symmetrical=False,
-                  cmap='gray', aspect=None, **kwargs):
+    def plot_topo(self, burst: str, caption: str='Topography on WGS84 ellipsoid, [m]',
+                  quantile: float|None=None, vmin: float|None=None, vmax: float|None=None, symmetrical: bool=False,
+                  cmap: str='gray', aspect: float|None=None, **kwargs):
         import numpy as np
         import matplotlib.pyplot as plt
 
-        if isinstance(data, str) and data == 'auto':
-            data = self.get_topo(burst)
+        data = self.get_topo(burst)
 
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
@@ -57,15 +55,13 @@ class S1_topo(S1_geocode):
 
         plt.figure()
         data.plot.imshow(cmap=cmap, vmin=vmin, vmax=vmax)
-        self.plot_AOI(**kwargs)
-        self.plot_POI(**kwargs)
         if aspect is not None:
             plt.gca().set_aspect(aspect)
         plt.xlabel('Range')
         plt.ylabel('Azimuth')
         plt.title(caption)
 
-    def topo_phase(self, burst_rep, burst_ref, topo='auto', grid=None, method='nearest'):
+    def topo_phase(self, burst_rep: str, burst_ref: str, resolution: tuple[int, int]) -> xr.DataArray:
         """
         np.arctan2(np.sin(topo_phase), np.cos(topo_phase))[0].plot.imshow()
         """
@@ -81,8 +77,7 @@ class S1_topo(S1_geocode):
         warnings.filterwarnings('ignore', module='dask')
         warnings.filterwarnings('ignore', module='dask.core')
 
-        if isinstance(topo, str) and topo == 'auto':
-            topo = self.get_topo(burst_ref)
+        topo = self.get_topo(burst_ref, resolution)
 
         # calculate the combined earth curvature and topography correction
         def calc_drho(rho, topo, earth_radius, height, b, alpha, Bx):
@@ -210,5 +205,211 @@ class S1_topo(S1_geocode):
         )
         del topo2d, prms
 
-        return xr.DataArray(out, topo.coords).where(da.isfinite(topo)).rename('phase')
+        topo_phase = xr.DataArray(out, topo.coords).where(da.isfinite(topo)).rename('phase')
+        del out, topo
+        return topo_phase
 
+
+    def get_transform_inverse(self, burst, resolution: tuple[int, int]):
+        """
+        Retrieve the inverse transform data.
+
+        This function opens a NetCDF dataset, which contains data mapping from radar
+        coordinates to geographical coordinates (from azimuth-range to latitude-longitude domain).
+
+        Parameters
+        ----------
+        burst : str
+            The burst name.
+
+        Returns
+        -------
+        xarray.Dataset
+            An xarray dataset with the transform data.
+
+        Examples
+        --------
+        Get the inverse transform data:
+        get_trans_inv()
+        """
+        import xarray as xr
+        filename = self.get_filename(burst, f'transform_inverse.{resolution[0]}x{resolution[1]}')
+        return xr.open_dataset(filename,
+                               engine=self.netcdf_engine_read,
+                               format=self.netcdf_format,
+                               chunks=self.chunksize)
+
+    def compute_transform_inverse(self, burst_ref, resolution: tuple[int, int], interactive=False):
+        """
+        Retrieve or calculate the transform data. This transform data is then saved as
+            a NetCDF file for future use.
+
+            This function generates data mapping from radar coordinates to geographical coordinates.
+            The function uses the direct transform data.
+
+        Parameters
+        ----------
+        burst_ref : str
+            The reference burst name.
+        interactive : bool, optional
+            If True, the computation will be performed interactively and the result will be returned as a delayed object.
+            Default is False.
+
+        Note
+        ----
+        This function operates on the 'transform' grid using NetCDF chunks (specified by 'netcdf_chunksize') rather than
+        larger processing chunks. This approach is effective due to on-the-fly index creation for the NetCDF chunks.
+
+        """
+        import dask
+        import xarray as xr
+        import numpy as np
+        import os
+        import warnings
+        warnings.filterwarnings('ignore')
+
+        def trans_inv_block(azis, rngs, tolerance, chunksize):
+            from scipy.spatial import cKDTree
+            # disable "distributed.utils_perf - WARNING - full garbage collections ..."
+            try:
+                from dask.distributed import utils_perf
+                utils_perf.disable_gc_diagnosis()
+            except ImportError:
+                from distributed.gc import disable_gc_diagnosis
+                disable_gc_diagnosis()
+            import warnings
+            warnings.filterwarnings('ignore')
+
+            # required one delta around for nearest interpolation and two for linear
+            azis_min = azis.min() - 1
+            azis_max = azis.max() + 1
+            rngs_min = rngs.min() - 1
+            rngs_max = rngs.max() + 1
+            #print ('azis_min', azis_min, 'azis_max', azis_max)
+
+            # define valid coordinate blocks 
+            block_mask = ((trans_amin<=azis_max)&(trans_amax>=azis_min)&(trans_rmin<=rngs_max)&(trans_rmax>=rngs_min)).values
+            block_azi, block_rng = trans_amin.shape
+            blocks_ys, blocks_xs = np.meshgrid(range(block_azi), range(block_rng), indexing='ij')
+            #assert 0, f'blocks_ys, blocks_xs: {blocks_ys[block_mask]}, {blocks_xs[block_mask]}'
+            # extract valid coordinates from the defined blocks
+            blocks_trans = []
+            blocks_lt = []
+            blocks_ll = []
+            for block_y, block_x in zip(blocks_ys[block_mask], blocks_xs[block_mask]):
+                # coordinates
+                block_lt, block_ll = [block.ravel() for block in np.meshgrid(lt_blocks[block_y], ll_blocks[block_x], indexing='ij')]
+                # variables
+                block_trans = transform.isel(y=slice(chunksize*block_y,chunksize*(block_y+1)),
+                                         x=slice(chunksize*block_x,chunksize*(block_x+1)))[['azi', 'rng', 'ele']]\
+                                   .compute(n_workers=1).to_array().values.reshape(3,-1)
+                # select valuable coordinates only
+                mask = (block_trans[0,:]>=azis_min)&(block_trans[0,:]<=azis_max)&\
+                       (block_trans[1,:]>=rngs_min)&(block_trans[1,:]<=rngs_max)
+                # ignore block without valid pixels
+                if mask[mask].size > 0:
+                    # append valid pixels to accumulators
+                    blocks_lt.append(block_lt[mask])
+                    blocks_ll.append(block_ll[mask])
+                    blocks_trans.append(block_trans[:,mask])
+                del block_lt, block_ll, block_trans, mask
+            del block_mask, block_azi, block_rng, blocks_ys, blocks_xs
+
+            if len(blocks_lt) == 0:
+                # this case is possible when DEM is incomplete, and it is not an error
+                return np.nan * np.zeros((3, azis.size, rngs.size), np.float32)
+
+            # TEST
+            #return np.nan * np.zeros((3, azis.size, rngs.size), np.float32)
+
+            # valid coordinates
+            block_lt = np.concatenate(blocks_lt)
+            block_ll = np.concatenate(blocks_ll)
+            block_trans = np.concatenate(blocks_trans, axis=1)
+            del blocks_lt, blocks_ll, blocks_trans
+
+            # perform index search on radar coordinate grid for the nearest geographic coordinates grid pixel
+            grid_azi, grid_rng = np.meshgrid(azis, rngs, indexing='ij')
+            tree = cKDTree(np.column_stack([block_trans[0], block_trans[1]]), compact_nodes=False, balanced_tree=False)
+            distances, indices = tree.query(np.column_stack([grid_azi.ravel(), grid_rng.ravel()]), k=1, workers=1)
+            del grid_azi, grid_rng, tree, cKDTree
+
+            # take the nearest pixels coordinates and elevation
+            # the only one index search is required to define all the output variables
+            grid_lt = block_lt[indices]
+            grid_lt[distances>tolerance] = np.nan
+            del block_lt
+            grid_ll = block_ll[indices]
+            grid_ll[distances>tolerance] = np.nan
+            del block_ll
+            grid_ele = block_trans[2][indices]
+            grid_ele[distances>tolerance] = np.nan
+            #print ('distance range', distances.min().round(2), distances.max().round(2))
+            #assert distances.max() < 2, f'Unexpectedly large distance between radar and geographic coordinate grid pixels (>=2): {distances.max()}'
+            del block_trans, indices, distances
+
+            # pack all the outputs into one 3D array
+            return np.asarray([grid_lt, grid_ll, grid_ele]).reshape((3, azis.size, rngs.size))
+
+        # transformation matrix
+        transform = self.get_transform(burst_ref, resolution)
+        # calculate indices on the fly
+        trans_blocks = transform[['azi', 'rng']].coarsen(y=self.netcdf_chunksize, x=self.netcdf_chunksize, boundary='pad')
+        #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
+        # materialize without progress bar indication
+        #trans_blocks_persist = dask.persist(trans_blocks.min(), trans_blocks.max()
+        # only convert structure
+        block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
+        trans_amin = block_min.azi
+        trans_amax = block_max.azi
+        trans_rmin = block_min.rng
+        trans_rmax = block_max.rng
+        del trans_blocks, block_min, block_max
+        #print ('trans_amin', trans_amin)
+        # split geographic coordinate grid to equal chunks and rest
+        #chunks = trans.azi.data.chunks
+        #lt_blocks = np.array_split(trans['lat'].values, np.cumsum(chunks[0])[:-1])
+        #ll_blocks = np.array_split(trans['lon'].values, np.cumsum(chunks[1])[:-1])
+        lt_blocks = np.array_split(transform['y'].values, np.arange(0, transform['y'].size, self.netcdf_chunksize)[1:])
+        ll_blocks = np.array_split(transform['x'].values, np.arange(0, transform['x'].size, self.netcdf_chunksize)[1:])
+
+        # split radar coordinate grid to equal chunks and rest
+        prm = self.PRM(burst_ref)
+        a_max, r_max = prm.bounds()
+        azis = np.arange(0.5, a_max, 1)
+        rngs = np.arange(0.5, r_max, 1)
+        #print ('azis', azis, 'rngs', rngs, 'sizes', azis.size, rngs.size)
+        
+        azis_blocks = np.array_split(azis, np.arange(0, azis.size, self.netcdf_chunksize)[1:])
+        rngs_blocks = np.array_split(rngs, np.arange(0, rngs.size, self.netcdf_chunksize)[1:])
+        #print ('azis_blocks.size', len(azis_blocks), 'rngs_blocks.size', len(rngs_blocks))
+
+        blocks_total = []
+        for azis_block in azis_blocks:
+            blocks = []
+            for rngs_block in rngs_blocks:
+                block = dask.array.from_delayed(dask.delayed(trans_inv_block, traverse=False)
+                                               (azis_block, rngs_block, 2, self.netcdf_chunksize),
+                                               shape=(3, azis_block.size, rngs_block.size), dtype=np.float32)
+                blocks.append(block)
+                del block
+            blocks_total.append(blocks)
+            del blocks
+
+        trans_inv_dask = dask.array.block(blocks_total)
+        del blocks_total
+        coords = {'a': azis, 'r': rngs}
+        trans_inv = xr.Dataset({key: xr.DataArray(trans_inv_dask[idx],  coords=coords)
+                                for idx, key in enumerate(['y', 'x', 'ele'])})
+        del trans_inv_dask
+
+        if interactive:
+            return trans_inv
+        
+        filename = self.get_filename(burst_ref, f'transform_inverse.{resolution[0]}x{resolution[1]}', clean=True)
+        encoding = {varname: self.get_compression(trans_inv[varname].shape) for varname in trans_inv.data_vars}
+        trans_inv.to_netcdf(filename,
+                        encoding=encoding,
+                        engine=self.netcdf_engine_write,
+                        format=self.netcdf_format)
+        del trans_inv, transform

@@ -7,10 +7,12 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from .S1_topo import S1_topo
+from .S1_transform import S1_transform
 from .PRM import PRM
 
-class S1(S1_topo):
+class S1(S1_transform):
+    import pandas as pd
+    import xarray as xr
 
     # redefine to save disk space
     netcdf_complevel = 1
@@ -56,7 +58,8 @@ class S1(S1_topo):
 #        matrix = np.array(coeffs[1:]).astype(float).reshape((shape[1],shape[0]))
 #        return (gauss_dec, matrix)
 
-    def plot(self, records=None, dem='auto', image=None, alpha=0.7, caption='Estimated Bursts Locations', cmap='turbo', aspect=None, _size=None):
+    def plot(self, records: pd.DataFrame=None, dem: str='auto', image: xr.DataArray=None, ref: str=None,
+             alpha: float=0.7, caption: str='Estimated Bursts Locations', cmap: str='turbo', aspect: float=None, _size: tuple[int, int]=None):
         import numpy as np
         import matplotlib.pyplot as plt
         import matplotlib
@@ -67,7 +70,7 @@ class S1(S1_topo):
             _size = (2000,1000)
 
         if records is None:
-            records = self.to_dataframe()
+            records = self.to_dataframe(ref=ref)
         
         plt.figure()
         if image is not None:

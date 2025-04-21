@@ -11,6 +11,10 @@ from insardev_toolkit import datagrid
 from .PRM_gmtsar import PRM_gmtsar
 
 class PRM(datagrid, PRM_gmtsar):
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+    from typing import Any, List, Union
     
     int_types = ['num_valid_az', 'num_rng_bins', 'num_patches', 'bytes_per_line', 'good_bytes_per_line', 'num_lines','SC_identity']
 
@@ -32,7 +36,7 @@ class PRM(datagrid, PRM_gmtsar):
 #        return timestamp
 
     @staticmethod
-    def to_numeric_or_original(val):
+    def to_numeric_or_original(val: str|float|int) -> str|float|int:
         if isinstance(val, str):
             try:
                 float_val = float(val)
@@ -42,7 +46,7 @@ class PRM(datagrid, PRM_gmtsar):
         return val
 
     @staticmethod
-    def from_list(prm_list):
+    def from_list(prm_list: list) -> "PRM":
         """
         Convert a list of parameter and value pairs to a PRM object.
 
@@ -61,7 +65,7 @@ class PRM(datagrid, PRM_gmtsar):
         return PRM._from_io(prm)
 
     @staticmethod
-    def from_str(prm_string):
+    def from_str(prm_string: str) -> "PRM":
         """
         Convert a string of parameter and value pairs to a PRM object.
 
@@ -86,7 +90,7 @@ class PRM(datagrid, PRM_gmtsar):
         return PRM._from_io(prm)
 
     @staticmethod
-    def from_file(prm_filename):
+    def from_file(prm_filename: str) -> "PRM":
         """
         Convert a PRM file of parameter and value pairs to a PRM object.
 
@@ -106,7 +110,7 @@ class PRM(datagrid, PRM_gmtsar):
         return prm
 
     @staticmethod
-    def _from_io(prm):
+    def _from_io(prm: str) -> "PRM":
         """
         Read parameter and value pairs from IO stream to a PRM object.
 
@@ -127,7 +131,7 @@ class PRM(datagrid, PRM_gmtsar):
 
         return PRM(df)
 
-    def __init__(self, prm=None):
+    def __init__(self, prm: Union["PRM", pd.DataFrame, None]=None):
         """
         Initialize a PRM object.
 
@@ -157,7 +161,7 @@ class PRM(datagrid, PRM_gmtsar):
         self.df = _prm[['name', 'value']].drop_duplicates(keep='last').set_index('name')
         self.filename = None
 
-    def __eq__(self, other):
+    def __eq__(self, other: "PRM") -> bool:
         """
         Compare two PRM objects for equality.
 
@@ -173,7 +177,7 @@ class PRM(datagrid, PRM_gmtsar):
         """
         return isinstance(self, PRM) and self.df == other.df
 
-    def __str__(self):
+    def __str__(self) -> str:
         """
         Return a string representation of the PRM object.
 
@@ -184,7 +188,7 @@ class PRM(datagrid, PRM_gmtsar):
         """
         return self.to_str()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """
         Return a string representation of the PRM object for debugging.
 
@@ -201,7 +205,7 @@ class PRM(datagrid, PRM_gmtsar):
             return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
 
     # use 'g' format for Python and numpy float values
-    def set(self, prm=None, **kwargs):
+    def set(self, prm: Union["PRM", None]=None, **kwargs) -> "PRM":
         """
         Set PRM values.
 
@@ -228,7 +232,7 @@ class PRM(datagrid, PRM_gmtsar):
             self.df.loc[key] = value
         return self
 
-    def to_dataframe(self):
+    def to_dataframe(self) -> pd.DataFrame:
         """
         Convert the PRM object to a DataFrame.
 
@@ -239,7 +243,7 @@ class PRM(datagrid, PRM_gmtsar):
         """
         return self.df
 
-    def to_file(self, prm):
+    def to_file(self, filename: str) -> "PRM":
         """
         Save the PRM object to a PRM file.
 
@@ -253,12 +257,12 @@ class PRM(datagrid, PRM_gmtsar):
         PRM
             The PRM object.
         """
-        self._to_io(prm)
+        self._to_io(filename)
         # update internal filename after saving with the new filename
-        self.filename = prm
+        self.filename = filename
         return self
 
-    def update(self, debug=False):
+    def update(self, debug: bool=False) -> "PRM":
         """
         Save PRM file to disk.
 
@@ -280,7 +284,7 @@ class PRM(datagrid, PRM_gmtsar):
 
         return self.to_file(self.filename)
 
-    def to_str(self):
+    def to_str(self) -> str:
         """
         Convert the PRM object to a string.
 
@@ -291,7 +295,7 @@ class PRM(datagrid, PRM_gmtsar):
         """
         return self._to_io()
 
-    def _to_io(self, output=None):
+    def _to_io(self, output: str|None=None) -> str:
         """
         Convert the PRM object to an IO stream.
 
@@ -308,7 +312,7 @@ class PRM(datagrid, PRM_gmtsar):
         return self.df.reset_index().astype(str).apply(lambda row: (' = ').join(row), axis=1)\
             .to_csv(output, header=None, index=None)
 
-    def sel(self, *args):
+    def sel(self, *args: str) -> "PRM":
         """
         Select specific PRM attributes and create a new PRM object.
 
@@ -324,7 +328,7 @@ class PRM(datagrid, PRM_gmtsar):
         """
         return PRM(self.df.loc[[*args]])
 
-    def __add__(self, other):
+    def __add__(self, other: Union["PRM", float, int]) -> "PRM":
         """
         Add two PRM objects or a PRM object and a scalar.
 
@@ -347,7 +351,7 @@ class PRM(datagrid, PRM_gmtsar):
             prm = self.df + other
         return PRM(prm)
 
-    def __sub__(self, other):
+    def __sub__(self, other: Union["PRM", float, int]) -> "PRM":
         """
         Subtract two PRM objects or a PRM object and a scalar.
 
@@ -370,7 +374,7 @@ class PRM(datagrid, PRM_gmtsar):
             prm = self.df - other
         return PRM(prm)
 
-    def get(self, *args):
+    def get(self, *args: str) -> Union[Any, List[Any]]:
         """
         Get the values of specific PRM attributes.
 
@@ -446,7 +450,7 @@ class PRM(datagrid, PRM_gmtsar):
 #
 #        return pd.concat([df1, df2]).drop_duplicates(keep=False)
 
-    def fix_aligned(self):
+    def fix_aligned(self) -> "PRM":
         """
         Correction for the range and azimuth shifts of the re-aligned SLC images (fix_prm_params() in GMTSAR)
         """
@@ -471,7 +475,7 @@ class PRM(datagrid, PRM_gmtsar):
                         SC_clock_stop=SC_clock_stop)
 
     # note: only one dimension chunked due to sequential file reading 
-    def read_SLC_int(self):
+    def read_SLC_int(self) -> xr.Dataset:
         """
         Read SLC (Single Look Complex) data and compute the power of the signal.
         The method reads binary SLC data file, which contains alternating sequences of real and imaginary parts.
@@ -554,7 +558,7 @@ class PRM(datagrid, PRM_gmtsar):
         im = xr.DataArray(im, coords=coords).rename('im')
         return xr.merge([re, im])
 
-    def read_LED(self):
+    def read_LED(self) -> tuple[dict, pd.DataFrame]:
         """
         Read an associated LED file and extract the metadata and data into a dictionary and a DataFrame.
     
@@ -613,7 +617,7 @@ class PRM(datagrid, PRM_gmtsar):
     # 3 model parameters
     # rank = 3 => nu = size-3
     @staticmethod
-    def robust_trend2d(data, rank):
+    def robust_trend2d(data: np.ndarray, rank: int) -> np.ndarray:
         """
         Perform robust linear regression to estimate the trend in 2D data.
 
@@ -768,7 +772,7 @@ class PRM(datagrid, PRM_gmtsar):
     # PRM.fitoffset(3, 3, offset_dat)
     # PRM.fitoffset(3, 3, matrix_fromfile='raw/offset.dat')
     @staticmethod
-    def fitoffset(rank_rng, rank_azi, matrix=None, matrix_fromfile=None, SNR=20):
+    def fitoffset(rank_rng: int, rank_azi: int, matrix: np.ndarray|None=None, matrix_fromfile: str|None=None, SNR: int=20) -> "PRM":
         """
         Estimates range and azimuth offsets for InSAR (Interferometric Synthetic Aperture Radar) data.
 
@@ -860,7 +864,7 @@ class PRM(datagrid, PRM_gmtsar):
 
         return prm
 
-    def bounds(self):
+    def bounds(self) -> tuple[int, int]:
         maxx, yvalid, num_patch = self.get('num_rng_bins', 'num_valid_az', 'num_patches')
         maxy = yvalid * num_patch
         return [maxy, maxx]

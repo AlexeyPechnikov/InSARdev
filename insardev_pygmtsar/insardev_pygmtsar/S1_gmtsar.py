@@ -12,7 +12,7 @@ from .PRM import PRM
 
 class S1_gmtsar(S1_prm):
 
-    def _ext_orb_s1a(self, burst, debug=False):
+    def _ext_orb_s1a(self, burst: str, debug: bool=False):
         """
         Extracts orbital data for the Sentinel-1A satellite by running GMTSAR binary `ext_orb_s1a`.
 
@@ -55,7 +55,7 @@ class S1_gmtsar(S1_prm):
 
     # produce LED and PRM in basedir
     # when date=None work on reference scene
-    def _make_s1a_tops(self, burst, mode=0, rshift_fromfile=None, ashift_fromfile=None, debug=False):
+    def _make_s1a_tops(self, burst: str, mode: int=0, rshift_fromfile: str|None=None, ashift_fromfile: str|None=None, debug: bool=False):
         """
         Produces LED and PRM in the base directory by executing GMTSAR binary `make_s1a_tops`.
 

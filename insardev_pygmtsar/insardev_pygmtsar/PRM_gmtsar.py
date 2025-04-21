@@ -8,8 +8,9 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 class PRM_gmtsar:
+    import numpy as np
 
-    def calc_dop_orb(self, earth_radius=0, doppler_centroid=0, inplace=False, debug=False):
+    def calc_dop_orb(self, earth_radius: float=0, doppler_centroid: float=0, inplace: bool=False, debug: bool=False) -> "PRM":
         """
         Calculate the Doppler orbit.
 
@@ -49,7 +50,7 @@ class PRM_gmtsar:
         else:
             return prm
 
-    def SAT_baseline(self, other, tail=None, debug=False):
+    def SAT_baseline(self, other: "PRM", tail: int|None=None, debug: bool=False) -> "PRM":
         """
         Compute the satellite baseline.
 
@@ -116,7 +117,8 @@ class PRM_gmtsar:
     coords = prm.SAT_llt2rat(dem_data[:10], precise=1)
     [format(v, '.6f') for v in coords]
     """
-    def SAT_llt2rat(self, coords=None, fromfile=None, tofile=None, precise=1, binary=False, debug=False):
+    def SAT_llt2rat(self, coords: np.ndarray|None=None, fromfile: str|None=None, tofile: str|None=None, precise: int=1, binary: bool=False,
+                    debug: bool=False) -> np.ndarray|None:
         """
         Convert latitude, longitude, and elevation (LLT) coordinates to radar (RAT) coordinates.
 
@@ -205,7 +207,8 @@ class PRM_gmtsar:
                 out = np.fromstring(stdout_data, dtype=float, sep=' ')
             return out if out.size==5 else out.reshape(-1,5)
 
-    def SAT_look(self, coords=None, fromfile=None, tofile=None, binary=False, debug=False):
+    def SAT_look(self, coords: np.ndarray|None=None, fromfile: str|None=None, tofile: str|None=None, binary: bool=False,
+                 debug: bool=False) -> np.ndarray|None:
         """
         Compute the satellite look vector.
 

@@ -10,12 +10,14 @@
 from .S1_base import S1_base
 
 class S1_slc(S1_base):
+    import geopandas as gpd
+    from shapely.geometry import MultiPolygon
 
     pattern_prefix = '[0-9]*_[0-9]*_IW?'
     pattern_burst = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
     pattern_orbit = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
 
-    def __init__(self, datadir, workdir, drop_if_exists=False):
+    def __init__(self, datadir: str, workdir: str|None=None, drop_if_exists: bool=False):
         """
         Scans the specified directory for Sentinel-1 SLC (Single Look Complex) data and filters it based on the provided parameters.
     
@@ -45,14 +47,15 @@ class S1_slc(S1_base):
         from dateutil.relativedelta import relativedelta
         oneday = relativedelta(days=1)
 
-        # (re)create basedir only when force=True
-        if os.path.exists(workdir):
-            if drop_if_exists:
-                shutil.rmtree(workdir, ignore_errors=True)
-            else:
-                #raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
-                print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
-        os.makedirs(workdir, exist_ok=True)
+        if workdir is not None:
+            # (re)create basedir only when force=True
+            if os.path.exists(workdir):
+                if drop_if_exists:
+                    shutil.rmtree(workdir, ignore_errors=True)
+                else:
+                    #raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+                    print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
+            os.makedirs(workdir, exist_ok=True)
         
         self.basedir = workdir
         self.datadir = datadir
@@ -122,7 +125,7 @@ class S1_slc(S1_base):
         print (f'NOTE: Loaded {len(df)} bursts.')
         self.df = df
 
-    def geoloc2geometry(self, annotation):
+    def geoloc2geometry(self, annotation: dict) -> MultiPolygon:
         """
         Read approximate bursts locations from annotation
         """
@@ -145,7 +148,7 @@ class S1_slc(S1_base):
             prev_line = line
         return MultiPolygon(bursts)
 
-    def read_xml(self, filename):
+    def read_xml(self, filename: str) -> dict:
         """
         Return the XML scene annotation as a dictionary.
 
@@ -169,7 +172,7 @@ class S1_slc(S1_base):
             doc = xmltodict.parse(fd.read())
         return doc
 
-    def get_geoloc(self, annotation):
+    def get_geoloc(self, annotation: dict) -> gpd.GeoDataFrame:
         """
         Build approximate scene polygons using Ground Control Points (GCPs) from XML scene annotation.
 

@@ -10,187 +10,11 @@
 from .S1_align import S1_align
 
 class S1_geocode(S1_align):
+    import pandas as pd
+    import xarray as xr
+    import numpy as np
 
-    def geocode(self, records=None, dem='auto', resolution=(20, 5), epsg='auto'):
-        """
-        Perform geocoding from radar to projected coordinates.
-
-        Parameters
-        ----------
-        records : pandas.DataFrame, optional
-            The records to process. If None, all records will be processed.
-        dem : str, optional
-            The DEM to use. If 'auto', the DEM will be computed.
-            Default is 'auto'.
-        resolution : tuple, optional
-            The resolution in the azimuth and range direction.
-            Default is (15, 5).
-        epsg : str, optional
-            The EPSG code to use. If 'auto', the EPSG code will be computed.
-            Default is 'auto'.
-        """
-        import warnings
-        # suppress Dask warning "RuntimeWarning: All-NaN slice encountered"
-        warnings.filterwarnings('ignore')
-        warnings.filterwarnings('ignore', module='dask')
-        warnings.filterwarnings('ignore', module='dask.core')
-        from tqdm.auto import tqdm
-        #import joblib
-
-        if epsg is None:
-            print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
-        elif isinstance(epsg, str) and epsg == 'auto':
-            epsgs = self.to_dataframe().centroid.apply(lambda geom: self.get_utm_epsg(geom.y, geom.x)).unique()
-            if len(epsgs) > 1:
-                raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
-            epsg = epsgs[0]
-            print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
-
-        #print ('bursts', bursts)
-        def burst_geocode(burst_ref, dem, resolution, epsg):
-            #print ('burst', burst)
-            self.compute_trans(burst_ref, dem=dem, resolution=resolution, epsg=epsg)
-            # do not save the grid
-            #trans_inv = self.compute_trans_inv(burst, interactive=True)
-            #topo = self.get_topo(burst, trans_inv)
-            #self.compute_trans_slc(burst, topo=topo)
-            # save the grid (2 times faster)
-            # for topo phase calculation
-            self.compute_trans_inv(burst_ref)
-
-        bursts_ref = self.get_records_ref(records).index.get_level_values(2)
-        # use sequential processing as geocoding is well parallelized internally
-        for burst_ref in tqdm(bursts_ref, desc='Geocoding SLC'.ljust(25)):
-            burst_geocode(burst_ref, dem=dem, resolution=resolution, epsg=epsg)
-
-    def transform(self, records=None, clean=True):
-        """
-        Perform geocoding from radar to projected coordinates.
-
-        Parameters
-        ----------
-        records : pandas.DataFrame, optional
-            The records to process. If None, all records will be processed.
-        clean : bool, optional
-            If True, the source SLC, LED and PRM files will be deleted.
-            Default is True.
-        """
-        from tqdm.auto import tqdm
-        #import joblib
-
-        # # use parallel processing for simple bursts conversion
-        # with self.progressbar_joblib(tqdm(desc='Geocoding bursts', total=len(bursts)*len(dates))) as progress_bar:
-        #    joblib.Parallel(n_jobs=-1, backend=None)\
-        #        (joblib.delayed(self.transform_slc)(burst, date) for burst in bursts for date in dates)
-
-        #bursts_rep = self.get_records_rep(records).index.get_level_values(2)
-        #bursts = self.df.index.get_level_values(2)
-        rep_ref_dict = self.get_records_rep_ref(records)
-        # process as repeat as reference bursts
-        rep_ref_dict = rep_ref_dict | dict(zip(rep_ref_dict.values(), rep_ref_dict.values()))
-        for burst_rep, burst_ref in tqdm(rep_ref_dict.items(), desc='Transforming SLC'.ljust(25)):
-            self.transform_slc(burst_rep, burst_ref, clean=clean)
-
-    def transform_slc(self, burst_rep, burst_ref, topo='auto', phase='auto', scale=2.5e-07, clean=True, interactive=False):
-        """
-        Perform geocoding from radar to geographic coordinates.
-
-        Parameters
-        ----------
-        burst_rep : str
-            The repeat burst name.
-        burst_ref : str
-            The reference burst name.
-        topo : str, optional
-            The topographic data to use. If 'auto', the topographic data will be computed.
-            Default is 'auto'.
-        phase : str, optional
-            The topographic phase to use. If 'auto', the topographic phase will be computed.
-            Default is 'auto'.
-        scale : float, optional
-            The scale to use. Default is 2.5e-07.
-        clean : bool, optional
-            If True, the source SLC, LED and PRM files will be deleted.
-            Default is True.
-        interactive : bool, optional
-            If True, the computation will be performed interactively and the result will be returned as a delayed object.
-            Default is False.
-        """
-        import pandas as pd
-        import numpy as np
-        import xarray as xr
-        import dask
-
-        if isinstance(phase, str) and phase == 'auto':
-            phase = self.topo_phase(burst_rep, burst_ref, topo=topo)
-        #dates = pd.DatetimeIndex(data.date).strftime('%Y-%m-%d')
-
-        #print(f'transform_slc {burst} {date}')
-        # get record
-        df = self.get_record(burst_rep)
-
-        # get PRM parameters
-        prm_rep = self.PRM(burst_rep)
-        prm_ref = self.PRM(burst_ref)
-
-        # read SLC data
-        slc = prm_rep.read_SLC_int()
-        # scale as complex values, zero in np.int16 type means NODATA
-        slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).where(slc.re != 0).rename('data')
-        # zero in np.int16 type means NODATA
-        #slc_complex = slc_complex.where(slc_complex != 0)
-        del slc
-        # reproject as a single complex variable
-        complex_proj = self.project(burst_rep, slc_complex * np.exp(-1j * phase))
-        
-        # do not apply scale to complex_proj to preserve projection attributes
-        data_proj = self.spatial_ref(
-                         xr.merge([
-                            (complex_proj.real / scale).round().astype(np.int16).rename('re'),
-                            (complex_proj.imag / scale).round().astype(np.int16).rename('im')
-                         ]),
-                         complex_proj
-                    )
-        del complex_proj
-
-        # add PRM attributes
-        for name, value in prm_rep.df.itertuples():
-            if name not in ['input_file', 'SLC_file', 'led_file']:
-                data_proj.attrs[name] = value
-        # add calculated attributes
-        BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
-        # prevent confusing -0.0
-        data_proj.attrs['BPR'] = BPR + 0
-        # workaround for the hard-coded attribute
-        data_proj.attrs['SLC_scale'] = scale
-        
-        # add record attributes
-        for _, row in df.reset_index().iterrows():
-            # reverse the items order within each row
-            for name, value in ((n, v) for n, v in list(row.items())[::-1] if n not in ['orbit', 'path']):
-                if isinstance(value, (pd.Timestamp, np.datetime64)):
-                    value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-                if name == 'geometry':
-                    value = value.wkt
-                data_proj.attrs[name] = value
-
-        if interactive:
-            return data_proj
-
-        filename = self.get_burstfile(burst_rep, clean=True)
-        #encoding = {'data': self.get_compression(data_proj.shape)}
-        encoding = {varname: self.get_compression(data_proj[varname].shape) for varname in data_proj.data_vars}
-        #print ('encoding', encoding)
-        data_proj.to_netcdf(filename,
-                            encoding=encoding,
-                            engine=self.netcdf_engine_write,
-                            format=self.netcdf_format)
-
-        if clean:
-            for ext in ['SLC', 'LED', 'PRM']:                
-                self.get_burstfile(burst_rep, ext, clean=True)
-
-    def project(self, burst, data, trans='auto'):
+    def geocode(self, burst: str, data: xr.DataArray, resolution: tuple[int, int]) -> xr.DataArray:
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -198,9 +22,6 @@ class S1_geocode(S1_align):
         ----------
         grid : xarray.DataArray
             Grid(s) representing the interferogram(s) in radar coordinates.
-        trans : xarray.DataArray
-            Geocoding transform matrix in radar coordinates.
-
         Returns
         -------
         xarray.DataArray
@@ -220,8 +41,7 @@ class S1_geocode(S1_align):
         import warnings
         warnings.filterwarnings('ignore')
 
-        if isinstance(trans, str) and trans == 'auto':
-            trans = self.get_trans(burst)
+        transform = self.get_transform(burst, resolution)
 
         # use outer data variable
         def trans_block(trans_block_azi, trans_block_rng):
@@ -262,17 +82,17 @@ class S1_geocode(S1_align):
         out = da.blockwise(
             trans_block,
             'yx',
-            trans.azi, 'yx',
-            trans.rng, 'yx',
+            transform.azi, 'yx',
+            transform.rng, 'yx',
             dtype=data.dtype
         )
 
-        da = xr.DataArray(out, trans.coords).rename(data.name)
-        del out
-        return self.spatial_ref(da, trans)
+        da = self.spatial_ref(xr.DataArray(out, transform.coords).rename(data.name), transform)
+        del out, transform
+        return da
 
     @staticmethod
-    def get_utm_epsg(lat, lon):
+    def get_utm_epsg(lat: float, lon: float) -> int:
         zone_num = int((lon + 180) // 6) + 1
         if lat >= 0:
             return 32600 + zone_num
@@ -280,16 +100,16 @@ class S1_geocode(S1_align):
             return 32700 + zone_num
     
     @staticmethod
-    def proj(yy, xx, to_epsg, from_epsg):
+    def proj(ys: np.ndarray, xs: np.ndarray, to_epsg: int, from_epsg: int) -> tuple[np.ndarray, np.ndarray]:
         from pyproj import CRS, Transformer
         from_crs = CRS.from_epsg(from_epsg)
         to_crs = CRS.from_epsg(to_epsg)
         transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-        xx_new, yy_new = transformer.transform(xx, yy)
+        xs_new, ys_new = transformer.transform(xs, ys)
         del transformer, from_crs, to_crs
-        return yy_new, xx_new
+        return ys_new, xs_new
 
-    def get_trans(self, burst):
+    def get_transform(self, burst: str, resolution: tuple[int, int]) -> xr.Dataset:
         """
         Retrieve the transform data.
 
@@ -312,7 +132,7 @@ class S1_geocode(S1_align):
         get_trans()
         """
         import xarray as xr
-        filename = self.get_filename(burst, 'trans')
+        filename = self.get_filename(burst, f'transform.{resolution[0]}x{resolution[1]}')
         return xr.open_dataset(filename,
                                engine=self.netcdf_engine_read,
                                format=self.netcdf_format,
@@ -321,7 +141,7 @@ class S1_geocode(S1_align):
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_trans(self, burst_ref, dem='auto', resolution=(10, 2.5), epsg=None, interactive=False):
+    def compute_transform(self, burst_ref: str, resolution: tuple[int, int]=(10, 2.5), epsg: int=None, interactive: bool=False):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -334,9 +154,6 @@ class S1_geocode(S1_align):
         ----------
         burst_ref : str
             The reference burst name.
-        dem : str, optional
-            The DEM to use. If 'auto', the DEM will be computed.
-            Default is 'auto'.
         resolution : tuple, optional
             The resolution in the azimuth and range direction.
             Default is (10, 2.5).
@@ -500,9 +317,8 @@ class S1_geocode(S1_align):
             del rae
             return trans
 
-        if isinstance(dem, str) and dem == 'auto':
-            # do not use coordinate names lat,lon because the output grid saved as (lon,lon) in this case...
-            dem = self.get_dem(burst_ref)
+        # do not use coordinate names lat,lon because the output grid saved as (lon,lon) in this case...
+        dem = self.get_dem(burst_ref)
 
         if epsg is None:
             epsg = self.get_utm_epsg(dem.lat.mean(), dem.lon.mean())
@@ -555,220 +371,10 @@ class S1_geocode(S1_align):
         if interactive:
             return trans
 
-        filename = self.get_filename(burst_ref, 'trans', clean=True)
+        filename = self.get_filename(burst_ref, f'transform.{resolution[0]}x{resolution[1]}', clean=True)
         encoding = {varname: self.get_compression(trans[varname].shape) for varname in trans.data_vars}
         self.spatial_ref(trans, epsg).to_netcdf(filename,
                         encoding=encoding,
                         engine=self.netcdf_engine_write,
                         format=self.netcdf_format)
-        del trans
-
-    def get_trans_inv(self, burst):
-        """
-        Retrieve the inverse transform data.
-
-        This function opens a NetCDF dataset, which contains data mapping from radar
-        coordinates to geographical coordinates (from azimuth-range to latitude-longitude domain).
-
-        Parameters
-        ----------
-        burst : str
-            The burst name.
-
-        Returns
-        -------
-        xarray.Dataset
-            An xarray dataset with the transform data.
-
-        Examples
-        --------
-        Get the inverse transform data:
-        get_trans_inv()
-        """
-        import xarray as xr
-        filename = self.get_filename(burst, 'trans_inv')
-        return xr.open_dataset(filename,
-                               engine=self.netcdf_engine_read,
-                               format=self.netcdf_format,
-                               chunks=self.chunksize)
-
-    def compute_trans_inv(self, burst_ref, trans='auto', interactive=False):
-        """
-        Retrieve or calculate the transform data. This transform data is then saved as
-            a NetCDF file for future use.
-
-            This function generates data mapping from radar coordinates to geographical coordinates.
-            The function uses the direct transform data.
-
-        Parameters
-        ----------
-        burst_ref : str
-            The reference burst name.
-        trans : str, optional
-            The transform data to use. If 'auto', the transform data will be computed.
-            Default is 'auto'.
-        interactive : bool, optional
-            If True, the computation will be performed interactively and the result will be returned as a delayed object.
-            Default is False.
-
-        Note
-        ----
-        This function operates on the 'trans' grid using NetCDF chunks (specified by 'netcdf_chunksize') rather than
-        larger processing chunks. This approach is effective due to on-the-fly index creation for the NetCDF chunks.
-
-        """
-        import dask
-        import xarray as xr
-        import numpy as np
-        import os
-        import warnings
-        warnings.filterwarnings('ignore')
-
-        def trans_inv_block(azis, rngs, tolerance, chunksize):
-            from scipy.spatial import cKDTree
-            # disable "distributed.utils_perf - WARNING - full garbage collections ..."
-            try:
-                from dask.distributed import utils_perf
-                utils_perf.disable_gc_diagnosis()
-            except ImportError:
-                from distributed.gc import disable_gc_diagnosis
-                disable_gc_diagnosis()
-            import warnings
-            warnings.filterwarnings('ignore')
-
-            # required one delta around for nearest interpolation and two for linear
-            azis_min = azis.min() - 1
-            azis_max = azis.max() + 1
-            rngs_min = rngs.min() - 1
-            rngs_max = rngs.max() + 1
-            #print ('azis_min', azis_min, 'azis_max', azis_max)
-
-            # define valid coordinate blocks 
-            block_mask = ((trans_amin<=azis_max)&(trans_amax>=azis_min)&(trans_rmin<=rngs_max)&(trans_rmax>=rngs_min)).values
-            block_azi, block_rng = trans_amin.shape
-            blocks_ys, blocks_xs = np.meshgrid(range(block_azi), range(block_rng), indexing='ij')
-            #assert 0, f'blocks_ys, blocks_xs: {blocks_ys[block_mask]}, {blocks_xs[block_mask]}'
-            # extract valid coordinates from the defined blocks
-            blocks_trans = []
-            blocks_lt = []
-            blocks_ll = []
-            for block_y, block_x in zip(blocks_ys[block_mask], blocks_xs[block_mask]):
-                # coordinates
-                block_lt, block_ll = [block.ravel() for block in np.meshgrid(lt_blocks[block_y], ll_blocks[block_x], indexing='ij')]
-                # variables
-                block_trans = trans.isel(y=slice(chunksize*block_y,chunksize*(block_y+1)),
-                                         x=slice(chunksize*block_x,chunksize*(block_x+1)))[['azi', 'rng', 'ele']]\
-                                   .compute(n_workers=1).to_array().values.reshape(3,-1)
-                # select valuable coordinates only
-                mask = (block_trans[0,:]>=azis_min)&(block_trans[0,:]<=azis_max)&\
-                       (block_trans[1,:]>=rngs_min)&(block_trans[1,:]<=rngs_max)
-                # ignore block without valid pixels
-                if mask[mask].size > 0:
-                    # append valid pixels to accumulators
-                    blocks_lt.append(block_lt[mask])
-                    blocks_ll.append(block_ll[mask])
-                    blocks_trans.append(block_trans[:,mask])
-                del block_lt, block_ll, block_trans, mask
-            del block_mask, block_azi, block_rng, blocks_ys, blocks_xs
-
-            if len(blocks_lt) == 0:
-                # this case is possible when DEM is incomplete, and it is not an error
-                return np.nan * np.zeros((3, azis.size, rngs.size), np.float32)
-
-            # TEST
-            #return np.nan * np.zeros((3, azis.size, rngs.size), np.float32)
-
-            # valid coordinates
-            block_lt = np.concatenate(blocks_lt)
-            block_ll = np.concatenate(blocks_ll)
-            block_trans = np.concatenate(blocks_trans, axis=1)
-            del blocks_lt, blocks_ll, blocks_trans
-
-            # perform index search on radar coordinate grid for the nearest geographic coordinates grid pixel
-            grid_azi, grid_rng = np.meshgrid(azis, rngs, indexing='ij')
-            tree = cKDTree(np.column_stack([block_trans[0], block_trans[1]]), compact_nodes=False, balanced_tree=False)
-            distances, indices = tree.query(np.column_stack([grid_azi.ravel(), grid_rng.ravel()]), k=1, workers=1)
-            del grid_azi, grid_rng, tree, cKDTree
-
-            # take the nearest pixels coordinates and elevation
-            # the only one index search is required to define all the output variables
-            grid_lt = block_lt[indices]
-            grid_lt[distances>tolerance] = np.nan
-            del block_lt
-            grid_ll = block_ll[indices]
-            grid_ll[distances>tolerance] = np.nan
-            del block_ll
-            grid_ele = block_trans[2][indices]
-            grid_ele[distances>tolerance] = np.nan
-            #print ('distance range', distances.min().round(2), distances.max().round(2))
-            #assert distances.max() < 2, f'Unexpectedly large distance between radar and geographic coordinate grid pixels (>=2): {distances.max()}'
-            del block_trans, indices, distances
-
-            # pack all the outputs into one 3D array
-            return np.asarray([grid_lt, grid_ll, grid_ele]).reshape((3, azis.size, rngs.size))
-
-        if isinstance(trans, str) and trans == 'auto':
-            # trans.dat - file generated by llt_grid2rat (r a topo lon lat)"
-            trans = self.get_trans(burst_ref)
-
-        # calculate indices on the fly
-        trans_blocks = trans[['azi', 'rng']].coarsen(y=self.netcdf_chunksize, x=self.netcdf_chunksize, boundary='pad')
-        #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
-        # materialize without progress bar indication
-        #trans_blocks_persist = dask.persist(trans_blocks.min(), trans_blocks.max()
-        # only convert structure
-        block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
-        trans_amin = block_min.azi
-        trans_amax = block_max.azi
-        trans_rmin = block_min.rng
-        trans_rmax = block_max.rng
-        del trans_blocks, block_min, block_max
-        #print ('trans_amin', trans_amin)
-
-        # split geographic coordinate grid to equal chunks and rest
-        #chunks = trans.azi.data.chunks
-        #lt_blocks = np.array_split(trans['lat'].values, np.cumsum(chunks[0])[:-1])
-        #ll_blocks = np.array_split(trans['lon'].values, np.cumsum(chunks[1])[:-1])
-        lt_blocks = np.array_split(trans['y'].values, np.arange(0, trans['y'].size, self.netcdf_chunksize)[1:])
-        ll_blocks = np.array_split(trans['x'].values, np.arange(0, trans['x'].size, self.netcdf_chunksize)[1:])
-
-        # split radar coordinate grid to equal chunks and rest
-        prm = self.PRM(burst_ref)
-        a_max, r_max = prm.bounds()
-        azis = np.arange(0.5, a_max, 1)
-        rngs = np.arange(0.5, r_max, 1)
-        #print ('azis', azis, 'rngs', rngs, 'sizes', azis.size, rngs.size)
-        
-        azis_blocks = np.array_split(azis, np.arange(0, azis.size, self.netcdf_chunksize)[1:])
-        rngs_blocks = np.array_split(rngs, np.arange(0, rngs.size, self.netcdf_chunksize)[1:])
-        #print ('azis_blocks.size', len(azis_blocks), 'rngs_blocks.size', len(rngs_blocks))
-
-        blocks_total = []
-        for azis_block in azis_blocks:
-            blocks = []
-            for rngs_block in rngs_blocks:
-                block = dask.array.from_delayed(dask.delayed(trans_inv_block, traverse=False)
-                                               (azis_block, rngs_block, 2, self.netcdf_chunksize),
-                                               shape=(3, azis_block.size, rngs_block.size), dtype=np.float32)
-                blocks.append(block)
-                del block
-            blocks_total.append(blocks)
-            del blocks
-
-        trans_inv_dask = dask.array.block(blocks_total)
-        del blocks_total
-        coords = {'a': azis, 'r': rngs}
-        trans_inv = xr.Dataset({key: xr.DataArray(trans_inv_dask[idx],  coords=coords)
-                                for idx, key in enumerate(['y', 'x', 'ele'])})
-        del trans_inv_dask
-
-        if interactive:
-            return trans_inv
-        
-        filename = self.get_filename(burst_ref, 'trans_inv', clean=True)
-        encoding = {varname: self.get_compression(trans_inv[varname].shape) for varname in trans_inv.data_vars}
-        trans_inv.to_netcdf(filename,
-                        encoding=encoding,
-                        engine=self.netcdf_engine_write,
-                        format=self.netcdf_format)
-        del trans_inv
+        del trans, dem

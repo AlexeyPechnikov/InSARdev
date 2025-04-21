@@ -11,6 +11,10 @@
 from .Stack_plot import Stack_plot
 
 class Stack(Stack_plot):
+    import rasterio as rio
+    import pandas as pd
+    import xarray as xr
+    import geopandas as gpd
 
     # redefine for fast caching
     netcdf_complevel = -1
@@ -18,19 +22,19 @@ class Stack(Stack_plot):
     def __repr__(self):
         return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
 
-    def PRM(self, key):
+    def PRM(self, key:str) -> str|float|int:
         """
         Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
         """
         return self.dss[0].attrs[key]
 
-    def crs(self):
+    def crs(self) -> rio.crs.CRS:
         return self.dss[0].rio.crs
 
-    def epsg(self):
+    def epsg(self) -> int:
         return self.dss[0].rio.crs.to_epsg()
 
-    def to_dataframe(self, id=None, date=None, pathNumber=None, crs='auto'):
+    def to_dataframe(self, id:str|list[str]|None=None, date:str|list[str]|None=None, pathNumber:str|list[str]|None=None, crs:str|None='auto') -> pd.DataFrame:
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -56,31 +60,35 @@ class Stack(Stack_plot):
             df = df[df.pathNumber==pathNumber]
         return df.set_crs(4326).to_crs(crs)
 
-    def to_dataset(self, records=None, polarizations=None, ids=None):
+    def to_dataset(self, records:pd.DataFrame|None=None, datas:list[xr.Dataset]|None=None, polarizations:list[str]|None=None, ids:list[str]|None=None):
         import pandas as pd
 
-        if records is None and polarizations is None and ids is None:
+        if records is None and datas is None and polarizations is None and ids is None:
             return self.dss
-
-        if ids is not None and isinstance(ids, str):
-            ids = [ids]
-        
-        if polarizations is not None and isinstance(polarizations, str):
-            polarizations = [polarizations]
-        polarizations_all = [pol for pol in ['VV','VH','HH','HV'] if pol in self.dss[0].data_vars]
 
         if records is None:
             records = self.df
-            #if dates is None else [ds.sel(date=dates) for ds in self.dss]
-        
         assert isinstance(records, pd.DataFrame)
+
+        if datas is None:
+            datas = self.dss
+        assert isinstance(datas, (list, tuple))
+        
+        if polarizations is not None and isinstance(polarizations, str):
+            polarizations = [polarizations]
+        polarizations_all = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+        assert polarizations is None or isinstance(polarizations, (list, tuple))
+
+        if ids is not None and isinstance(ids, str):
+            ids = [ids]
+        assert ids is None or isinstance(ids, (list, tuple))
         
         dss = []
         for rid in records.index.get_level_values(0).unique():
             if ids is not None and not rid in ids:
                 continue
             dates = records[records.index.get_level_values(0)==rid].index.get_level_values(2).astype(str)
-            ds = [ds for ds in self.dss if ds.id==rid][0].sel(date=dates)
+            ds = [ds for ds in datas if ds.id==rid][0].sel(date=dates)
             if polarizations is not None:
                 for pol in polarizations_all:
                     if pol not in polarizations:
@@ -93,9 +101,9 @@ class Stack(Stack_plot):
     #     if len(dss) > 1:
     #         return self.to_datasets(records)[0]
 
-    def __init__(self, basedir, pattern_burst='*_*_?W?',
-                 pattern_date = 'S1_[0-9]+_IW[0-9]_[0-9]{8}T[0-9]{6}_[HV]{2}_.*-BURST\.nc',
-                 attr_start='BPR', debug=False):
+    def __init__(self, basedir:str, resolution: tuple[int, int]=(20, 5), pattern_burst:str='*_*_?W?',
+                 pattern_date:str='S1_[0-9]+_IW[0-9]_[0-9]{8}T[0-9]{6}_[HV]{2}_.*-BURST',
+                 attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -140,9 +148,9 @@ class Stack(Stack_plot):
         #print ('bursts', bursts)
         for burst in bursts:
             basedir = os.path.join(self.basedir, burst)
-            filenames = self._glob_re(pattern_date, basedir=basedir)
+            filenames = self._glob_re(pattern_date + f'{resolution[0]}x{resolution[1]}.nc', basedir=basedir)
             #print ('\tfilenames', filenames)
-            filename = os.path.join(basedir, f'trans.nc')
+            filename = os.path.join(basedir, f'transform.{resolution[0]}x{resolution[1]}.nc')
 
             ds = xr.open_mfdataset(
                 filenames,
@@ -231,7 +239,7 @@ class Stack(Stack_plot):
     #     import xarray as xr
     #     return xr.concat([ds.BPR for ds in self.ds], dim='burst').mean('burst').to_dataframe()[['BPR']]
 
-    def baseline_pairs(self, days=None, meters=None, invert=False):
+    def baseline_pairs(self, days:int|None=None, meters:int|None=None, invert:bool=False) -> pd.DataFrame:
         """
         Generates a sorted list of baseline pairs.
         Returns
@@ -275,7 +283,7 @@ class Stack(Stack_plot):
                          duration=(df['rep'] - df['ref']).dt.days,
                          rel=np.datetime64('nat'))
 
-    def plot(self, records=None):
+    def plot(self, records:pd.DataFrame|None=None):
         import pandas as pd
         import matplotlib
         import matplotlib.pyplot as plt

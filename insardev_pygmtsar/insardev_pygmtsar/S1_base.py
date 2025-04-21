@@ -11,11 +11,12 @@ from insardev_toolkit import progressbar_joblib
 from insardev_toolkit import datagrid
 
 class S1_base(progressbar_joblib, datagrid):
+    import pandas as pd
 
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
 
-    def to_dataframe(self, crs=4326):
+    def to_dataframe(self, crs: int=4326, ref: str=None) -> pd.DataFrame:
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -28,20 +29,20 @@ class S1_base(progressbar_joblib, datagrid):
         --------
         df = stack.to_dataframe()
         """
-        if self.reference is None:
+        if ref is None:
             df = self.df
         else:
-            path_number = self.df[self.df.startTime.dt.date.astype(str)==self.reference].pathNumber.unique()
+            path_number = self.df[self.df.startTime.dt.date.astype(str)==ref].pathNumber.unique()
             if len(path_number) == 0:
                 return self.df
             df = self.df[self.df.pathNumber==path_number[0]]
         return df.set_crs(4326).to_crs(crs)
 
-    def get_prefix(self, burst):
+    def get_prefix(self, burst: str) -> str:
         df = self.get_record(burst)
         return df.index.get_level_values(0)[0]
 
-    def get_burstfile(self, burst, ext='nc', clean=False):
+    def get_burstfile(self, burst: str, ext: str='nc', clean: bool=False) -> str:
         import os
         prefix = self.get_prefix(burst)
         filename = os.path.join(self.basedir, prefix, f'{burst}.{ext}')
@@ -54,7 +55,7 @@ class S1_base(progressbar_joblib, datagrid):
                 assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
         return filename
 
-    def get_filename(self, burst, name, ext='nc', clean=False):
+    def get_filename(self, burst: str, name: str, ext: str='nc', clean: bool=False) -> str:
         import os
         prefix = self.get_prefix(burst)
         filename = os.path.join(self.basedir, prefix, f'{name}.{ext}')
@@ -67,61 +68,19 @@ class S1_base(progressbar_joblib, datagrid):
                 assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
         return filename
    
-    def get_basename(self, burst):
+    def get_basename(self, burst: str) -> str:
         import os
         prefix = self.get_prefix(burst)
         basename = os.path.join(self.basedir, prefix, burst)
         return basename
     
-    def get_dirname(self, burst):
+    def get_dirname(self, burst: str) -> str:
         import os
         prefix = self.get_prefix(burst)
         dirname = os.path.join(self.basedir, prefix)
         return dirname
 
-    def get_reference(self):
-        """
-        Get the reference date for the Stack object.
-        """
-        return self.reference
-
-    def set_reference(self, reference='auto'):
-        """
-        Define reference date for Stack object.
-
-        Parameters
-        ----------
-        reference : str
-            Date string representing the reference scene.
-
-        Returns
-        -------
-        Stack
-            Modified instance of the Stack class.
-
-        Examples
-        --------
-        Set the reference scene to '2022-01-20':
-        stack.set_reference('2022-01-20')
-        """
-        if reference is None:
-            self.reference = None
-            return
-        elif isinstance(reference, str) and reference == 'auto':
-            reference = str(self.df.startTime.dt.date.min())
-            print (f'NOTE: auto set reference date {reference}.')
-        else:
-            assert reference in self.df.startTime.dt.date.astype(str).values, f'Reference burst(s) not found: {reference}.'
-        path_number = self.df[self.df.startTime.dt.date.astype(str)==reference].pathNumber.unique()[0]
-        total_count = len(self.df)
-        df = self.df[self.df.pathNumber==path_number]
-        count = len(df)
-        if total_count != count:
-            print (f'NOTE: {total_count-count} bursts ignored and {count} bursts used for selected reference date {reference} and corresponding path number {path_number}.')
-        self.reference = reference
-        return
-
-    def get_record(self, burst):
+    def get_record(self, burst: str) -> pd.DataFrame:
         """
         Return dataframe record.
 
@@ -140,26 +99,33 @@ class S1_base(progressbar_joblib, datagrid):
         assert len(df) > 0, f'Record not found'
         return df
 
-    def get_records_ref(self, records=None):
-            if records is None:
-                records = self.to_dataframe()
-            records_ref = records[records.startTime.dt.date.astype(str)==self.reference]
-            return records_ref
+    def get_repref(self, ref: str, records: pd.DataFrame=None) -> dict:
+        """
+        Get the reference and repeat bursts for a given reference date.
 
-    def get_records_rep(self, records=None):
-            if records is None:
-                records = self.to_dataframe()
-            records_rep = records[records.startTime.dt.date.astype(str)!=self.reference]
-            return records_rep
-    
-    def get_records_rep_ref(self, records=None):
-        records_ref = self.get_records_ref(records)
+        Parameters
+        ----------
+        ref : str
+            The reference date.
+        records : pd.DataFrame, optional
+            The DataFrame containing the records.
+
+        Returns
+        -------
+        dict
+            A dictionary with the reference and repeat burst lists.
+        """
+        if records is None:
+            records = self.to_dataframe(ref=ref)
+        
+        recs_ref = records[records.startTime.dt.date.astype(str)==ref]
         refs_dict = {}
-        for record in records_ref.itertuples():
-            refs_dict[record.Index[:2]] = record.Index[2]
-        #print ('refs_dict', refs_dict)
-        records_rep = self.get_records_rep(records)
+        for rec in recs_ref.itertuples():
+            refs_dict.setdefault(rec.Index[0], []).append(rec.Index)
+        
+        recs_rep = records[records.startTime.dt.date.astype(str)!=ref]
         reps_dict = {}
-        for record in records_rep.itertuples():
-            reps_dict[record.Index[2]] = record.Index[:2]
-        return {burst_rep: refs_dict[reps_dict[burst_rep]] for burst_rep in reps_dict.keys()}
+        for rec in recs_rep.itertuples():
+            reps_dict.setdefault(rec.Index[0], []).append(rec.Index)
+
+        return {key: (refs_dict[key], reps_dict[key]) for key in refs_dict}
