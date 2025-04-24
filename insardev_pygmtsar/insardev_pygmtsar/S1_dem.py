@@ -8,27 +8,11 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from .S1_tidal import S1_tidal
-from .PRM import PRM
-from insardev_toolkit import progressbar
 
 class S1_dem(S1_tidal):
     import geopandas as gpd
     import xarray as xr
     import pandas as pd
-
-    buffer_degrees = 0.04
-
-    # def get_extent_ra(self):
-    #     """
-    #     minx, miny, maxx, maxy = np.round(geom.bounds).astype(int)
-    #     """
-    #     import numpy as np
-    #     from shapely.geometry import LineString
-
-    #     dem = self.get_dem()
-    #     df = dem.isel(lon=[0,-1]).to_dataframe().reset_index()
-    #     geom = self.geocode(LineString(np.column_stack([df.lon, df.lat])))
-    #     return geom
 
     def get_geoid(self, grid: xr.DataArray|xr.Dataset=None) -> xr.DataArray:
         """
@@ -61,107 +45,16 @@ class S1_dem(S1_tidal):
             return self.interp2d_like(geoid, grid)
         return geoid
 
-    # def set_dem(self, dem_filename):
-    #     """
-    #     Set the filename of the digital elevation model (DEM) in WGS84 NetCDF grid.
-
-    #     Parameters
-    #     ----------
-    #     dem_filename : str or None
-    #         Path to the WGS84 NetCDF DEM file. If provided, the DEM filename will be set. If None, the DEM filename will be cleared.
-
-    #     Returns
-    #     -------
-    #     self
-    #         Returns the modified instance of the class.
-
-    #     Examples
-    #     --------
-    #     Set the DEM filename:
-    #     stack = stack.set_dem('data/DEM_WGS84.nc')
-
-    #     Notes
-    #     -----
-    #     This method sets the filename of the digital elevation model (DEM) data to be used in the SAR processing.
-    #     The DEM file is a NetCDF dataset in geographical coordinates containing elevation values for the Earth's surface.
-    #     By setting the DEM filename, it allows SAR processing algorithms to utilize the DEM data for geocoding, topographic
-    #     correction, and other applications. If `dem_filename` is None, the DEM filename will be cleared.
-    #     """
-    #     import os
-    #     if dem_filename is not None:
-    #         assert os.path.exists(dem_filename), f'DEM file not found: {dem_filename}'
-    #         assert os.path.isfile(dem_filename) and os.access(dem_filename, os.R_OK), f'DEM file is not readable: {dem_filename}'
-    #         self.dem_filename = os.path.relpath(dem_filename,'.')
-    #     else:
-    #         self.dem_filename = None
-    #     return self
-
     # buffer required to get correct (binary) results from SAT_llt2rat tool
     # small buffer produces incomplete area coverage and restricted NaNs
     # 0.02 degrees works well worldwide but not in Siberia
     # minimum buffer size: 8 arc seconds for 90 m DEM
-    def get_dem(self, burst: str=None, buffer_degrees: float=None) -> xr.DataArray:
-        """
-        Retrieve the digital elevation model (DEM) data.
-
-        Parameters
-        ----------
-
-        Returns
-        -------
-        xarray.DataArray
-            The DEM data as a DataArray object.
-
-        Raises
-        ------
-        Exception
-            If the DEM is not set before calling this method.
-
-        Examples
-        --------
-        topo_ll = stack.get_dem()
-
-        Notes
-        -----
-        This method retrieves the digital elevation model (DEM) data previously downloaded and stored in a NetCDF file.
-        The DEM file is opened, and the elevation variable is extracted. Any missing values in the elevation data are filled
-        with zeros (mostly representing water surfaces).
-        """
-        import xarray as xr
-        import os
-        import warnings
-        # supress warnings "UserWarning: The specified chunks separate the stored chunks along dimension"
-        warnings.filterwarnings('ignore')
-
-        if self.dem_filename is None:
-            raise Exception('Set DEM first')
-
-        if buffer_degrees is None:
-            buffer_degrees = self.buffer_degrees
-
-        bounds = None
-        if burst is not None:
-            record = self.get_record(burst)
-            geometry = record.geometry.buffer(self.buffer_degrees)
-            bounds = geometry.bounds.values.flatten()
-
-        dem = xr.open_dataset(self.dem_filename,
-                              engine=self.netcdf_engine_read,
-                              format=self.netcdf_format,
-                              chunks=self.chunksize)
-
-        if bounds is not None:
-            dem = dem.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
-        return dem['dem'].transpose('lat','lon')
-
-    def load_dem(self, data: xr.DataArray|str, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=None):
+    def get_dem_wgs84ellipsoid(self, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=0.04):
         """
         Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
 
         Parameters
         ----------
-        data : xarray dataarray or str
-            DEM filename or variable.
         geometry : geopandas.GeoDataFrame, optional
             The geometry of the area to crop the DEM.
         buffer_degrees : float, optional
@@ -196,32 +89,25 @@ class S1_dem(S1_tidal):
         import pandas as pd
         import os
 
-        if data is None:
-            self.dem_filename = None
-            return
+        if self.DEM is None:
+            raise ValueError('ERROR: DEM is not specified.')
 
-        dem_filename = os.path.join(self.basedir, 'DEM_WGS84.nc')
+        if geometry is None:
+            geometry = self.df
 
-        if self.dem_filename is not None:
-            print ('NOTE: DEM exists, ignore the command. Use Stack.load_dem(None) to allow new DEM loading')
-            return
-
-        if buffer_degrees is not None:
-            self.buffer_degrees = buffer_degrees
-
-        if isinstance(data, (xr.Dataset)):
-            ortho = data[list(data.data_vars)[0]]
-        elif isinstance(data, (xr.DataArray)):
-            ortho = data
-        elif isinstance(data, str) and os.path.splitext(data)[-1] in ['.tiff', '.tif', '.TIF']:
-            ortho = rio.open_rasterio(data, chunks=self.chunksize).squeeze(drop=True)\
+        if isinstance(self.DEM, (xr.Dataset)):
+            ortho = self.DEM[list(self.DEM.data_vars)[0]]
+        elif isinstance(self.DEM, (xr.DataArray)):
+            ortho = self.DEM
+        elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.tiff', '.tif', '.TIF']:
+            ortho = rio.open_rasterio(self.DEM, chunks=self.chunksize).squeeze(drop=True)\
                 .rename({'y': 'lat', 'x': 'lon'})\
                 .drop('spatial_ref')
             if ortho.lat.diff('lat')[0].item() < 0:
                 ortho = ortho.reindex(lat=ortho.lat[::-1])
-        elif isinstance(data, str) and os.path.splitext(data)[-1] in ['.nc', '.netcdf', '.grd']:
-            ortho = xr.open_dataarray(data, engine=self.netcdf_engine_read, chunks=self.chunksize)
-        elif isinstance(data, str):
+        elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.nc', '.netcdf', '.grd']:
+            ortho = xr.open_dataarray(self.DEM, engine=self.netcdf_engine_read, chunks=self.chunksize)
+        elif isinstance(self.DEM, str):
             print ('ERROR: filename extension is not recognized. Should be one from .tiff, .tif, .TIF, .nc, .netcdf, .grd')
         else:
             print ('ERROR: argument is not an Xarray object and it is not a file name')
@@ -234,23 +120,10 @@ class S1_dem(S1_tidal):
         assert len(duplicates) == 0, 'ERROR: DEM grid includes duplicated coordinates, possibly on merged tiles edges'
 
         # crop to the geometry extent
-        if geometry is not None:
-            bounds = self.get_bounds(geometry)
-            ortho = ortho\
-               .sel(lat=slice(bounds[1] - self.buffer_degrees, bounds[3] + self.buffer_degrees),
-                    lon=slice(bounds[0] - self.buffer_degrees, bounds[2] + self.buffer_degrees))
+        bounds = self.get_bounds(geometry.buffer(buffer_degrees))
+        ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
 
         # heights correction
         geoid = self.get_geoid(ortho)
-        if os.path.exists(dem_filename):
-            os.remove(dem_filename)
-        encoding = {'dem': self.get_compression(ortho.shape)}
-        delayed = self.spatial_ref((ortho + geoid).to_dataset(name='dem'), 4326)\
-            .to_netcdf(dem_filename,
-                       encoding=encoding,
-                       engine=self.netcdf_engine_write,
-                       format=self.netcdf_format,
-                       compute=False)
-        progressbar(result := dask.persist(delayed), desc='Preparing WGS84 DEM'.ljust(25))
-
-        self.dem_filename = dem_filename
+        ds = (ortho + geoid).astype(np.float32).transpose('lat','lon').rename("dem")
+        return self.spatial_ref(ds, 4326)

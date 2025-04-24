@@ -15,11 +15,18 @@ class S1_transform(S1_topo):
     import numpy as np
 
     def transform(self, ref: str, records: pd.DataFrame|None=None, degrees: float=12.0/3600,
-            resolution: tuple[int, int]=(20, 5), epsg: str|int|None='auto', n_jobs: int=-1, debug: bool=False):
+            resolution: tuple[int, int]=(20, 5), epsg: str|int|None='auto', timeout: str|int|None='30s', debug: bool=False):
         from tqdm.auto import tqdm
-        import joblib
+        import dask
         from tqdm.auto import tqdm
         import os
+        import tempfile
+        from dask.distributed import get_client
+
+        if self.DEM is None:
+            raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
+        if self.workdir is None:
+            raise ValueError('ERROR: work directory (workdir) is not set. Please create a new instance of S1 with a workdir.')
 
         if records is None:
             records = self.to_dataframe(ref=ref)
@@ -33,36 +40,20 @@ class S1_transform(S1_topo):
             epsg = epsgs[0]
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
-        if n_jobs is None or debug == True:
-            print ('Note: sequential joblib processing is applied when n_jobs is None or debug is True.')
-            joblib_backend = 'sequential'
-        else:
-            joblib_backend = None
-
-        def process_refrep(bursts, debug=False):
+        def process_refrep(bursts, basedir, debug=False):
             # polarization does not matter for geometry alignment, any polarization reference burst can be used
             # burst format is like ('021_043788_IW1', 'VH', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
             burst_refs = bursts[0]
             burst_reps = bursts[1]
-
-            prefix = self.get_prefix(burst_refs[0][-1])
-            path_prefix = os.path.join(self.basedir, prefix)
-            if not os.path.isdir(path_prefix):
-                os.makedirs(path_prefix)
-                
-            #print (ref, burst_refs, '->', burst_reps)
-            # align reference burst for all polarizations
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self.align_ref)(burst_ref[-1], debug=debug) for burst_ref in burst_refs)
-            # align repeat bursts for all polarizations using any reference burst
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)\
-                (joblib.delayed(self.align_rep)(burst_rep[-1], burst_ref=burst_refs[0][-1], degrees=degrees, debug=debug) for burst_rep in burst_reps)
-
+            # prepare reference burst for all polarizations
+            for burst_ref in burst_refs:
+                self.align_ref(burst_ref[-1], basedir, debug=debug)
             #print ('compute_transform')
-            self.compute_transform(burst_refs[0][-1], resolution=resolution, epsg=epsg)
+            self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, epsg=epsg)
             # for topo phase calculation
             #print ('compute_transform_inverse')
-            self.compute_transform_inverse(burst_refs[0][-1], resolution=resolution)
+            self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
+
             # compute the transform data for the same polarization reference burst
             # this allows to easily detect when topo phase is not applicable
             # use sequential processing as it is well parallelized internally
@@ -70,20 +61,28 @@ class S1_transform(S1_topo):
             for burst_rep in burst_reps + burst_refs:
                 burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
                 #print (burst_rep[-1], '->', burst_ref[-1])
-                self.transform_slc(burst_rep[-1], burst_ref[-1], resolution=resolution)
-            
-            # cleanup
-            filename = self.get_filename(burst_refs[0][-1], f'transform_inverse.{resolution[0]}x{resolution[1]}')
-            if os.path.exists(filename):
-                os.remove(filename)
+                # align repeat bursts to the reference burst
+                if burst_rep not in burst_refs:
+                    #print ('align_rep', burst_rep[-1], burst_ref[-1])
+                    self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=degrees, debug=debug)
+                self.transform_slc(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
 
+        # Dask cluster client
+        client = get_client()
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         for refrep in tqdm(refreps, desc="Transforming SLC"):
-            process_refrep(refrep, debug=debug)
+            with tempfile.TemporaryDirectory(prefix=refrep[0][0][0]) as basedir:
+                #print("working in:", basedir)
+                process_refrep(refrep, basedir, debug=debug)
+                # cleanup - release all workers memory, call garbage collector before to prevent heartbeat errors
+                import gc; gc.collect()
+                if timeout is not None:
+                    client.restart(wait_for_workers=False)
+                    client.wait_for_workers(1, timeout=timeout)
 
-    def transform_slc(self, burst_rep: str, burst_ref: str, resolution: tuple[int, int], scale: float=2.5e-07, interactive: bool=False):
+    def transform_slc(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -97,44 +96,34 @@ class S1_transform(S1_topo):
             The resolution to use.
         scale : float, optional
             The scale to use. Default is 2.5e-07.
-        interactive : bool, optional
-            If True, the computation will be performed interactively and the result will be returned as a delayed object.
-            Default is False.
         """
         import pandas as pd
         import numpy as np
         import xarray as xr
         import dask
-
-        phase = self.topo_phase(burst_rep, burst_ref, resolution)
-        #dates = pd.DatetimeIndex(data.date).strftime('%Y-%m-%d')
-
+        import os
         #print(f'transform_slc {burst} {date}')
         # get record
         df = self.get_record(burst_rep)
 
         # get PRM parameters
-        prm_rep = self.PRM(burst_rep)
-        prm_ref = self.PRM(burst_ref)
+        prm_rep = self.PRM(burst_rep, basedir=basedir)
+        prm_ref = self.PRM(burst_ref, basedir=basedir)
 
         # read SLC data
         slc = prm_rep.read_SLC_int()
         # scale as complex values, zero in np.int16 type means NODATA
         slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).where(slc.re != 0).rename('data')
-        # zero in np.int16 type means NODATA
-        #slc_complex = slc_complex.where(slc_complex != 0)
-        del slc
         # reproject as a single complex variable
-        complex_proj = self.geocode(burst_rep, slc_complex * np.exp(-1j * phase), resolution)
+        phase = self.topo_phase(burst_rep, burst_ref, basedir=basedir, resolution=resolution)
+        complex_proj = self.geocode(burst_rep, slc_complex * np.exp(-1j * phase), basedir=basedir, resolution=resolution)
+        del phase, slc_complex
         
         # do not apply scale to complex_proj to preserve projection attributes
-        data_proj = self.spatial_ref(
-                         xr.merge([
-                            (complex_proj.real / scale).round().astype(np.int16).rename('re'),
-                            (complex_proj.imag / scale).round().astype(np.int16).rename('im')
-                         ]),
-                         complex_proj
-                    )
+        data_proj = xr.merge([
+                        (complex_proj.real / scale).round().astype(np.int16).rename('re'),
+                        (complex_proj.imag / scale).round().astype(np.int16).rename('im')
+                        ])
         del complex_proj
 
         # add PRM attributes
@@ -158,19 +147,29 @@ class S1_transform(S1_topo):
                     value = value.wkt
                 data_proj.attrs[name] = value
 
-        if interactive:
-            return data_proj
+        # add georeference attributes
+        data_proj = self.spatial_ref(data_proj, epsg)
+        data_proj.attrs['spatial_ref'] = data_proj['spatial_ref'].item()
+        data_proj = data_proj.drop_vars('spatial_ref')
 
-        dy = int(data_proj.y.diff('y').round(0).values[0])
-        dx = int(data_proj.x.diff('x').round(0).values[0])
-        filename = self.get_burstfile(burst_rep, ext=f'{dy}x{dx}.nc', clean=True)
-        #encoding = {'data': self.get_compression(data_proj.shape)}
-        encoding = {varname: self.get_compression(data_proj[varname].shape) for varname in data_proj.data_vars}
-        #print ('encoding', encoding)
-        data_proj.to_netcdf(filename,
-                            encoding=encoding,
-                            engine=self.netcdf_engine_write,
-                            format=self.netcdf_format)
+        # transfer attributes to the output variables
+        data_proj.im.attrs = data_proj.attrs
+        data_proj.re.attrs = data_proj.attrs
+
+        encoding = {var: self.get_compression_zarr(data_proj[var].shape, dtype=data_proj[var].dtype) for var in data_proj.data_vars}
+        # tiny coord arrays: one chunk, no compressor, NaN fill value instead of default 0
+        encoding.update({
+            'x': dict(compressor=None, chunks=(data_proj.sizes['x'],), dtype="float64", fill_value=np.nan),
+            'y': dict(compressor=None, chunks=(data_proj.sizes['y'],), dtype="float64", fill_value=np.nan),
+        })
+        data_proj.to_zarr(
+            store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
+            encoding=encoding,
+            mode='w',
+            consolidated=True
+        )
+        slc.close()
+        del data_proj, slc
 
         for ext in ['SLC', 'LED', 'PRM']:                
             self.get_burstfile(burst_rep, ext, clean=True)

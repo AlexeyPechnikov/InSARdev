@@ -74,7 +74,8 @@ class S1_align(S1_dem):
         warnings.filterwarnings('ignore')
 
         # add buffer around the cropped area for borders interpolation
-        dem_area = self.get_dem(burst)
+        record = self.get_record(burst)
+        dem_area = self.get_dem_wgs84ellipsoid(geometry=record.geometry)
         
         ny = int(np.round(degrees/dem_area.lat.diff('lat')[0]))
         nx = int(np.round(degrees/dem_area.lon.diff('lon')[0]))
@@ -88,7 +89,7 @@ class S1_align(S1_dem):
         return topo_llt[~np.isnan(topo_llt[:, 2])]
 
     # aligning for reference image
-    def align_ref(self, burst: str, debug: bool=False):
+    def align_ref(self, burst: str, basedir: str=None, debug: bool=False):
         """
         Align and stack the reference scene.
 
@@ -109,17 +110,14 @@ class S1_align(S1_dem):
         import numpy as np
         import os
 
-        prefix = self.get_prefix(burst)
-        path_prefix = os.path.join(self.basedir, prefix)
-
         # generate PRM, LED, SLC
-        self._make_s1a_tops(burst, mode=1, debug=debug)
+        self._make_s1a_tops(burst, basedir, mode=1, debug=debug)
 
-        PRM.from_file(os.path.join(path_prefix, f'{burst}.PRM'))\
+        PRM.from_file(os.path.join(basedir, f'{burst}.PRM'))\
             .calc_dop_orb(inplace=True).update()
 
     # aligning for secondary image
-    def align_rep(self, burst_rep: str, burst_ref: str, degrees: float=12.0/3600, debug: bool=False):
+    def align_rep(self, burst_rep: str, burst_ref: str, basedir: str, degrees: float=12.0/3600, debug: bool=False):
         """
         Align and stack secondary images.
 
@@ -140,36 +138,25 @@ class S1_align(S1_dem):
         """
         import xarray as xr
         import numpy as np
+        import dask
         import os
         
         # temporary filenames to be removed
         cleanup = []
 
-        #ref_prefix = self.get_prefix(burst)
-        #rep_prefix = self.get_prefix(burst, date)
-
-        #burst_ref = self.get_reference(burst)
-
-        prefix = self.get_prefix(burst_ref)
-        #path_prefix = os.path.join(self.basedir, prefix)
-
         # define reference image parameters
-        earth_radius = self.PRM(burst_ref).get('earth_radius')
+        earth_radius = self.PRM(burst_ref, basedir).get('earth_radius')
 
         # prepare coarse DEM for alignment
         # 12 arc seconds resolution is enough, for SRTM 90m decimation is 4x4
         topo_llt = self._get_topo_llt(burst_ref, degrees=degrees)
-        #topo_llt.shape
 
         # define relative filenames for PRM
-        rep_prm  = os.path.join(self.basedir, prefix, f'{burst_rep}.PRM')
-        ref_prm  = os.path.join(self.basedir, prefix, f'{burst_ref}.PRM')
-
-        # TODO: define 1st image for line, in the example we have no more
-        tmp_da = 0
+        rep_prm  = os.path.join(basedir, f'{burst_rep}.PRM')
+        ref_prm  = os.path.join(basedir, f'{burst_ref}.PRM')
 
         # generate PRM, LED
-        self._make_s1a_tops(burst_rep, debug=debug)
+        self._make_s1a_tops(burst_rep, basedir, debug=debug)
 
         # compute the time difference between first frame and the rest frames
         t1, prf = PRM.from_file(rep_prm).get('clock_start', 'PRF')
@@ -182,25 +169,6 @@ class S1_align(S1_dem):
         prm1 = PRM.from_file(ref_prm)
         prm1.set(prm1.sel('clock_start' ,'clock_stop', 'SC_clock_start', 'SC_clock_stop') + nl/prf/86400.0)
         tmp_prm = prm1
-
-        # compute whether there are any image offset
-        #if tmp_da == 0:
-        # tmp_prm defined above from {reference}.PRM
-        prm1 = tmp_prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-        prm2 = PRM.from_file(rep_prm).calc_dop_orb(earth_radius, inplace=True, debug=debug).update()
-        lontie,lattie = prm1.SAT_baseline(prm2, debug=debug).get('lon_tie_point', 'lat_tie_point')
-        tmp_am = prm1.SAT_llt2rat(coords=[lontie, lattie, 0], precise=1, debug=debug)[1]
-        tmp_as = prm2.SAT_llt2rat(coords=[lontie, lattie, 0], precise=1, debug=debug)[1]
-        # bursts look equal to rounded result int(np.round(...))
-        tmp_da = int(tmp_as - tmp_am)
-        #print ('tmp_am', tmp_am, 'tmp_as', tmp_as, 'tmp_da', tmp_da)
-
-        # in case the images are offset by more than a burst, shift the super-reference's PRM again
-        # so SAT_llt2rat gives precise estimate
-        if abs(tmp_da) >= 1000:
-            prf = tmp_prm.get('PRF')
-            tmp_prm.set(tmp_prm.sel('clock_start' ,'clock_stop', 'SC_clock_start', 'SC_clock_stop') - tmp_da/prf/86400.0)
-            #raise Exception('TODO: Modifying reference PRM by $tmp_da lines...')
 
         # tmp.PRM defined above from {reference}.PRM
         prm1 = tmp_prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
@@ -220,12 +188,8 @@ class S1_align(S1_dem):
         # set the exact borders in radar coordinates
         par_tmp = offset_dat[(offset_dat[:,0]>0) & (offset_dat[:,0]<rmax) & (offset_dat[:,2]>0) & (offset_dat[:,2]<amax)]
         par_tmp[:,2] += nl
-        if abs(tmp_da) >= 1000:
-            par_tmp[:,2] -= tmp_da
-            par_tmp[:,3] += tmp_da
 
         # prepare the rshift and ashift look up table to be used by make_s1a_tops
-        # use tmp_dat instead of offset_dat
         r_xyz = offset_dat[:,[0,2,1]]
         a_xyz = offset_dat[:,[0,2,3]]
 
@@ -244,16 +208,11 @@ class S1_align(S1_dem):
         # generate the image with point-by-point shifts
         # note: it removes calc_dop_orb parameters from PRM file
         # generate PRM, LED
-        self._make_s1a_tops(burst_rep, mode=1,
-                           rshift_fromfile=f'{burst_rep}_r.grd',
-                           ashift_fromfile=f'{burst_rep}_a.grd',
-                           debug=debug)
-
-        # need to update shift parameter so stitch_tops will know how to stitch
-        #PRM.from_file(rep_prm).set(PRM.fitoffset(3, 3, offset_dat)).update()
-
-        # Restoring $tmp_da lines shift to the image... 
-        PRM.from_file(rep_prm).set(ashift=0 if abs(tmp_da) < 1000 else tmp_da, rshift=0).update()
+        self._make_s1a_tops(burst_rep, basedir,
+                            mode=1,
+                            rshift_fromfile=f'{burst_rep}_r.grd',
+                            ashift_fromfile=f'{burst_rep}_a.grd',
+                            debug=debug)
 
         PRM.from_file(rep_prm).set(PRM.fitoffset(3, 3, par_tmp)).update()
 
@@ -261,5 +220,4 @@ class S1_align(S1_dem):
 
         # cleanup
         for filename in cleanup:
-            #if os.path.exists(filename):
             os.remove(filename)

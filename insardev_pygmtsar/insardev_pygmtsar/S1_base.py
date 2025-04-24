@@ -38,14 +38,14 @@ class S1_base(progressbar_joblib, datagrid):
             df = self.df[self.df.pathNumber==path_number[0]]
         return df.set_crs(4326).to_crs(crs)
 
-    def get_prefix(self, burst: str) -> str:
+    def fullBurstId(self, burst: str) -> str:
         df = self.get_record(burst)
         return df.index.get_level_values(0)[0]
 
-    def get_burstfile(self, burst: str, ext: str='nc', clean: bool=False) -> str:
+    def get_burstfile(self, burst: str, basedir: str, ext: str='nc', clean: bool=False) -> str:
         import os
-        prefix = self.get_prefix(burst)
-        filename = os.path.join(self.basedir, prefix, f'{burst}.{ext}')
+        prefix = self.fullBurstId(burst)
+        filename = os.path.join(basedir, prefix, f'{burst}.{ext}')
         #print ('get_burstfile', filename)
         if clean:
             if os.path.exists(filename):
@@ -55,10 +55,9 @@ class S1_base(progressbar_joblib, datagrid):
                 assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
         return filename
 
-    def get_filename(self, burst: str, name: str, ext: str='nc', clean: bool=False) -> str:
+    def get_filename(self, burst: str, basedir: str, name: str, ext: str='nc', clean: bool=False) -> str:
         import os
-        prefix = self.get_prefix(burst)
-        filename = os.path.join(self.basedir, prefix, f'{name}.{ext}')
+        filename = os.path.join(basedir, f'{name}.{ext}' if ext is not None else name)
         #print ('get_filename', filename)
         if clean:
             if os.path.exists(filename):
@@ -70,14 +69,14 @@ class S1_base(progressbar_joblib, datagrid):
    
     def get_basename(self, burst: str) -> str:
         import os
-        prefix = self.get_prefix(burst)
-        basename = os.path.join(self.basedir, prefix, burst)
+        prefix = self.fullBurstId(burst)
+        basename = os.path.join(self.workdir, prefix, burst)
         return basename
     
     def get_dirname(self, burst: str) -> str:
         import os
-        prefix = self.get_prefix(burst)
-        dirname = os.path.join(self.basedir, prefix)
+        prefix = self.fullBurstId(burst)
+        dirname = os.path.join(self.workdir, prefix)
         return dirname
 
     def get_record(self, burst: str) -> pd.DataFrame:
@@ -129,3 +128,32 @@ class S1_base(progressbar_joblib, datagrid):
             reps_dict.setdefault(rec.Index[0], []).append(rec.Index)
 
         return {key: (refs_dict[key], reps_dict[key]) for key in refs_dict}
+
+    def julian_to_datetime(self, julian_timestamp: float) -> pd.Timestamp:
+        """
+        Convert Julian timestamp to datetime.
+        
+        Parameters
+        ----------
+        julian_timestamp : float
+            Timestamp in format YYYYDOY.FRACTION, e.g., 2023040.1484139557
+            where YYYY is year, DOY is day of year, and FRACTION is fractional day
+            
+        Returns
+        -------
+        pd.Timestamp
+            Converted datetime
+        """
+        import pandas as pd
+        import numpy as np
+        
+        # Split into year, DOY, and fraction
+        year = int(julian_timestamp / 1000)  # Get year from first 4 digits
+        doy = int(julian_timestamp % 1000)   # Get DOY from next 3 digits
+        fraction = julian_timestamp - int(julian_timestamp)  # Get fractional day
+        
+        # Convert to datetime
+        base_date = pd.Timestamp(f"{year}-01-01")
+        date = base_date + pd.Timedelta(days=doy) + pd.Timedelta(days=fraction)
+        
+        return date

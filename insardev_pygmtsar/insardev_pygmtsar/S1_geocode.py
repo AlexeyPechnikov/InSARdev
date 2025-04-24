@@ -14,18 +14,25 @@ class S1_geocode(S1_align):
     import xarray as xr
     import numpy as np
 
-    def geocode(self, burst: str, data: xr.DataArray, resolution: tuple[int, int]) -> xr.DataArray:
+    def geocode(self, burst: str, data: xr.DataArray, basedir: str, resolution: tuple[int, int]) -> xr.DataArray:
         """
-        Perform geocoding from radar to geographic coordinates.
+        Perform geocoding from radar to projected coordinates.
 
         Parameters
         ----------
-        grid : xarray.DataArray
+        burst : str
+            The burst name.
+        data : xarray.DataArray
             Grid(s) representing the interferogram(s) in radar coordinates.
+        basedir : str
+            The base directory.
+        resolution : tuple[int, int]
+            The resolution in the azimuth and range direction.
+
         Returns
         -------
         xarray.DataArray
-            The inverse geocoded grid(s) in geographic coordinates.
+            The geocoded grid(s) in projected coordinates.
 
         Examples
         --------
@@ -40,8 +47,6 @@ class S1_geocode(S1_align):
         import numpy as np
         import warnings
         warnings.filterwarnings('ignore')
-
-        transform = self.get_transform(burst, resolution)
 
         # use outer data variable
         def trans_block(trans_block_azi, trans_block_rng):
@@ -79,6 +84,7 @@ class S1_geocode(S1_align):
             del coord_a, coord_r, points, values
             return grid_proj
 
+        transform = self.get_transform(burst, resolution)
         out = da.blockwise(
             trans_block,
             'yx',
@@ -87,7 +93,9 @@ class S1_geocode(S1_align):
             dtype=data.dtype
         )
 
-        da = self.spatial_ref(xr.DataArray(out, transform.coords).rename(data.name), transform)
+        #da = self.spatial_ref(xr.DataArray(out, transform.coords).rename(data.name), transform)
+        da = xr.DataArray(out, transform.ele.coords).rename(data.name)
+        transform.close()
         del out, transform
         return da
 
@@ -132,16 +140,18 @@ class S1_geocode(S1_align):
         get_trans()
         """
         import xarray as xr
-        filename = self.get_filename(burst, f'transform.{resolution[0]}x{resolution[1]}')
-        return xr.open_dataset(filename,
-                               engine=self.netcdf_engine_read,
-                               format=self.netcdf_format,
-                               chunks=self.chunksize)
-        #return self.open_cube(filename)
+        import os
+        ds = xr.open_zarr(store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst), 'transform'),
+                            consolidated=True,
+                            chunks='auto')
+        # variables are stored as int32, convert to float32 instead of default float64
+        for v in ('azi','rng','ele'):
+            ds[v] = ds[v].astype('float32')
+        return ds
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_transform(self, burst_ref: str, resolution: tuple[int, int]=(10, 2.5), epsg: int=None, interactive: bool=False):
+    def compute_transform(self, burst_ref: str, basedir: str, resolution: tuple[int, int]=(10, 2.5), epsg: int=None):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -177,17 +187,26 @@ class S1_geocode(S1_align):
         import warnings
         warnings.filterwarnings('ignore')
 
+        # round variables for better compression
+        scale_factor = 10.0
+
         # range, azimuth, elevation(ref to radius in PRM), look_E, look_N, look_U
         llt2ratlook_map = {0: 'rng', 1: 'azi', 2: 'ele', 3: 'look_E', 4: 'look_N', 5: 'look_U'}
         #llt2ratlook_map = {0: 'rng', 1: 'azi', 2: 'ele'}
 
-        prm = self.PRM(burst_ref)
+        prm = self.PRM(burst_ref, basedir)
+        #timestamp = self.julian_to_datetime(prm.get('SC_clock_start'))
+        #print ('timestamp geocode', timestamp)
+
         def SAT_llt2ratlook(lats, lons, zs):
             # for binary=True values outside of the scene missed and the array is not complete
             # 4th and 5th coordinates are the same as input lat, lon
             #print (f'SAT_llt2rat: lats={lats}, lons={lons}, zs={zs} ({lats.shape}, {lons.shape}, {zs.shape})')
             coords3d = np.column_stack([lons, lats, np.nan_to_num(zs)])
-            rae = prm.SAT_llt2rat(coords3d, precise=1, binary=False).astype(np.float32).reshape(zs.size, 5)[...,:3]
+            #print ('coords3d', coords3d)
+            rae = prm.SAT_llt2rat(coords3d, precise=1, binary=False).astype(np.float32)
+            #print ('rae', rae)
+            rae = rae.reshape(zs.size, 5)[...,:3]
             #rae[~np.isfinite(zs), :] = np.nan
             #return rae
             # look_E look_N look_U
@@ -198,14 +217,7 @@ class S1_geocode(S1_align):
             return out
 
         # exclude latitude and longitude columns as redundant
-        def trans_block(ys, xs, coarsen, epsg, amin=-np.inf, amax=np.inf, rmin=-np.inf, rmax=np.inf, filename=None):
-            # disable "distributed.utils_perf - WARNING - full garbage collections ..."
-            try:
-                from dask.distributed import utils_perf
-                utils_perf.disable_gc_diagnosis()
-            except ImportError:
-                from distributed.gc import disable_gc_diagnosis
-                disable_gc_diagnosis()
+        def trans_block(ys, xs, coarsen, epsg, scale_factor, amin=-np.inf, amax=np.inf, rmin=-np.inf, rmax=np.inf):
             import warnings
             warnings.filterwarnings('ignore')
 
@@ -286,7 +298,9 @@ class S1_geocode(S1_align):
                 rae = rae_coarsen.transpose(2,0,1)
             del rae_coarsen
 
-            return rae.astype(np.float32)
+            #return rae.astype(np.float32)
+            # fill invalid values with integer min
+            return np.where(np.isfinite(rae), (scale_factor*rae).round(), np.iinfo(np.int32).min).astype(np.int32)
 
         def trans_blocks(ys, xs, chunksize):
             #print ('ys', ys, 'xs', xs, 'sizes', ys.size, xs.size)
@@ -301,9 +315,10 @@ class S1_geocode(S1_align):
                 blocks = []
                 for xs_block in xs_blocks:
                     block = dask.array.from_delayed(
-                        dask.delayed(trans_block)(ys_block, xs_block, coarsen, epsg, **borders),
+                        dask.delayed(trans_block)(ys_block, xs_block, coarsen, epsg, scale_factor, **borders),
                         shape=(6, ys_block.size, xs_block.size),
-                        dtype=np.float32
+                        #dtype=np.float32
+                        dtype=np.int32
                     )
                     blocks.append(block)
                     del block
@@ -318,7 +333,8 @@ class S1_geocode(S1_align):
             return trans
 
         # do not use coordinate names lat,lon because the output grid saved as (lon,lon) in this case...
-        dem = self.get_dem(burst_ref)
+        record = self.get_record(burst_ref)
+        dem = self.get_dem_wgs84ellipsoid(geometry=record.geometry)
 
         if epsg is None:
             epsg = self.get_utm_epsg(dem.lat.mean(), dem.lon.mean())
@@ -367,14 +383,22 @@ class S1_geocode(S1_align):
 
         # compute for the radar extent
         trans = trans_blocks(ys, xs, self.chunksize)
+        # round variables for better compression
+        for varname in ['azi', 'rng', 'ele']:
+            trans[varname].attrs['scale_factor'] = 1/scale_factor
+            trans[varname].attrs['add_offset'] = 0
+            trans[varname].attrs['_FillValue'] = np.iinfo(np.int32).min
+        # add add georeference attributes
+        trans = self.spatial_ref(trans, epsg)
+        trans.attrs['spatial_ref'] = trans['spatial_ref'].item()
+        trans = trans.drop_vars('spatial_ref')
 
-        if interactive:
-            return trans
-
-        filename = self.get_filename(burst_ref, f'transform.{resolution[0]}x{resolution[1]}', clean=True)
-        encoding = {varname: self.get_compression(trans[varname].shape) for varname in trans.data_vars}
-        self.spatial_ref(trans, epsg).to_netcdf(filename,
-                        encoding=encoding,
-                        engine=self.netcdf_engine_write,
-                        format=self.netcdf_format)
-        del trans, dem
+        encoding = {var: self.get_compression_zarr(trans[var].shape, dtype=trans[var].dtype) for var in trans.data_vars}
+        #print ('encoding', encoding)
+        trans.to_zarr(
+            store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_ref), 'transform'),
+            encoding=encoding,
+            mode='w',
+            consolidated=True
+        )
+        del trans

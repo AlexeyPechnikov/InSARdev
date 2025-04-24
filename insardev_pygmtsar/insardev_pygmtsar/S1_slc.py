@@ -12,12 +12,13 @@ from .S1_base import S1_base
 class S1_slc(S1_base):
     import geopandas as gpd
     from shapely.geometry import MultiPolygon
-
+    import xarray as xr
+    
     pattern_prefix = '[0-9]*_[0-9]*_IW?'
     pattern_burst = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
     pattern_orbit = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
 
-    def __init__(self, datadir: str, workdir: str|None=None, drop_if_exists: bool=False):
+    def __init__(self, datadir: str, workdir: str|None=None, DEM: str|xr.DataArray|xr.Dataset|None=None, drop_if_exists: bool=False):
         """
         Scans the specified directory for Sentinel-1 SLC (Single Look Complex) data and filters it based on the provided parameters.
     
@@ -25,6 +26,12 @@ class S1_slc(S1_base):
         ----------
         datadir : str
             The directory containing the data files.
+        workdir : str, optional
+            The directory to store the processed data.
+        DEMfilename : str, optional
+            The filename of the DEM file.
+        drop_if_exists : bool, optional
+            If True, delete the existing files in the work directory.
         
         Returns
         -------
@@ -48,7 +55,7 @@ class S1_slc(S1_base):
         oneday = relativedelta(days=1)
 
         if workdir is not None:
-            # (re)create basedir only when force=True
+            # (re)create workdir only when force=True
             if os.path.exists(workdir):
                 if drop_if_exists:
                     shutil.rmtree(workdir, ignore_errors=True)
@@ -57,8 +64,9 @@ class S1_slc(S1_base):
                     print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
             os.makedirs(workdir, exist_ok=True)
         
-        self.basedir = workdir
         self.datadir = datadir
+        self.workdir = workdir
+        self.DEM = DEM
 
         orbits = glob(self.pattern_orbit, root_dir=self.datadir)
         #print ('orbits', orbits)

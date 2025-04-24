@@ -40,23 +40,119 @@ class datagrid:
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
     chunksize = 2048
     chunksize1d = 16384
-    #netcdf_engine = 'h5netcdf'
-    #netcdf_engine = 'netcdf4'
     netcdf_engine_read = 'h5netcdf'
     netcdf_engine_write = 'netcdf4'
     netcdf_format = 'NETCDF4'
-    netcdf_chunksize = 1024
+    netcdf_chunksize = 1024*2
     netcdf_chunksize1d = 65536
     netcdf_compression_algorithm = 'zlib'
     netcdf_complevel = 3
     netcdf_shuffle = True
-    netcdf_queue = 16
+    #netcdf_queue = 16
+
+    zarr_chunksize = 2048
+    zarr_chunksize1d = 64*1024
+    # ['lz4', 'lz4hc', 'blosclz', 'zstd', 'zlib']
+    zarr_compression_algorithm = 'zstd'
+    zarr_clevel = 6
+    zarr_shuffle_floating = 'bitshuffle'
+    zarr_shuffle_integer = 'noshuffle'
+    zarr_blocksize = 0
 
     # processing directory
     basedir = '.'
 
     # define lost class variables due to joblib via arguments
-    def get_compression(self, shape=None, chunksize=None):
+    def get_compression_zarr(self, shape=None, dtype=None, chunksize=None, shuffle=None, fill_value=None):
+        """
+        Return the compression options for a data grid.
+
+        Parameters
+        ----------
+        shape : tuple, list, np.ndarray, optional
+            The shape of the data grid. Required if chunksize is less than grid dimension sizes. Default is None.
+        chunksize : int or tuple, optional
+            The chunk size for data compression. If not specified, the class attribute chunksize is used.
+
+        Returns
+        -------
+        dict
+            A dictionary containing the compression options for the data grid.
+
+        Examples
+        --------
+        Get the compression options for a data grid with shape (1000, 1000):
+
+        >>> get_compression_zarr(shape=(1000, 1000))
+        {'zstd': True, 'complevel': 6, 'chunksizes': (2048, 2048)}
+
+        Get the compression options for a data grid with chunksize 256:
+
+        >>> get_compression_zarr(chunksize=256)
+        {'zstd': True, 'complevel': 6, 'chunksizes': (2048, 2048)}
+        """
+        import numpy as np
+        from zarr.codecs import BloscCodec
+
+        if dtype is not None:
+            if np.issubdtype(dtype, np.floating):
+                shuffle = self.zarr_shuffle_floating if shuffle is None else shuffle
+                fill_value = np.nan if fill_value is None else fill_value
+            else:
+                shuffle = self.zarr_shuffle_integer if shuffle is None else shuffle
+                #fill_value = 0 if fill_value is None else fill_value
+                if fill_value is None:
+                    # unsigned ints get 0, signed ints get the min representable
+                    if np.issubdtype(dtype, np.unsignedinteger):
+                        fill_value = 0
+                    else:
+                        fill_value = np.iinfo(dtype).min
+        if shuffle is None:
+            shuffle = self.zarr_shuffle_floating
+        if fill_value is None:
+            fill_value = np.nan
+
+        compressor = BloscCodec(
+            cname=self.zarr_compression_algorithm,
+            clevel=self.zarr_clevel,
+            shuffle=shuffle,
+            blocksize=self.zarr_blocksize
+        )
+
+        if chunksize is None and len(shape) == 1:
+            # (stacked) single-dimensional grid 
+            chunksize = self.zarr_chunksize1d
+        elif chunksize is None:
+            # common 2+D grid
+            chunksize = self.zarr_chunksize
+
+        assert chunksize is not None, 'compression() chunksize is None'
+        if isinstance(chunksize, (tuple, list, np.ndarray)):
+            # use as is, it can be 2D or 3D grid (even 1D while it is not used for now)
+            if shape is not None:
+                assert len(shape) == len(chunksize), f'ERROR: defined shape and chunksize dimensions are not equal: {len(shape)} != {len(chunksize)}'
+                chunksizes = tuple([chunksize[dim] if chunksize[dim]<shape[dim] else shape[dim] for dim in range(len(shape))])
+            else:
+                chunksizes = chunksize
+        else:
+            if shape is not None:
+                # 2D or 3D grid
+                chunksizes = []
+                for idim in range(len(shape)):
+                    chunksizes.append(chunksize if chunksize<shape[idim] else shape[idim])
+                # set first dimension chunksize to 1 for 3D array
+                if len(chunksizes) == 3:
+                    chunksizes[0] = 1
+                chunksizes = tuple(chunksizes)
+            else:
+                chunksizes=(chunksize, chunksize)
+        opts = dict(chunks=chunksizes, fill_value=fill_value)
+        if self.zarr_compression_algorithm is not None and self.zarr_clevel >= 0:
+            opts['compressors'] = (compressor,)
+        return opts
+
+    # define lost class variables due to joblib via arguments
+    def get_compression_netcdf(self, shape=None, chunksize=None):
         """
         Return the compression options for a data grid.
 
@@ -463,6 +559,10 @@ class datagrid:
         import numpy as np
         import xarray as xr
         import dask.array as da
+        # prevent PerformanceWarning: Increasing number of chunks by factor of ...
+        import warnings
+        warnings.filterwarnings("ignore", category=da.core.PerformanceWarning)
+
         dims = grid.dims[-2:]
         dim1, dim2 = dims
         coords = {dim1: grid[dim1], dim2: grid[dim2]}

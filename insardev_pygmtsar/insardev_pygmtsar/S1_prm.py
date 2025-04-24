@@ -12,7 +12,7 @@ from .PRM import PRM
 
 class S1_prm(S1_slc):
 
-    def PRM(self, burst: str) -> PRM:
+    def PRM(self, burst: str, basedir) -> PRM:
         """
         Open a PRM (Parameter) file.
 
@@ -30,9 +30,9 @@ class S1_prm(S1_slc):
         """
         import os
 
-        prefix = self.get_prefix(burst)
+        #prefix = self.get_prefix(burst)
         #print ('PRM prefix', prefix)
-        filename = os.path.join(self.basedir, prefix, f'{burst}.PRM')
+        filename = os.path.join(basedir, f'{burst}.PRM')
         #print ('PRM filename', filename)
         return PRM.from_file(filename)
 
