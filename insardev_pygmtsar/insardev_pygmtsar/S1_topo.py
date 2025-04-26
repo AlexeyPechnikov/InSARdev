@@ -340,7 +340,8 @@ class S1_topo(S1_geocode):
         del trans_inv
         #print ('topo', topo)
 
-        encoding = {'topo': self.get_encoding_zarr(topo.shape)}
+        encoding = {'topo': self.get_encoding_zarr()}
+        #print ('encoding', encoding)
         topo.to_zarr(
             store=os.path.join(basedir, 'topo'),
             encoding=encoding,

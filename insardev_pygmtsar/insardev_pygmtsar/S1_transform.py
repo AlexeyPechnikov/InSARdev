@@ -15,7 +15,7 @@ class S1_transform(S1_topo):
     import numpy as np
 
     def transform(self, ref: str, records: pd.DataFrame|None=None, degrees: float=12.0/3600,
-            resolution: tuple[int, int]=(20, 5), epsg: str|int|None='auto', timeout: str|int|None='30s', debug: bool=False):
+            resolution: tuple[int, int]=(20, 5), scale_factor: float=2.0, epsg: str|int|None='auto', timeout: str|int|None='30s', debug: bool=False):
         from tqdm.auto import tqdm
         import dask
         from tqdm.auto import tqdm
@@ -52,7 +52,7 @@ class S1_transform(S1_topo):
                 for burst_ref in burst_refs:
                     self.align_ref(burst_ref[-1], basedir, debug=debug)
                 #print ('compute_transform')
-                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, scale_factor=scale_factor, epsg=epsg)
                 # for topo phase calculation
                 #print ('compute_transform_inverse')
                 self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
@@ -177,16 +177,17 @@ class S1_transform(S1_topo):
             data_proj[varname].attrs['scale_factor'] = scale
             data_proj[varname].attrs['add_offset'] = 0
             data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).min
-
-        encoding = {var: self.get_encoding_zarr(data_proj[var].shape, dtype=data_proj[var].dtype) for var in data_proj.data_vars}
-        # coord arrays: one chunk, no compressor, NaN fill value instead of default 0
-        #encoding.update({
-        #    'x': dict(compressor=None, chunks=(data_proj.sizes['x'],), dtype="float64", fill_value=np.nan),
-        #    'y': dict(compressor=None, chunks=(data_proj.sizes['y'],), dtype="float64", fill_value=np.nan),
-        #})
+        
+        encoding_vars = {var: self.get_encoding_zarr(chunks=(data_proj.x.size,),
+                                                     dtype=data_proj[var].dtype,
+                                                     shuffle='noshuffle'
+                                                     ) for var in data_proj.data_vars}
+        #print ('encoding_vars', encoding_vars)
+        encoding_coords = {coord: self.get_encoding_zarr(chunks=(data_proj[coord].size,), dtype=data_proj[coord].dtype) for coord in data_proj.coords}
+        #print ('encoding_coords', encoding_coords)
         data_proj.to_zarr(
             store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
-            encoding=encoding,
+            encoding=encoding_vars | encoding_coords,
             mode='w',
             consolidated=True
         )

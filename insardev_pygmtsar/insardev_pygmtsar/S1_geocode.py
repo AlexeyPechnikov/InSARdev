@@ -150,7 +150,7 @@ class S1_geocode(S1_align):
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_transform(self, burst_ref: str, basedir: str, resolution: tuple[int, int]=(10, 2.5), epsg: int=None):
+    def compute_transform(self, burst_ref: str, basedir: str, resolution: tuple[int, int]=(10, 2.5), scale_factor: float=2.0, epsg: int=None):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -185,9 +185,6 @@ class S1_geocode(S1_align):
         import cv2
         import warnings
         warnings.filterwarnings('ignore')
-
-        # round variables for better compression
-        scale_factor = 10.0
 
         # range, azimuth, elevation(ref to radius in PRM), look_E, look_N, look_U
         llt2ratlook_map = {0: 'rng', 1: 'azi', 2: 'ele', 3: 'look_E', 4: 'look_N', 5: 'look_U'}
@@ -392,11 +389,13 @@ class S1_geocode(S1_align):
         trans.attrs['spatial_ref'] = trans.spatial_ref.attrs['spatial_ref']
         trans = trans.drop_vars('spatial_ref')
 
-        encoding = {var: self.get_encoding_zarr(trans[var].shape, dtype=trans[var].dtype) for var in trans.data_vars}
-        #print ('encoding', encoding)
+        encoding_vars = {var: self.get_encoding_zarr(dtype=trans[var].dtype) for var in trans.data_vars}
+        #print ('encoding_vars', encoding_vars)
+        encoding_coords = {coord: self.get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
+        #print ('encoding_coords', encoding_coords)
         trans.to_zarr(
             store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_ref), 'transform'),
-            encoding=encoding,
+            encoding=encoding_vars | encoding_coords,
             mode='w',
             consolidated=True
         )

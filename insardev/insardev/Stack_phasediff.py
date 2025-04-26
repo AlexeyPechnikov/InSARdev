@@ -212,7 +212,6 @@ class Stack_phasediff(Stack_base):
         corrs_pols = [xr.merge([das[idx] for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
         dss = (intfs_pols, corrs_pols) if datas_dataset else ([intf[polarizations[0]] for intf in intfs_pols], [corrs[polarizations[0]] for corrs in corrs_pols])
         # workaround for previous code, use attributes from the original data for keys to build a dict
-        print ('X')
         return self.to_dict(dss[0]), self.to_dict(dss[1]) if datas_iterable else dss
         #return dss
 

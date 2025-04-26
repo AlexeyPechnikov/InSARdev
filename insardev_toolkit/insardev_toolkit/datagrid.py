@@ -52,21 +52,18 @@ class datagrid:
     # ['lz4', 'lz4hc', 'blosclz', 'zstd', 'zlib']
     zarr_compression_algorithm: str = 'zstd'
     zarr_clevel: int = 6
-    zarr_shuffle_floating: str = 'bitshuffle'
-    zarr_shuffle_integer: str = 'noshuffle'
+    zarr_shuffle: str = 'bitshuffle'
     zarr_blocksize: int = 0
 
     # define lost class variables due to joblib via arguments
-    def get_encoding_zarr(self, shape=None, dtype=None, shuffle=None, fill_value=None):
+    def get_encoding_zarr(self, chunks=None, dtype=None, shuffle=None, fill_value=None, compression=True):
         import numpy as np
         from zarr.codecs import BloscCodec
 
         if dtype is not None:
             if np.issubdtype(dtype, np.floating):
-                shuffle = self.zarr_shuffle_floating if shuffle is None else shuffle
                 fill_value = np.nan if fill_value is None else fill_value
             else:
-                shuffle = self.zarr_shuffle_integer if shuffle is None else shuffle
                 #fill_value = 0 if fill_value is None else fill_value
                 if fill_value is None:
                     # unsigned ints get 0, signed ints get the min representable
@@ -75,7 +72,7 @@ class datagrid:
                     else:
                         fill_value = np.iinfo(dtype).min
         if shuffle is None:
-            shuffle = self.zarr_shuffle_floating
+            shuffle = self.zarr_shuffle
         if fill_value is None:
             fill_value = np.nan
 
@@ -87,8 +84,12 @@ class datagrid:
         )
 
         opts = dict(fill_value=fill_value)
-        if self.zarr_compression_algorithm is not None and self.zarr_clevel >= 0:
+        if chunks is not None:
+            opts['chunks'] = chunks
+        if compression and self.zarr_compression_algorithm is not None and self.zarr_clevel >= 0:
             opts['compressors'] = (compressor,)
+        else:
+            opts['compressor'] = None
         return opts
 
     # define lost class variables due to joblib via arguments

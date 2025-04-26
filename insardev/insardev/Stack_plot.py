@@ -148,7 +148,7 @@ class Stack_plot(Stack_export):
             factor_x = int(np.round(size_x / (_size[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
             # coarsen and materialize data for all the calculations and plotting
-            progressbar(da := da[:,::max(1, factor_y), ::max(1, factor_x)].persist(), desc=f'Computing {polarization}'.ljust(25))
+            progressbar(da := da[:,::max(1, factor_y), ::max(1, factor_x)].persist(), desc=f'Computing {polarization} Plot'.ljust(25))
 
             # calculate min, max when needed
             if quantile is not None:
@@ -173,6 +173,7 @@ class Stack_plot(Stack_export):
             fg.fig.suptitle(f'{polarization} {caption}', y=y)            
             #self.plots_AOI(fg, **kwargs)
             #self.plots_POI(fg, **kwargs)
+            return fg
 
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
@@ -197,28 +198,31 @@ class Stack_plot(Stack_export):
         #print ('polarizations', polarizations)
 
         # process polarizations one by one
+        fgs = []
         for pol in polarizations:
-            plot_polarization(data, polarization=pol)
+            fg = plot_polarization(data, polarization=pol)
+            fgs.append(fg)
+        return fgs
 
     def plot_displacement_mm(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
         data_los_mm = self.los_displacement_mm(data)
-        self.plot_stack(data_los_mm, polarizations,
+        return self.plot_stack(data_los_mm, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
 
     def plot_displacement(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
-        self.plot_stack(data, polarizations,
+        return self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
 
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
-        self.plot_stack(data, polarizations,
+        return self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
 
@@ -226,7 +230,7 @@ class Stack_plot(Stack_export):
                            cmap='gist_rainbow_r',
                            caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
         import numpy as np
-        self.plot_stack(data, polarizations,
+        return self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
 
@@ -239,7 +243,7 @@ class Stack_plot(Stack_export):
                 name='custom_gray', 
                 colors=['black', 'whitesmoke']
             )
-        self.plot_stack(data, polarizations,
+        return self.plot_stack(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
                         caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size, **kwargs)
 
