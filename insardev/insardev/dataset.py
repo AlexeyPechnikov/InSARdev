@@ -317,7 +317,7 @@ class dataset(datagrid):
             data = data.to_dataset().assign_attrs({'dataarray': data.name})
 
         is_dask = isinstance(data[list(data.data_vars)[0]].data, dask.array.Array)
-        encoding = {varname: self.get_compression_netcdf(data[varname].shape, chunksize=chunksize) for varname in data.data_vars}
+        encoding = {varname: self.get_encoding_netcdf(data[varname].shape, chunksize=chunksize) for varname in data.data_vars}
         #print ('save_cube encoding', encoding)
         #print ('is_dask', is_dask, 'encoding', encoding)
 
@@ -560,7 +560,7 @@ class dataset(datagrid):
 
         if isinstance(data, xr.DataArray):
             data = data.to_dataset().assign_attrs({'dataarray': data.name})
-        encoding = {varname: self.get_compression_netcdf(data[varname].shape[1:]) for varname in data.data_vars}
+        encoding = {varname: self.get_encoding_netcdf(data[varname].shape[1:]) for varname in data.data_vars}
         #print ('save_stack encoding', encoding)
     
         # Applying iterative processing to prevent Dask scheduler deadlocks.

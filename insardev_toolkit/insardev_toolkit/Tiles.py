@@ -230,7 +230,7 @@ class Tiles(datagrid, progressbar_joblib):
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
-            encoding = {'z': self.get_compression_netcdf(da.shape)}
+            encoding = {'z': self.get_encoding_netcdf(da.shape)}
             da.rename('z').to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da
 

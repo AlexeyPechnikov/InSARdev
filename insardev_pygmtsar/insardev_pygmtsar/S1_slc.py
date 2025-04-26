@@ -14,9 +14,9 @@ class S1_slc(S1_base):
     from shapely.geometry import MultiPolygon
     import xarray as xr
     
-    pattern_prefix = '[0-9]*_[0-9]*_IW?'
-    pattern_burst = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
-    pattern_orbit = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
+    pattern_prefix: str = '[0-9]*_[0-9]*_IW?'
+    pattern_burst: str = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
+    pattern_orbit: str = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
 
     def __init__(self, datadir: str, workdir: str|None=None, DEM: str|xr.DataArray|xr.Dataset|None=None, drop_if_exists: bool=False):
         """

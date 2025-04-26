@@ -514,7 +514,6 @@ class PRM(datagrid, PRM_gmtsar):
         def read_SLC_block(slc_filename, start, stop):
             # Read a chunk of the SLC file
             # [real_0, imag_0, real_1, imag_1, real_2, imag_2, ...]
-            #print ('    offset, shape', start*2, 2*(stop-start))
             # offset is measured in bytes
             return np.memmap(slc_filename, dtype=np.int16, mode='r', offset=start*4, shape=(2*(stop-start),))
 
@@ -530,22 +529,20 @@ class PRM(datagrid, PRM_gmtsar):
         blocksize = self.netcdf_chunksize * xdim
         blocks = int(np.ceil(ydim * xdim / blocksize))
         #print ('chunks', chunks, 'chunksize', chunksize)
-        # Create a lazy Dask array that reads chunks of the SLC file
+        # create a lazy Dask array that reads chunks of the SLC file
         res = []
         ims = []
         for i in range(blocks):
             start = i * blocksize
             stop = min((i+1) * blocksize, ydim * xdim)
-            #assert 0, f'SLC: start={start}, stop={stop}'
-            #print ('start, stop, shape', start, stop, (stop-start))
             # use proper output data type for complex data and intensity
             block = da.from_delayed(read_SLC_block(slc_filename, start, stop),
                 shape=(2*(stop-start),), dtype=np.int16)
             res.append(block[::2])
             ims.append(block[1::2])
             del block
-        # Concatenate the chunks together
-        # Data file can include additional data outside of the specified dimensions
+        # concatenate the chunks together
+        # data file can include additional data outside of the specified dimensions
         re = da.concatenate(res).reshape((-1, xdim))[:ydim,:]
         im = da.concatenate(ims).reshape((-1, xdim))[:ydim,:]
         del res, ims

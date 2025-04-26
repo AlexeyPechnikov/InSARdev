@@ -9,15 +9,14 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_plot import Stack_plot
+from insardev_toolkit import progressbar
 
 class Stack(Stack_plot):
     import rasterio as rio
     import pandas as pd
     import xarray as xr
     import geopandas as gpd
-
-    # redefine for fast caching
-    netcdf_complevel = -1
+    import fsspec
 
     def __repr__(self):
         return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
@@ -26,15 +25,17 @@ class Stack(Stack_plot):
         """
         Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
         """
-        return self.dss[0].attrs[key]
+        return next(iter(self.dss.values())).attrs[key]
 
     def crs(self) -> rio.crs.CRS:
-        return self.dss[0].rio.crs
+        return next(iter(self.dss.values())).rio.crs
 
     def epsg(self) -> int:
-        return self.dss[0].rio.crs.to_epsg()
+        return next(iter(self.dss.values())).rio.crs.to_epsg()
 
-    def to_dataframe(self, id:str|list[str]|None=None, date:str|list[str]|None=None, pathNumber:str|list[str]|None=None, crs:str|None='auto') -> pd.DataFrame:
+    def to_dataframe(self,
+                     datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None,
+                     crs:str|None='auto') -> pd.DataFrame:
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -52,68 +53,85 @@ class Stack(Stack_plot):
             crs = self.crs()
 
         df = self.df
-        if id is not None:
-            df = df[df.index.get_level_values(0).isin([id] if isinstance(id, str) else id)]
-        if date is not None:
-            df = df[df.index.get_level_values(2).isin([date] if isinstance(date, str) else date)]
-        if pathNumber is not None:
-            df = df[df.pathNumber==pathNumber]
-        return df.set_crs(4326).to_crs(crs)
+        if crs is None:
+            return df
+        else:
+            return df.set_crs(4326).to_crs(crs)
 
-    def to_dataset(self, records:pd.DataFrame|None=None, datas:list[xr.Dataset]|None=None, polarizations:list[str]|None=None, ids:list[str]|None=None):
+    def to_dict(self,
+                datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None):
+        """
+        Return the full dictionary of datasets or convert speciied list of datasets or dataarrays to a dictionary.
+        """
         import pandas as pd
-
-        if records is None and datas is None and polarizations is None and ids is None:
-            return self.dss
-
-        if records is None:
-            records = self.df
-        assert isinstance(records, pd.DataFrame)
+        import xarray as xr
+        import numpy as np
 
         if datas is None:
-            datas = self.dss
-        assert isinstance(datas, (list, tuple))
-        
-        if polarizations is not None and isinstance(polarizations, str):
-            polarizations = [polarizations]
-        polarizations_all = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
-        assert polarizations is None or isinstance(polarizations, (list, tuple))
-
-        if ids is not None and isinstance(ids, str):
-            ids = [ids]
-        assert ids is None or isinstance(ids, (list, tuple))
-        
-        dss = []
-        for rid in records.index.get_level_values(0).unique():
-            if ids is not None and not rid in ids:
-                continue
-            dates = records[records.index.get_level_values(0)==rid].index.get_level_values(2).astype(str)
-            ds = [ds for ds in datas if ds.id==rid][0].sel(date=dates)
-            if polarizations is not None:
-                for pol in polarizations_all:
-                    if pol not in polarizations:
+            return self.dss
+        elif isinstance(datas, pd.DataFrame):
+            dss = {}
+            # iterate all burst groups
+            for id in datas.index.get_level_values(0).unique():
+                # select all records for the current burst group
+                records = datas[datas.index.get_level_values(0)==id]
+                # filter dates
+                dates = records.index.get_level_values(2).astype(str)
+                ds = self.dss[id].sel(date=dates)
+                # filter polarizations
+                pols = records.index.get_level_values(1).unique().values
+                if len(pols) > 1:
+                    raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
+                elif len(pols) == 0:
+                    raise ValueError(f'ERROR: No polarizations found for the burst: {id}')
+                pols = pols[0]
+                if ',' in pols:
+                    pols = pols.split(',')
+                if isinstance(pols, str):
+                    pols = [pols]
+                count = 0
+                if np.unique(pols).size < len(pols):
+                    raise ValueError(f'ERROR: defined polarizations {pols} are not unique.')
+                if len([pol for pol in pols if pol in ds.data_vars]) < len(pols):
+                    raise ValueError(f'ERROR: defined polarizations {pols} are not available in the dataset: {id}')
+                for pol in [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in ds.data_vars]:
+                    if pol not in pols:
                         ds = ds.drop(pol)
-            dss.append(ds)
-        return dss
+                    else:
+                        count += 1
+                if count == 0:
+                    raise ValueError(f'ERROR: No valid polarizations found for the burst: {id}')
+                dss[id] = ds
+            return dss
+        elif isinstance(datas, dict):
+            return datas
+        elif isinstance(datas, (list, tuple)):
+            if 'fullBurstID' in datas[0].data_vars:
+                return {ds.fullBurstID.item(0):ds for ds in datas}
+            else:
+                print ('NOTE: No fullBurstID variable found in the dataset, using order as a key.')
+                return {i:ds for i, ds in enumerate(datas)}
+        else:
+            raise ValueError(f'ERROR: datas is not None or dataframe or a dict, list, or tuple of xr.Dataset or xr.DataArray: {type(datas)}')
 
     # def to_dataset(self, records=None):
     #     dss = self.to_datasets(records)
     #     if len(dss) > 1:
     #         return self.to_datasets(records)[0]
 
-    def __init__(self, basedir:str, resolution: tuple[int, int]=(20, 5), pattern_burst:str='*_*_?W?',
-                 pattern_date:str='S1_[0-9]+_IW[0-9]_[0-9]{8}T[0-9]{6}_[HV]{2}_.*-BURST',
-                 attr_start:str='BPR', debug:bool=False):
+    def __init__(self, path:str, fs:fsspec.spec.AbstractFileSystem|None=None,
+                 pattern:str='S1_??????_IW?_????????T??????_[HV][HV]_????-BURST', attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
         import geopandas as gpd
         from shapely import wkt
-        import glob
+        import fsspec
         import os
 
         # use oter variables attr_start, debug
         def ds_preprocess(ds):
+            #print ('ds_preprocess', ds)
             process_attr = True if debug else False
             for key in ds.attrs:
                 if key==attr_start:
@@ -132,33 +150,38 @@ class Stack(Stack_plot):
             if BPR != 0:
                 ds.attrs = {}
 
-            #polarization = ds['polarization'].values.item(0)
-            scale = ds['SLC_scale'].values.item(0)
-            #print ('scale', scale)
-            ds['data'] = (scale*(ds.re + 1j*ds.im)).astype(np.complex64).where(ds.re != 0)
+            ds['data'] = (ds.re + 1j*ds.im).astype(np.complex64)
             if not debug:
-                del ds['re'], ds['im'], ds['SLC_scale']
+                del ds['re'], ds['im']
             date = pd.to_datetime(ds['startTime'].item())
             return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
         
-        self.basedir = basedir
+        # specify dataset location locally or via fsspec
+        self.path = path
+        if not isinstance(fs, fsspec.spec.AbstractFileSystem):
+            fs = fsspec.filesystem("file")
+        self.fs = fs
 
-        dss = []
-        bursts = sorted(glob.glob(pattern_burst, root_dir=self.basedir))
-        #print ('bursts', bursts)
-        for burst in bursts:
-            basedir = os.path.join(self.basedir, burst)
-            filenames = self._glob_re(pattern_date + f'{resolution[0]}x{resolution[1]}.nc', basedir=basedir)
+        dss = {}
+        paths = fs.glob(path)
+        #print ('paths', paths)
+        if len(paths) == 0:
+            raise ValueError(f'ERROR: No files found for the path: {path}')
+        for path in paths:
+            burst = os.path.basename(path)
+            #print (path, '->', burst)
+            filenames = fs.glob(os.path.join(path, pattern))
             #print ('\tfilenames', filenames)
-            filename = os.path.join(basedir, f'transform.{resolution[0]}x{resolution[1]}.nc')
+            filename = os.path.join(path, 'transform')
+            #print ('\tfilename', filename)
 
             ds = xr.open_mfdataset(
                 filenames,
-                engine=self.netcdf_engine_read,
-                format=self.netcdf_format,
+                engine="zarr",
                 parallel=True,
                 concat_dim='date',
-                chunks={'date': 1, 'y': self.chunksize, 'x': self.chunksize},
+                #chunks={'date': 1, 'y': self.chunksize, 'x': self.chunksize},
+                chunks='auto',
                 combine='nested',
                 preprocess=ds_preprocess,
             )
@@ -169,14 +192,16 @@ class Stack(Stack_plot):
                 datas = []
                 for polarization in polarizations:
                     data = ds.isel(date=ds.polarization == polarization).rename({'data': polarization})
-                    del data['polarization'], data['burst']
+                    # cannot combine in a single value VV and VH polarizations and corresponding burst names
+                    data.burst.values = [v.replace(polarization, 'XX') for v in data.burst.values]
+                    del data['polarization']
                     datas.append(data)
                 ds = xr.merge(datas)
             else:
                 ds = ds.rename({'data': polarizations[0]})
-
-            trans = xr.open_dataset(filename, engine=self.netcdf_engine_read, format=self.netcdf_format)
-
+            #print (ds)
+            trans = xr.open_zarr(store=filename, consolidated=True, chunks='auto')
+            #print ('\ttrans', trans)
             #scale = data.attrs['SLC_scale']
             #scale = ds['SLC_scale'].values.item(0)
             #print ('scale', scale)
@@ -196,16 +221,19 @@ class Stack(Stack_plot):
                     ds[var] = trans[var]
             del trans
 
+            ds.rio.write_crs(ds.attrs['spatial_ref'], inplace=True)
+
             #ds_complex.attrs = ds_complex.data.attrs
             #ds_complex.data.attrs = {}
-            dss.append(ds.assign_attrs({'id': burst}))
+            #dss.append(ds.assign_attrs({'id': burst}))
+            dss[burst] = ds
 
-        assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
+        #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
         self.dss = dss
 
         # make attributes dataframe from datas
         processed_attrs = []
-        for ds in dss:
+        for ds in dss.values():
             #print (data.id)
             attrs = [data_var for data_var in ds if ds[data_var].dims==('date',)][::-1]
             attr_start_idx = attrs.index(attr_start)
@@ -225,7 +253,8 @@ class Stack(Stack_plot):
                 #print (processed_attr)
         df = gpd.GeoDataFrame(processed_attrs)
         del df['date']
-        df['polarization'] = ','.join(polarizations)
+        #df['polarization'] = ','.join(polarizations)
+        df = df.assign(polarization=[tuple(map(str, polarizations))] * len(df))
         burst_col = df.columns[0]
         #print ('df.columns[0]', df.columns[0])
         #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
@@ -305,3 +334,157 @@ class Stack(Stack_plot):
         ax.set_title('Sentinel-1 Burst Footprints')
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
+
+    def to_dataset(self,
+              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
+              polarizations: list[str] = None,
+              compute: bool = False):
+        """
+        This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
+        xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
+        #xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
+        """
+        import xarray as xr
+        import numpy as np
+        import dask
+
+        #print ('datas', datas, 'polarizations', polarizations)
+        #print ()
+        if datas is None:
+            datas = self.dss
+        elif isinstance(datas, xr.Dataset):
+            return datas
+        elif isinstance(datas, xr.DataArray):
+            return datas.to_dataset()
+        elif not isinstance(datas, (dict, list, tuple)):
+            raise ValueError(f'ERROR: datas is not a dict, list, or tuple: {type(datas)}')
+
+        # all the grids will be unified to a single grid, we don't need the dict keys
+        if isinstance(datas, dict):
+            datas = list(datas.values())
+        
+        if len(datas) == 0:
+            return None
+
+        if len(datas) == 1:
+            datas = datas[0]
+            if compute:
+                progressbar(result := datas.persist(), desc=f'Compute Dataset'.ljust(25))
+                return result
+            return datas
+
+        # find all variables in the first dataset related to polarizations
+        data_vars = datas[0].data_vars if isinstance(datas[0], xr.Dataset) else datas[0].name
+        data_vars = [pol for pol in ['VV','VH','HH','HV'] if pol in data_vars]
+        # select processing polarizations
+        if polarizations is None:
+            polarizations = data_vars
+        elif isinstance(polarizations, str):
+            if polarizations not in data_vars:
+                raise ValueError(f'ERROR: polarizations is not a valid: {polarizations}')
+            polarizations = [polarizations]
+        elif not isinstance(polarizations, (list, tuple)):
+            raise ValueError(f'ERROR: polarizations is not a single string or list or tuple: {type(polarizations)}')
+        else:
+            if len([pol for pol in polarizations if pol not in data_vars]) > 0:
+                raise ValueError(f'ERROR: polarizations are not valid: {polarizations}')
+
+        # process list of datasets with one or multiple polarizations
+        if isinstance(datas[0], xr.Dataset):
+            das_total = []
+            for pol in polarizations:
+                das = self.to_dataset([ds[pol] for ds in datas])
+                das_total.append(das)
+                del das
+            das_total = xr.merge(das_total)
+            
+            if compute:
+                progressbar(result := das_total.persist(), desc=f'Compute Unified Dataset'.ljust(25))
+                del das_total
+                return result
+            return das_total
+
+        # process list of dataarrays with single polarization
+
+        # define unified grid
+        y_min = min(ds.y.min().item() for ds in datas)
+        y_max = max(ds.y.max().item() for ds in datas)
+        x_min = min(ds.x.min().item() for ds in datas)
+        x_max = max(ds.x.max().item() for ds in datas)
+        #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
+        stackvar = list(datas[0].dims)[0]
+        # workaround for dask.array.blockwise
+        stackval = datas[0][stackvar].astype(str)
+        stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
+        dy = datas[0].y.diff('y').item(0)
+        dx = datas[0].x.diff('x').item(0)
+        #print ('dy, dx', dy, dx)
+        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y'])
+        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x'])
+        #print ('stack', stackvar, stackval)
+        #print ('ys', ys)
+        #print ('xs', xs)
+        # extract extents of all datasets once
+        extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
+        
+        # use outer variable datas
+        def block_dask(stack, y_chunk, x_chunk):
+            #print ('pair', pair)
+            #print ('concat: block_dask', stackvar, stack)
+            # extract extent of the current chunk once
+            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
+            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
+            # select all datasets overlapping with the current chunk
+            das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute(num_workers=1)
+                         for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
+                         if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
+            #print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
+            
+            fill_dtype = datas[0].dtype
+            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+            if len(das_slice) == 0:
+                # return empty block
+                return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
+            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
+            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice]
+            del das_slice
+            if len(das_block) == 1:
+                # return single block as is
+                return das_block[0].values
+
+            das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+            # ffill does not work correct on complex data and per-component ffill is faster
+            # the magic trick is to use sorting to ensure burst overpapping order
+            # bursts ends should be overlapped by bursts starts
+            if np.issubdtype(das_block_concat.dtype, np.complexfloating):
+                return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
+                        + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
+            else:
+                return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
+            # if not wrap:
+            #     # calculate arithmetic mean for phase and correlation data
+            #     return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
+            # else:
+            #     # calculate circular mean for interferogram data
+            #     block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
+            #     return np.arctan2(block_complex.imag, block_complex.real)
+
+        # prevent warnings 'PerformanceWarning: Increasing number of chunks by factor of ...'
+        import warnings
+        from dask.array.core import PerformanceWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=PerformanceWarning)
+            # rechunk data for expected usage
+            data = dask.array.blockwise(
+                block_dask,
+                'zyx',
+                stackidx.chunk(1), 'z',
+                ys.chunk({'y': self.chunksize}), 'y',
+                xs.chunk({'x': self.chunksize}), 'x',
+                meta = np.empty((0, 0, 0), dtype=datas[0].dtype)
+            )
+        da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
+            .rename(datas[0].name)\
+            .assign_attrs(datas[0].attrs)
+        del data
+        return self.spatial_ref(da, datas)

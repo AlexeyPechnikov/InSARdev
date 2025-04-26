@@ -19,9 +19,10 @@ class S1_transform(S1_topo):
         from tqdm.auto import tqdm
         import dask
         from tqdm.auto import tqdm
+        import joblib
         import os
         import tempfile
-        from dask.distributed import get_client
+        #from dask.distributed import get_client
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -40,47 +41,51 @@ class S1_transform(S1_topo):
             epsg = epsgs[0]
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
-        def process_refrep(bursts, basedir, debug=False):
-            # polarization does not matter for geometry alignment, any polarization reference burst can be used
-            # burst format is like ('021_043788_IW1', 'VH', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
-            burst_refs = bursts[0]
-            burst_reps = bursts[1]
-            # prepare reference burst for all polarizations
-            for burst_ref in burst_refs:
-                self.align_ref(burst_ref[-1], basedir, debug=debug)
-            #print ('compute_transform')
-            self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, epsg=epsg)
-            # for topo phase calculation
-            #print ('compute_transform_inverse')
-            self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
+        def process_refrep(bursts, debug=False):
+            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as basedir:
+                #print('working in:', basedir)
+                # polarization does not matter for geometry alignment, any polarization reference burst can be used
+                # burst format is like ('021_043788_IW1', 'VH', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
+                burst_refs = bursts[0]
+                burst_reps = bursts[1]
+                # prepare reference burst for all polarizations
+                for burst_ref in burst_refs:
+                    self.align_ref(burst_ref[-1], basedir, debug=debug)
+                #print ('compute_transform')
+                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                # for topo phase calculation
+                #print ('compute_transform_inverse')
+                self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
 
-            # compute the transform data for the same polarization reference burst
-            # this allows to easily detect when topo phase is not applicable
-            # use sequential processing as it is well parallelized internally
-            #print ('transform_slc')
-            for burst_rep in burst_reps + burst_refs:
-                burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
-                #print (burst_rep[-1], '->', burst_ref[-1])
-                # align repeat bursts to the reference burst
-                if burst_rep not in burst_refs:
-                    #print ('align_rep', burst_rep[-1], burst_ref[-1])
-                    self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=degrees, debug=debug)
-                self.transform_slc(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                # compute the transform data for the same polarization reference burst
+                # this allows to easily detect when topo phase is not applicable
+                # use sequential processing as it is well parallelized internally
+                #print ('transform_slc')
+                for burst_rep in burst_reps + burst_refs:
+                    burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
+                    #print (burst_rep[-1], '->', burst_ref[-1])
+                    # align repeat bursts to the reference burst
+                    if burst_rep not in burst_refs:
+                        #print ('align_rep', burst_rep[-1], burst_ref[-1])
+                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=degrees, debug=debug)
+                    self.transform_slc(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
 
         # Dask cluster client
-        client = get_client()
+        # client = get_client()
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
-        for refrep in tqdm(refreps, desc="Transforming SLC"):
-            with tempfile.TemporaryDirectory(prefix=refrep[0][0][0]) as basedir:
-                #print("working in:", basedir)
-                process_refrep(refrep, basedir, debug=debug)
-                # cleanup - release all workers memory, call garbage collector before to prevent heartbeat errors
-                import gc; gc.collect()
-                if timeout is not None:
-                    client.restart(wait_for_workers=False)
-                    client.wait_for_workers(1, timeout=timeout)
+            
+        for refrep in tqdm(refreps, desc='Transforming SLC'):
+            #process_refrep(refrep, debug=debug)
+            joblib.Parallel(n_jobs=1, backend='threading')(
+                [joblib.delayed(process_refrep)(refrep, debug=debug)]
+            )
+            # cleanup - release all workers memory, call garbage collector before to prevent heartbeat errors
+            # import gc; gc.collect()
+            # if timeout is not None:
+            #     client.restart(wait_for_workers=False)
+            #     client.wait_for_workers(1, timeout=timeout)
 
     def transform_slc(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
         """
@@ -110,19 +115,27 @@ class S1_transform(S1_topo):
         prm_rep = self.PRM(burst_rep, basedir=basedir)
         prm_ref = self.PRM(burst_ref, basedir=basedir)
 
+        #print ('transform_slc', burst_rep, burst_ref, basedir, resolution, epsg, scale)
+
         # read SLC data
         slc = prm_rep.read_SLC_int()
-        # scale as complex values, zero in np.int16 type means NODATA
-        slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).where(slc.re != 0).rename('data')
+        # scale as complex values
+        slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).rename('data')
+        # mask empty borders
+        slc_complex = slc_complex\
+                .where((slc_complex!=0+0j).sum('a') > 0.8 * slc_complex.a.size)\
+                .where((slc_complex!=0+0j).sum('r') > 0.8 * slc_complex.r.size)
         # reproject as a single complex variable
         phase = self.topo_phase(burst_rep, burst_ref, basedir=basedir, resolution=resolution)
         complex_proj = self.geocode(burst_rep, slc_complex * np.exp(-1j * phase), basedir=basedir, resolution=resolution)
+        # unify the order of dimensions
+        complex_proj = complex_proj.transpose('y', 'x')
         del phase, slc_complex
         
         # do not apply scale to complex_proj to preserve projection attributes
         data_proj = xr.merge([
-                        (complex_proj.real / scale).round().astype(np.int16).rename('re'),
-                        (complex_proj.imag / scale).round().astype(np.int16).rename('im')
+                        (complex_proj.real / scale).round().astype(np.int16).where(np.isfinite(complex_proj.real), np.iinfo(np.int16).min).rename('re'),
+                        (complex_proj.imag / scale).round().astype(np.int16).where(np.isfinite(complex_proj.imag), np.iinfo(np.int16).min).rename('im')
                         ])
         del complex_proj
 
@@ -130,12 +143,13 @@ class S1_transform(S1_topo):
         for name, value in prm_rep.df.itertuples():
             if name not in ['input_file', 'SLC_file', 'led_file']:
                 data_proj.attrs[name] = value
+
         # add calculated attributes
         BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
         # prevent confusing -0.0
         data_proj.attrs['BPR'] = BPR + 0
         # workaround for the hard-coded attribute
-        data_proj.attrs['SLC_scale'] = scale
+        #data_proj.attrs['SLC_scale'] = scale
         
         # add record attributes
         for _, row in df.reset_index().iterrows():
@@ -149,19 +163,27 @@ class S1_transform(S1_topo):
 
         # add georeference attributes
         data_proj = self.spatial_ref(data_proj, epsg)
-        data_proj.attrs['spatial_ref'] = data_proj['spatial_ref'].item()
+        data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
+        # remove spatial_ref variable to limit zarray files count
         data_proj = data_proj.drop_vars('spatial_ref')
 
         # transfer attributes to the output variables
+        #print ('data_proj.attrs', data_proj.attrs)
         data_proj.im.attrs = data_proj.attrs
         data_proj.re.attrs = data_proj.attrs
 
-        encoding = {var: self.get_compression_zarr(data_proj[var].shape, dtype=data_proj[var].dtype) for var in data_proj.data_vars}
-        # tiny coord arrays: one chunk, no compressor, NaN fill value instead of default 0
-        encoding.update({
-            'x': dict(compressor=None, chunks=(data_proj.sizes['x'],), dtype="float64", fill_value=np.nan),
-            'y': dict(compressor=None, chunks=(data_proj.sizes['y'],), dtype="float64", fill_value=np.nan),
-        })
+        # add storage specific attributes
+        for varname in ['re', 'im']:
+            data_proj[varname].attrs['scale_factor'] = scale
+            data_proj[varname].attrs['add_offset'] = 0
+            data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).min
+
+        encoding = {var: self.get_encoding_zarr(data_proj[var].shape, dtype=data_proj[var].dtype) for var in data_proj.data_vars}
+        # coord arrays: one chunk, no compressor, NaN fill value instead of default 0
+        #encoding.update({
+        #    'x': dict(compressor=None, chunks=(data_proj.sizes['x'],), dtype="float64", fill_value=np.nan),
+        #    'y': dict(compressor=None, chunks=(data_proj.sizes['y'],), dtype="float64", fill_value=np.nan),
+        #})
         data_proj.to_zarr(
             store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
             encoding=encoding,

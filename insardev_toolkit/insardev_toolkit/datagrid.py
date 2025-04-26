@@ -38,59 +38,26 @@ class datagrid:
     # Minimum valid Sentinel-1 radar amplitude from GMTSAR code
     #amplitude_threshold = 5.e-21
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
-    chunksize = 2048
-    chunksize1d = 16384
-    netcdf_engine_read = 'h5netcdf'
-    netcdf_engine_write = 'netcdf4'
-    netcdf_format = 'NETCDF4'
-    netcdf_chunksize = 1024*2
-    netcdf_chunksize1d = 65536
-    netcdf_compression_algorithm = 'zlib'
-    netcdf_complevel = 3
-    netcdf_shuffle = True
-    #netcdf_queue = 16
+    chunksize: int = 2560
+    chunksize1d: int = 128*1024
 
-    zarr_chunksize = 2048
-    zarr_chunksize1d = 64*1024
+    netcdf_engine_read: str = 'h5netcdf'
+    netcdf_engine_write: str = 'netcdf4'
+    netcdf_format: str = 'NETCDF4'
+    netcdf_chunksize: int = 1280
+    netcdf_compression_algorithm: str = 'zlib'
+    netcdf_complevel: int = 3
+    netcdf_shuffle: bool = True
+
     # ['lz4', 'lz4hc', 'blosclz', 'zstd', 'zlib']
-    zarr_compression_algorithm = 'zstd'
-    zarr_clevel = 6
-    zarr_shuffle_floating = 'bitshuffle'
-    zarr_shuffle_integer = 'noshuffle'
-    zarr_blocksize = 0
-
-    # processing directory
-    basedir = '.'
+    zarr_compression_algorithm: str = 'zstd'
+    zarr_clevel: int = 6
+    zarr_shuffle_floating: str = 'bitshuffle'
+    zarr_shuffle_integer: str = 'noshuffle'
+    zarr_blocksize: int = 0
 
     # define lost class variables due to joblib via arguments
-    def get_compression_zarr(self, shape=None, dtype=None, chunksize=None, shuffle=None, fill_value=None):
-        """
-        Return the compression options for a data grid.
-
-        Parameters
-        ----------
-        shape : tuple, list, np.ndarray, optional
-            The shape of the data grid. Required if chunksize is less than grid dimension sizes. Default is None.
-        chunksize : int or tuple, optional
-            The chunk size for data compression. If not specified, the class attribute chunksize is used.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the compression options for the data grid.
-
-        Examples
-        --------
-        Get the compression options for a data grid with shape (1000, 1000):
-
-        >>> get_compression_zarr(shape=(1000, 1000))
-        {'zstd': True, 'complevel': 6, 'chunksizes': (2048, 2048)}
-
-        Get the compression options for a data grid with chunksize 256:
-
-        >>> get_compression_zarr(chunksize=256)
-        {'zstd': True, 'complevel': 6, 'chunksizes': (2048, 2048)}
-        """
+    def get_encoding_zarr(self, shape=None, dtype=None, shuffle=None, fill_value=None):
         import numpy as np
         from zarr.codecs import BloscCodec
 
@@ -119,40 +86,13 @@ class datagrid:
             blocksize=self.zarr_blocksize
         )
 
-        if chunksize is None and len(shape) == 1:
-            # (stacked) single-dimensional grid 
-            chunksize = self.zarr_chunksize1d
-        elif chunksize is None:
-            # common 2+D grid
-            chunksize = self.zarr_chunksize
-
-        assert chunksize is not None, 'compression() chunksize is None'
-        if isinstance(chunksize, (tuple, list, np.ndarray)):
-            # use as is, it can be 2D or 3D grid (even 1D while it is not used for now)
-            if shape is not None:
-                assert len(shape) == len(chunksize), f'ERROR: defined shape and chunksize dimensions are not equal: {len(shape)} != {len(chunksize)}'
-                chunksizes = tuple([chunksize[dim] if chunksize[dim]<shape[dim] else shape[dim] for dim in range(len(shape))])
-            else:
-                chunksizes = chunksize
-        else:
-            if shape is not None:
-                # 2D or 3D grid
-                chunksizes = []
-                for idim in range(len(shape)):
-                    chunksizes.append(chunksize if chunksize<shape[idim] else shape[idim])
-                # set first dimension chunksize to 1 for 3D array
-                if len(chunksizes) == 3:
-                    chunksizes[0] = 1
-                chunksizes = tuple(chunksizes)
-            else:
-                chunksizes=(chunksize, chunksize)
-        opts = dict(chunks=chunksizes, fill_value=fill_value)
+        opts = dict(fill_value=fill_value)
         if self.zarr_compression_algorithm is not None and self.zarr_clevel >= 0:
             opts['compressors'] = (compressor,)
         return opts
 
     # define lost class variables due to joblib via arguments
-    def get_compression_netcdf(self, shape=None, chunksize=None):
+    def get_encoding_netcdf(self, shape=None, chunksize=None):
         """
         Return the compression options for a data grid.
 
@@ -172,12 +112,12 @@ class datagrid:
         --------
         Get the compression options for a data grid with shape (1000, 1000):
 
-        >>> compression(shape=(1000, 1000))
+        >>> get_encoding_netcdf(shape=(1000, 1000))
         {'zlib': True, 'complevel': 3, 'chunksizes': (512, 512)}
 
         Get the compression options for a data grid with chunksize 256:
 
-        >>> compression(chunksize=256)
+        >>> get_encoding_netcdf(chunksize=256)
         {'zlib': True, 'complevel': 3, 'chunksizes': (256, 256)}
         """
         import numpy as np

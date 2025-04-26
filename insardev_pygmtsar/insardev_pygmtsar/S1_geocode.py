@@ -93,7 +93,6 @@ class S1_geocode(S1_align):
             dtype=data.dtype
         )
 
-        #da = self.spatial_ref(xr.DataArray(out, transform.coords).rename(data.name), transform)
         da = xr.DataArray(out, transform.ele.coords).rename(data.name)
         transform.close()
         del out, transform
@@ -390,10 +389,10 @@ class S1_geocode(S1_align):
             trans[varname].attrs['_FillValue'] = np.iinfo(np.int32).min
         # add add georeference attributes
         trans = self.spatial_ref(trans, epsg)
-        trans.attrs['spatial_ref'] = trans['spatial_ref'].item()
+        trans.attrs['spatial_ref'] = trans.spatial_ref.attrs['spatial_ref']
         trans = trans.drop_vars('spatial_ref')
 
-        encoding = {var: self.get_compression_zarr(trans[var].shape, dtype=trans[var].dtype) for var in trans.data_vars}
+        encoding = {var: self.get_encoding_zarr(trans[var].shape, dtype=trans[var].dtype) for var in trans.data_vars}
         #print ('encoding', encoding)
         trans.to_zarr(
             store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_ref), 'transform'),

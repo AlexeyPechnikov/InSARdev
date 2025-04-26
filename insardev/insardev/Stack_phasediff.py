@@ -12,15 +12,32 @@ from .Stack_base import Stack_base
 from insardev_toolkit import progressbar
 
 class Stack_phasediff(Stack_base):
-
+    import xarray as xr
+    import numpy as np
+    import pandas as pd
 
     # internal method to compute interferogram on single polarization data array(s)
-    def _interferogram(self, pairs, datas, weight=None, phase=None,
-                              resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=None,
-                              stack=None, compute=False, debug=False):
+    def _interferogram(self,
+                       pairs:list[tuple[str,str]]|np.ndarray|pd.DataFrame,
+                       datas:dict[str,xr.DataArray],
+                       polarization: str,
+                       weight:xr.DataArray|None=None,
+                       phase:xr.DataArray|None=None,
+                       resolution:float|None=None,
+                       wavelength:float|None=None,
+                       gaussian_threshold:float=0.5,
+                       psize:int|list[int,int]|None=None,
+                       coarsen:list[int,int]|None=None,
+                       stack:xr.DataArray|None=None,
+                       compute:bool=False,
+                       debug:bool=False
+                       ):
         import xarray as xr
         import numpy as np
         import dask
+        import warnings
+        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         assert isinstance(datas, (list, tuple, xr.DataArray)), 'ERROR: datas should be a list or tuple or DataArray'
 
@@ -44,6 +61,11 @@ class Stack_phasediff(Stack_base):
         intfs = []
         corrs = []
         for data in (datas if isinstance(datas, (list, tuple)) else [datas]):
+            #data_vars = data.drop(['VV','VH','HH','HV'], errors='ignore').data_vars
+            #data_attrs = data.attrs
+            #print (data_vars)
+            data = data[polarization]
+
             if weight is not None:
                 data = data.reindex_like(weight, fill_value=np.nan)
             intensity = np.square(np.abs(data))
@@ -81,20 +103,17 @@ class Stack_phasediff(Stack_base):
             del phasediff_look
     
             # compute together because correlation depends on phase, and filtered phase depends on correlation.
-            #progressbar(result := dask.persist(decimator(corr15m), decimator(intf15m)), desc='Compute Phase and Correlation')
-            # unpack results for a single interferogram
-            #corr90m, intf90m = [grid[0] for grid in result]
             # anti-aliasing filter for the output resolution is applied above
             if decimator_intf is not None and decimator_corr is not None:
-                #ds = xr.merge([intf_dec, corr_dec])
                 das = (decimator_intf(intf_look),  decimator_corr(corr_look))
             else:
-                #ds = xr.merge([intf_look, corr_look])
                 das = (intf_look,  corr_look)
             del corr_look, intf_look
 
+            # append original data attributes to the result
+            das = [da.assign_attrs(data.attrs) for da in das]
+
             if isinstance(stack, xr.DataArray):
-                #ds = ds.interp(y=stack.y, x=stack.x, method='nearest')
                 intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest'))
                 corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest'))
             else:
@@ -110,24 +129,37 @@ class Stack_phasediff(Stack_base):
             corrs = corrs[0]
 
         if compute:
-            progressbar(result := dask.persist(intfs, corrs), desc=f'Compute {data.name} Interferogram'.ljust(25))
+            progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
             del intfs, corrs
             return result
         return (intfs, corrs)
 
-    def interferogram(self, pairs, datas, weight=None, phase=None,
-                              resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=None,
-                              stack=None, polarizations=None, compute=False, debug=False):
+    def interferogram(self,
+                      pairs:list[tuple[str,str]]|np.ndarray|pd.DataFrame,
+                      datas:dict[str,xr.DataArray]|xr.Dataset|xr.DataArray,
+                      weight:xr.DataArray|None=None,
+                      phase:xr.DataArray|None=None,
+                      resolution:float|None=None,
+                      wavelength:float|None=None,
+                      gaussian_threshold:float=0.5,
+                      psize:int|list[int,int]|None=None,
+                      coarsen:list[int,int]|None=None,
+                      stack:xr.DataArray|None=None,
+                      compute:bool=False,
+                      debug:bool=False
+                      ):
         import xarray as xr
         import numpy as np
         import dask
 
-        assert isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: datas should be a list or tuple or Dataset or DataArray'
+        assert isinstance(datas, (dict, xr.Dataset, xr.DataArray)), 'ERROR: datas should be a dict, Dataset or DataArray'
 
         # if datas is None:
         #     datas = self.dss
 
-        datas_iterable = isinstance(datas, (list, tuple))
+        datas_iterable = isinstance(datas, dict)
+        # workaround for previous code
+        datas = list(datas.values()) if datas_iterable else datas
         #print ('datas_iterable', datas_iterable)
         datas_dataset = isinstance(datas[0], xr.Dataset) if datas_iterable else isinstance(datas, xr.Dataset)
         #print ('datas_dataset', datas_dataset)
@@ -144,21 +176,28 @@ class Stack_phasediff(Stack_base):
                 datas = [ds.to_dataset() for ds in datas]
         
         # copy id from the data to the result
-        ids = [ds.attrs.get('id', None) for ds in datas]
+        #ids = [ds.attrs.get('id', None) for ds in datas]
 
-        if polarizations is None:
-            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
-        elif isinstance(polarizations, str):
-            polarizations = [polarizations]
+        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
         #print ('polarizations', polarizations)
         
         intfs_pols = []
         corrs_pols = []
         for pol in polarizations:
-            intfs, corrs = self._interferogram(pairs, datas=[ds[pol] for ds in datas], weight=weight, phase=phase,
-                                        resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold,
-                                        psize=psize, coarsen=coarsen,
-                                        stack=stack, compute=compute, debug=debug)
+            intfs, corrs = self._interferogram(pairs,
+                                               datas=datas,
+                                               polarization=pol,
+                                               weight=weight,
+                                               phase=phase,
+                                               resolution=resolution,
+                                               wavelength=wavelength,
+                                               gaussian_threshold=gaussian_threshold,
+                                               psize=psize,
+                                               coarsen=coarsen,
+                                               stack=stack,
+                                               compute=compute,
+                                               debug=debug
+                                               )
             intfs_pols.append(intfs)
             corrs_pols.append(corrs)
             del intfs, corrs
@@ -169,27 +208,65 @@ class Stack_phasediff(Stack_base):
         #     return (intfs_pols[0], corrs_pols[0]) 
         #     #return (intfs_pols[0], corrs_pols[0]) if datas_dataset else (intfs_pols[0][polarizations[0]], corrs_pols[0][polarizations[0]])
 
-        intfs_pols = [xr.merge([das[idx].assign_attrs(id=ids[idx]) for das in intfs_pols]) for idx in range(len(intfs_pols[0]))]
-        corrs_pols = [xr.merge([das[idx].assign_attrs(id=ids[idx]) for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
-        return (intfs_pols, corrs_pols) if datas_dataset else ([intf[polarizations[0]] for intf in intfs_pols], [corrs[polarizations[0]] for corrs in corrs_pols])
+        intfs_pols = [xr.merge([das[idx] for das in intfs_pols]) for idx in range(len(intfs_pols[0]))]
+        corrs_pols = [xr.merge([das[idx] for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
+        dss = (intfs_pols, corrs_pols) if datas_dataset else ([intf[polarizations[0]] for intf in intfs_pols], [corrs[polarizations[0]] for corrs in corrs_pols])
+        # workaround for previous code, use attributes from the original data for keys to build a dict
+        print ('X')
+        return self.to_dict(dss[0]), self.to_dict(dss[1]) if datas_iterable else dss
+        #return dss
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
-    def interferogram_singlelook(self, pairs, datas=None, weight=None, phase=None,
-                                         wavelength=None, gaussian_threshold=0.5, psize=None,
-                                         stack=None, polarizations=None, compute=False, debug=False):
-        return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                   wavelength=wavelength, gaussian_threshold=gaussian_threshold, psize=psize,
-                                   stack=stack, polarizations=polarizations, compute=compute, debug=debug)
+    def interferogram_singlelook(self,
+                                pairs,
+                                datas=None,
+                                weight=None,
+                                phase=None,
+                                wavelength=None,
+                                gaussian_threshold=0.5,
+                                psize=None,
+                                stack=None,
+                                compute=False,
+                                debug=False):
+        return self.interferogram(pairs,
+                                datas=datas,
+                                weight=weight,
+                                phase=phase,
+                                wavelength=wavelength,
+                                gaussian_threshold=gaussian_threshold,
+                                psize=psize,
+                                stack=stack,
+                                compute=compute,
+                                debug=debug)
 
     # Goldstein filter requires square grid cells means 1:4 range multilooking.
     # For multilooking interferogram we can use square grid always using coarsen = (1,4)
-    def interferogram_multilook(self, pairs, datas=None, weight=None, phase=None,
-                                        resolution=None, wavelength=None, gaussian_threshold=0.5, psize=None, coarsen=(1,4),
-                                        stack=None, polarizations=None, compute=False, debug=False):
-        return self.interferogram(pairs, datas=datas, weight=weight, phase=phase,
-                                   resolution=resolution, wavelength=wavelength, gaussian_threshold=gaussian_threshold, psize=psize, coarsen=coarsen,
-                                   stack=stack, polarizations=polarizations, compute=compute, debug=debug)
+    def interferogram_multilook(self,
+                              pairs,
+                              datas=None,
+                              weight=None,
+                              phase=None,
+                              resolution=None,
+                              wavelength=None,
+                              gaussian_threshold=0.5,
+                              psize=None,
+                              coarsen=(1,4),
+                              stack=None,
+                              compute=False,
+                              debug=False):
+        return self.interferogram(pairs,
+                                datas=datas,
+                                weight=weight,
+                                phase=phase,
+                                resolution=resolution,
+                                wavelength=wavelength,
+                                gaussian_threshold=gaussian_threshold,
+                                psize=psize,
+                                coarsen=coarsen,
+                                stack=stack,
+                                compute=compute,
+                                debug=debug)
 
     @staticmethod
     def phase2interferogram(phase, debug=False):
@@ -231,6 +308,9 @@ class Stack_phasediff(Stack_base):
         import dask
         import xarray as xr
         import numpy as np
+        import warnings
+        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         if debug:
             print ('DEBUG: correlation')
@@ -264,6 +344,9 @@ class Stack_phasediff(Stack_base):
         import xarray as xr
         import numpy as np
         import pandas as pd
+        import warnings
+        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         if debug:
             print ('DEBUG: phasediff')
@@ -411,137 +494,3 @@ class Stack_phasediff(Stack_base):
         del stack
         # replace zeros produces in NODATA areas
         return ds.where(np.isfinite(phase)).rename(phase.name)
-
-    def union(self, datas=None, polarizations=None, compute=False):
-        """
-        This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
-        xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
-        #xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
-        """
-        import xarray as xr
-        import numpy as np
-        import dask
-
-        #print ('datas', datas, 'polarizations', polarizations)
-        #print ()
-        # if datas is None:
-        #     datas = self.dss
-
-        # not iterable data cannot be concatenated
-        if isinstance(datas, (xr.Dataset, xr.DataArray)):
-            if compute:
-                progressbar(result := datas.persist(), desc=f'Compute Data'.ljust(25))
-                return result
-            return datas
-        elif isinstance(datas, (list, tuple)):
-            # empty list or single dataarray do not need to be concatenated
-            if len(datas) == 0:
-                return None
-            if len(datas) == 1:
-                if compute:
-                    progressbar(result := datas[0].persist(), desc=f'Compute Data'.ljust(25))
-                    return result
-                return datas[0]
-        else:
-            raise ValueError(f'ERROR: datas is not a list, tuple, Dataset or DataArray: {type(datas)}')
-
-        # process list of datasets with multiple polarizations
-        if isinstance(datas[0], xr.Dataset):
-            if polarizations is None:
-                polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
-            elif isinstance(polarizations, str):
-                polarizations = [polarizations]
-            #print ('polarizations', polarizations)
-            
-            das_total = []
-            for pol in polarizations:
-                das = self.union([ds[pol] for ds in datas])
-                das_total.append(das)
-                del das
-            das_total = xr.merge(das_total)
-            
-            if compute:
-                progressbar(result := das_total.persist(), desc=f'Compute Concatenated Data'.ljust(25))
-                del das_total
-                return result
-            return das_total
-
-        # process single polarization (variable)
-
-        # define unified grid
-        y_min = min(ds.y.min().item() for ds in datas)
-        y_max = max(ds.y.max().item() for ds in datas)
-        x_min = min(ds.x.min().item() for ds in datas)
-        x_max = max(ds.x.max().item() for ds in datas)
-        #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
-        stackvar = list(datas[0].dims)[0]
-        # workaround for dask.array.blockwise
-        stackval = datas[0][stackvar].astype(str)
-        stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
-        dy = datas[0].y.diff('y').item(0)
-        dx = datas[0].x.diff('x').item(0)
-        #print ('dy, dx', dy, dx)
-        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y'])
-        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x'])
-        #print ('stack', stackvar, stackval)
-        #print ('ys', ys)
-        #print ('xs', xs)
-        # extract extents of all datasets once
-        extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
-        
-        # use outer variable datas
-        def block_dask(stack, y_chunk, x_chunk):
-            #print ('pair', pair)
-            #print ('concat: block_dask', stackvar, stack)
-            # extract extent of the current chunk once
-            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
-            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
-            # select all datasets overlapping with the current chunk
-            das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute(num_workers=1)
-                         for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
-                         if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
-            #print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
-            
-            fill_dtype = datas[0].dtype
-            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
-            if len(das_slice) == 0:
-                # return empty block
-                return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
-            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
-            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice]
-            del das_slice
-            if len(das_block) == 1:
-                # return single block as is
-                return das_block[0].values
-
-            das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
-            # ffill does not work correct on complex data and per-component ffill is faster
-            # the magic trick is to use sorting to ensure burst overpapping order
-            # bursts ends should be overlapped by bursts starts
-            if np.issubdtype(das_block_concat.dtype, np.complexfloating):
-                return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
-                        + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
-            else:
-                return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
-            # if not wrap:
-            #     # calculate arithmetic mean for phase and correlation data
-            #     return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
-            # else:
-            #     # calculate circular mean for interferogram data
-            #     block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
-            #     return np.arctan2(block_complex.imag, block_complex.real)
-
-        # rechunk data for expected usage
-        data = dask.array.blockwise(
-            block_dask,
-            'zyx',
-            stackidx.chunk(1), 'z',
-            ys.chunk({'y': self.chunksize}), 'y',
-            xs.chunk({'x': self.chunksize}), 'x',
-            meta = np.empty((0, 0, 0), dtype=datas[0].dtype)
-        )
-        da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
-            .rename(datas[0].name)\
-            .assign_attrs(datas[0].attrs)
-        del data
-        return self.spatial_ref(da, datas)

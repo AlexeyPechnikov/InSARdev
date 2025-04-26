@@ -216,6 +216,6 @@ class XYZTiles(datagrid, progressbar_joblib):
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
-            encoding = {'colors': self.get_compression_netcdf(da.shape)}
+            encoding = {'colors': self.get_encoding_netcdf(da.shape)}
             da.to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da

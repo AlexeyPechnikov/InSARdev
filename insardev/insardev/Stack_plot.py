@@ -108,12 +108,15 @@ class Stack_plot(Stack_export):
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
+        import warnings
+        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         # no data means no plot and no error
         if data is None:
             return
 
-        assert isinstance(data, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a list or tuple or Dataset or DataArray'
+        assert isinstance(data, (dict, list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a dict or list or tuple or Dataset or DataArray'
 
         # screen size in pixels (width, height) to estimate reasonable number pixels per plot
         # this is quite large to prevent aliasing on 600dpi plots without additional processing
@@ -122,13 +125,16 @@ class Stack_plot(Stack_export):
 
         def plot_polarization(data, polarization):
 
+            if isinstance(data, dict):
+                data = list(data.values())
+
             if isinstance(data, xr.Dataset):
                 stackvar = list(data.dims)[0]
                 da = data[polarization].isel({stackvar: slice(0, rows)})
             else:
                 stackvar = list(data[0].dims)[0]
                 das = [da[polarization].isel({stackvar: slice(0, rows)}) for da in data]
-                da = self.union(das)
+                da = self.to_dataset(das)
                 del das
 
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
@@ -142,8 +148,7 @@ class Stack_plot(Stack_export):
             factor_x = int(np.round(size_x / (_size[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
             # coarsen and materialize data for all the calculations and plotting
-            da = da[:,::max(1, factor_y), ::max(1, factor_x)].compute()
-            #da = da.coarsen(y=max(1, factor_y), x=max(1, factor_x), boundary='trim').mean().compute()
+            progressbar(da := da[:,::max(1, factor_y), ::max(1, factor_x)].persist(), desc=f'Computing {polarization}'.ljust(25))
 
             # calculate min, max when needed
             if quantile is not None:
@@ -172,15 +177,18 @@ class Stack_plot(Stack_export):
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if not isinstance(data, (xr.Dataset, xr.DataArray, (list, tuple))):
+        if not isinstance(data, (xr.Dataset, xr.DataArray, (dict, list, tuple))):
             raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray or list of xr.Dataset or xr.DataArray')
 
-        # convert DataArray to Dataset to plot a single polarization
         if isinstance(data, xr.DataArray):
+            # convert DataArray to Dataset to plot a single polarization
             data = data.to_dataset()
-        # convert list of DataArray to list of Dataset to plot a single polarization
-        if isinstance(data, (list, tuple)) and not isinstance(data[0], xr.Dataset):
+        elif isinstance(data, (list, tuple)) and not isinstance(data[0], xr.Dataset):
+            # convert list of DataArray to list of Dataset to plot a single polarization
             data = [da.to_dataset() for da in data]
+        elif isinstance(data, dict):
+            # convert dict of DataArray to dict of Dataset to plot a single polarization
+            data = {k: v.to_dataset() if not isinstance(v, xr.Dataset) else v for k, v in data.items()}
 
         if polarizations is None:
             polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)

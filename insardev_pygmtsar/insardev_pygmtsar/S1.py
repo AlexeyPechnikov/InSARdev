@@ -14,14 +14,11 @@ class S1(S1_transform):
     import pandas as pd
     import xarray as xr
 
-    # redefine to save disk space
-    netcdf_complevel = 1
-
     # class variables
-    datadir = None
-    workdir = None
-    DEM = None
-    df = None
+    datadir: str|None = None
+    workdir: str|None = None
+    DEM: str|xr.DataArray|xr.Dataset|None = None
+    df: pd.DataFrame|None = None
 
     def plot(self, records: pd.DataFrame=None, ref: str=None,
              alpha: float=0.7, caption: str='Estimated Bursts Locations', cmap: str='turbo', aspect: float=None, _size: tuple[int, int]=None):
