@@ -36,8 +36,19 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
         import warnings
-        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
+        # …and just in case you want to match by message too:
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
 
         assert isinstance(datas, (list, tuple, xr.DataArray)), 'ERROR: datas should be a list or tuple or DataArray'
 
@@ -308,8 +319,19 @@ class Stack_phasediff(Stack_base):
         import xarray as xr
         import numpy as np
         import warnings
-        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
+        # …and just in case you want to match by message too:
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
 
         if debug:
             print ('DEBUG: correlation')
@@ -344,8 +366,19 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import pandas as pd
         import warnings
-        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
+        # …and just in case you want to match by message too:
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
 
         if debug:
             print ('DEBUG: phasediff')
@@ -383,10 +416,19 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
         import warnings
-        # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings('ignore')
-        warnings.filterwarnings('ignore', module='dask')
-        warnings.filterwarnings('ignore', module='dask.core')
+        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
+        # …and just in case you want to match by message too:
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module=r"dask\._task_spec"
+        )
 
         if debug:
             print ('DEBUG: goldstein')

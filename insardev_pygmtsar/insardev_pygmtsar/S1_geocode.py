@@ -150,7 +150,12 @@ class S1_geocode(S1_align):
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
 
-    def compute_transform(self, burst_ref: str, basedir: str, resolution: tuple[int, int]=(10, 2.5), scale_factor: float=2.0, epsg: int=None):
+    def compute_transform(self,
+                          burst_ref: str,
+                          basedir: str,
+                          resolution: tuple[int, int]=(10, 2.5),
+                          scale_factor: float=2.0,
+                          epsg: int=None):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
         a NetCDF file for future use.
@@ -294,9 +299,8 @@ class S1_geocode(S1_align):
                 rae = rae_coarsen.transpose(2,0,1)
             del rae_coarsen
 
-            #return rae.astype(np.float32)
-            # fill invalid values with integer min
-            return np.where(np.isfinite(rae), (scale_factor*rae).round(), np.iinfo(np.int32).min).astype(np.int32)
+            return rae
+            #return np.where(np.isfinite(rae), (scale_factor*rae).round(), np.iinfo(np.int32).max).astype(np.int32)
 
         def trans_blocks(ys, xs, chunksize):
             #print ('ys', ys, 'xs', xs, 'sizes', ys.size, xs.size)
@@ -313,8 +317,7 @@ class S1_geocode(S1_align):
                     block = dask.array.from_delayed(
                         dask.delayed(trans_block)(ys_block, xs_block, coarsen, epsg, scale_factor, **borders),
                         shape=(6, ys_block.size, xs_block.size),
-                        #dtype=np.float32
-                        dtype=np.int32
+                        dtype=np.float32
                     )
                     blocks.append(block)
                     del block
@@ -379,11 +382,14 @@ class S1_geocode(S1_align):
 
         # compute for the radar extent
         trans = trans_blocks(ys, xs, self.chunksize)
-        # round variables for better compression
+
+        # scale to integers for better compression
         for varname in ['azi', 'rng', 'ele']:
+            trans[varname] = xr.where(np.isfinite(trans[varname]), (scale_factor*trans[varname]).round(), np.iinfo(np.int32).max).astype(np.int32)
             trans[varname].attrs['scale_factor'] = 1/scale_factor
             trans[varname].attrs['add_offset'] = 0
-            trans[varname].attrs['_FillValue'] = np.iinfo(np.int32).min
+            trans[varname].attrs['_FillValue'] = np.iinfo(np.int32).max
+
         # add add georeference attributes
         trans = self.spatial_ref(trans, epsg)
         trans.attrs['spatial_ref'] = trans.spatial_ref.attrs['spatial_ref']

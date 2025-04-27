@@ -64,13 +64,7 @@ class datagrid:
             if np.issubdtype(dtype, np.floating):
                 fill_value = np.nan if fill_value is None else fill_value
             else:
-                #fill_value = 0 if fill_value is None else fill_value
-                if fill_value is None:
-                    # unsigned ints get 0, signed ints get the min representable
-                    if np.issubdtype(dtype, np.unsignedinteger):
-                        fill_value = 0
-                    else:
-                        fill_value = np.iinfo(dtype).min
+                fill_value = np.iinfo(dtype).max if fill_value is None else fill_value
         if shuffle is None:
             shuffle = self.zarr_shuffle
         if fill_value is None:

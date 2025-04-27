@@ -34,8 +34,11 @@ class Stack(Stack_plot):
         return next(iter(self.dss.values())).rio.crs.to_epsg()
 
     def to_dataframe(self,
-                     datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None,
-                     crs:str|None='auto') -> pd.DataFrame:
+                     datas: dict[str, xr.Dataset | xr.DataArray] | None = None,
+                     crs:str|None='auto',
+                     attr_start:str='BPR',
+                     debug:bool=False
+                     ) -> pd.DataFrame:
         """
         Return a Pandas DataFrame for all Stack scenes.
 
@@ -48,15 +51,62 @@ class Stack(Stack_plot):
         --------
         df = stack.to_dataframe()
         """
+        import geopandas as gpd
+        from shapely import wkt
+        import pandas as pd
+        import numpy as np
 
+        if datas is not None and not isinstance(datas, dict):
+            raise ValueError(f'ERROR: datas is not None or a dict: {type(datas)}')
+    
         if crs is not None and isinstance(crs, str) and crs == 'auto':
             crs = self.crs()
 
-        df = self.df
-        if crs is None:
-            return df
-        else:
-            return df.set_crs(4326).to_crs(crs)
+        if datas is None:
+            datas = self.dss
+
+        polarizations = [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in next(iter(datas.values())).data_vars]
+        #print ('polarizations', polarizations)
+
+        # make attributes dataframe from datas
+        processed_attrs = []
+        for ds in datas.values():
+            #print (data.id)
+            attrs = [data_var for data_var in ds if ds[data_var].dims==('date',)][::-1]
+            attr_start_idx = attrs.index(attr_start)
+            for date_idx, date in enumerate(ds.date.values):
+                processed_attr = {}
+                for attr in attrs[:attr_start_idx+1]:
+                    value = ds[attr].item(date_idx)
+                    #print (attr, date_idx, date, value)
+                    #processed_attr['date'] = date
+                    if hasattr(value, 'item'):
+                        processed_attr[attr] = value.item()
+                    elif attr == 'geometry':
+                        processed_attr[attr] = wkt.loads(value)
+                    else:
+                        processed_attr[attr] = value
+                processed_attrs.append(processed_attr)
+                #print (processed_attr)
+        df = gpd.GeoDataFrame(processed_attrs, crs=4326)
+        #del df['date']
+        #df['polarization'] = ','.join(polarizations)
+        # convert polarizations to strings like "VV,VH" to pevent confusing with tuples in the dataframe
+        df = df.assign(polarization=','.join(map(str, polarizations)))
+        # round for human readability
+        df['BPR'] = df['BPR'].round(1)
+
+        group_col = df.columns[0]
+        burst_col = df.columns[1]
+        #print ('df.columns[0]', df.columns[0])
+        #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
+        df['startTime'] = pd.to_datetime(df['startTime'])
+        #df['date'] = df['startTime'].dt.date.astype(str)
+        df = df.sort_values(by=[group_col, 'polarization', burst_col]).set_index([group_col, 'polarization', burst_col])
+        # move geometry to the end of the dataframe to be the most similar to insar_pygmtsar output
+        df = df.loc[:, df.columns.drop("geometry").tolist() + ["geometry"]]
+        
+        return df.to_crs(crs) if crs is not None else df
 
     def to_dict(self,
                 datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None):
@@ -76,7 +126,8 @@ class Stack(Stack_plot):
                 # select all records for the current burst group
                 records = datas[datas.index.get_level_values(0)==id]
                 # filter dates
-                dates = records.index.get_level_values(2).astype(str)
+                #dates = records.index.get_level_values(2).astype(str)
+                dates = records.startTime.dt.date.values.astype(str)
                 ds = self.dss[id].sel(date=dates)
                 # filter polarizations
                 pols = records.index.get_level_values(1).unique().values
@@ -109,8 +160,11 @@ class Stack(Stack_plot):
             if 'fullBurstID' in datas[0].data_vars:
                 return {ds.fullBurstID.item(0):ds for ds in datas}
             else:
-                print ('NOTE: No fullBurstID variable found in the dataset, using order as a key.')
-                return {i:ds for i, ds in enumerate(datas)}
+                import random, string
+                chars = string.ascii_lowercase
+                random_prefix = ''.join(random.choices(chars, k=8))
+                print (f'NOTE: No fullBurstID variable found in the dataset, using random prefix {random_prefix} with order as the key.')
+                return {f'{random_prefix}_{i+1}':ds for i, ds in enumerate(datas)}
         else:
             raise ValueError(f'ERROR: datas is not None or dataframe or a dict, list, or tuple of xr.Dataset or xr.DataArray: {type(datas)}')
 
@@ -128,6 +182,26 @@ class Stack(Stack_plot):
         from shapely import wkt
         import fsspec
         import os
+        from tqdm.auto import tqdm
+        import warnings
+        # suppress the "Sending large graph of size …"
+        warnings.filterwarnings(
+            'ignore',
+            category=UserWarning,
+            module=r'distributed\.client',
+            message=r'Sending large graph of size .*'
+        )
+        from distributed import get_client, WorkerPlugin
+        class IgnoreDaskDivide(WorkerPlugin):
+            def setup(self, worker):
+                # suppress the "RuntimeWarning: invalid value encountered in divide"
+                warnings.filterwarnings(
+                    "ignore",
+                    category=RuntimeWarning,
+                    module=r'dask\._task_spec'
+                )
+        client = get_client()
+        client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
 
         # use oter variables attr_start, debug
         def ds_preprocess(ds):
@@ -167,7 +241,7 @@ class Stack(Stack_plot):
         #print ('paths', paths)
         if len(paths) == 0:
             raise ValueError(f'ERROR: No files found for the path: {path}')
-        for path in paths:
+        for path in tqdm(paths, desc='Loading Datasets'):
             burst = os.path.basename(path)
             #print (path, '->', burst)
             filenames = fs.glob(os.path.join(path, pattern))
@@ -180,8 +254,8 @@ class Stack(Stack_plot):
                 engine="zarr",
                 parallel=True,
                 concat_dim='date',
-                #chunks={'date': 1, 'y': self.chunksize, 'x': self.chunksize},
-                chunks='auto',
+                chunks=self.chunksize,
+                #chunks='auto',
                 combine='nested',
                 preprocess=ds_preprocess,
             )
@@ -199,70 +273,18 @@ class Stack(Stack_plot):
                 ds = xr.merge(datas)
             else:
                 ds = ds.rename({'data': polarizations[0]})
-            #print (ds)
-            trans = xr.open_zarr(store=filename, consolidated=True, chunks='auto')
-            #print ('\ttrans', trans)
-            #scale = data.attrs['SLC_scale']
-            #scale = ds['SLC_scale'].values.item(0)
-            #print ('scale', scale)
-            # Create complex data while preserving attributes
-            #ds_complex = self.spatial_ref(
-            #    (scale*(ds.re + 1j*ds.im)).astype(np.complex64).where(ds.re != 0).rename(burst),
-            #    ds
-            #).to_dataset(name='data')
-
-            #ds_complex.attrs.update(ds.attrs)
-
-            # for var in ds.data_vars:
-            #     if var not in ['re', 'im']:
-            #         ds_complex[var] = ds[var]
+            # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
+            trans = xr.open_zarr(store=filename, consolidated=True, chunks=self.chunksize).astype('float32')
             for var in trans.data_vars:
                 if var not in ['re', 'im']:
                     ds[var] = trans[var]
             del trans
 
             ds.rio.write_crs(ds.attrs['spatial_ref'], inplace=True)
-
-            #ds_complex.attrs = ds_complex.data.attrs
-            #ds_complex.data.attrs = {}
-            #dss.append(ds.assign_attrs({'id': burst}))
             dss[burst] = ds
 
         #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
         self.dss = dss
-
-        # make attributes dataframe from datas
-        processed_attrs = []
-        for ds in dss.values():
-            #print (data.id)
-            attrs = [data_var for data_var in ds if ds[data_var].dims==('date',)][::-1]
-            attr_start_idx = attrs.index(attr_start)
-            for date_idx, date in enumerate(ds.date.values):
-                processed_attr = {}
-                for attr in attrs[:attr_start_idx+1]:
-                    value = ds[attr].item(date_idx)
-                    #print (attr, date_idx, date, value)
-                    processed_attr['date'] = date
-                    if hasattr(value, 'item'):
-                        processed_attr[attr] = value.item()
-                    elif attr == 'geometry':
-                        processed_attr[attr] = wkt.loads(value)
-                    else:
-                        processed_attr[attr] = value
-                processed_attrs.append(processed_attr)
-                #print (processed_attr)
-        df = gpd.GeoDataFrame(processed_attrs)
-        del df['date']
-        #df['polarization'] = ','.join(polarizations)
-        df = df.assign(polarization=[tuple(map(str, polarizations))] * len(df))
-        burst_col = df.columns[0]
-        #print ('df.columns[0]', df.columns[0])
-        #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
-        df['startTime'] = pd.to_datetime(df['startTime'])
-        df['date'] = df['startTime'].dt.date.astype(str)
-        df = df.sort_values(by=[burst_col, 'polarization', 'date']).set_index([burst_col, 'polarization', 'date'])
-        
-        self.df = df
 
     # def baseline_table(self):
     #     import xarray as xr
@@ -318,9 +340,10 @@ class Stack(Stack_plot):
         import matplotlib.pyplot as plt
 
         if records is None:
-            records = self.df
+            records = self.to_dataframe()
 
         df = records.reset_index()
+        df['date'] = df['startTime'].dt.date
 
         df['label'] = df.apply(lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} {rec['date']} [{rec['pathNumber']}]", axis=1)
         unique_labels = sorted(df['label'].unique())
@@ -328,7 +351,7 @@ class Stack(Stack_plot):
         colors = {label[-4:-1]: 'orange' if label[0] == 'A' else 'cyan' for i, label in enumerate(unique_labels)}
         fig, ax = plt.subplots(figsize=(10, 8))
         for label, group in df.groupby('label'):
-            group.plot(ax=ax, edgecolor=colors[label[-4:-1]], facecolor='none', linewidth=1, alpha=1, label=label)
+            group.plot(ax=ax, edgecolor=colors[label[-4:-1]], facecolor='none', lw=0.25, alpha=1, label=label)
         handles = [matplotlib.lines.Line2D([0], [0], color=colors[label[-4:-1]], lw=1, label=label) for label in unique_labels]
         ax.legend(handles=handles, loc='upper right')
         ax.set_title('Sentinel-1 Burst Footprints')
@@ -337,7 +360,6 @@ class Stack(Stack_plot):
 
     def to_dataset(self,
               datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
-              polarizations: list[str] = None,
               compute: bool = False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
@@ -375,19 +397,7 @@ class Stack(Stack_plot):
 
         # find all variables in the first dataset related to polarizations
         data_vars = datas[0].data_vars if isinstance(datas[0], xr.Dataset) else datas[0].name
-        data_vars = [pol for pol in ['VV','VH','HH','HV'] if pol in data_vars]
-        # select processing polarizations
-        if polarizations is None:
-            polarizations = data_vars
-        elif isinstance(polarizations, str):
-            if polarizations not in data_vars:
-                raise ValueError(f'ERROR: polarizations is not a valid: {polarizations}')
-            polarizations = [polarizations]
-        elif not isinstance(polarizations, (list, tuple)):
-            raise ValueError(f'ERROR: polarizations is not a single string or list or tuple: {type(polarizations)}')
-        else:
-            if len([pol for pol in polarizations if pol not in data_vars]) > 0:
-                raise ValueError(f'ERROR: polarizations are not valid: {polarizations}')
+        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in data_vars]
 
         # process list of datasets with one or multiple polarizations
         if isinstance(datas[0], xr.Dataset):

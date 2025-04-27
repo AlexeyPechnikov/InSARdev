@@ -91,6 +91,8 @@ class XYZTiles(datagrid, progressbar_joblib):
         gmap = XYZTiles().download(AOI, zoom = 10)
         gmap.plot.imshow()
         """
+        import geopandas as gpd
+        import rioxarray as rio
         import xarray as xr
         import requests
         import imageio.v3 as iio
@@ -212,6 +214,16 @@ class XYZTiles(datagrid, progressbar_joblib):
             if mask.any():
                 da.values[mask] = fill_value
             da.attrs['_FillValue'] = fill_value
+
+        # reproject to the geometry CRS when possible
+        try:
+            if isinstance(geometry, (gpd.GeoDataFrame, gpd.GeoSeries)):
+                crs = geometry.crs
+            else:
+                crs = geometry.rio.crs
+            da = da.rio.reproject(crs)
+        except Exception:
+            pass
 
         if filename is not None:
             if os.path.exists(filename):

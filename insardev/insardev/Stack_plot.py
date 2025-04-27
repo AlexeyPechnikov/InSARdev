@@ -12,105 +12,33 @@ from .Stack_export import Stack_export
 from insardev_toolkit import progressbar
 
 class Stack_plot(Stack_export):
+    import xarray as xr
+    import numpy as np
+    import pandas as pd
+    import matplotlib
 
-    # def plot_phase(self, data, caption='Phase, [rad]',
-    #                quantile=None, vmin=None, vmax=None, symmetrical=False,
-    #                cmap='turbo', aspect=None, **kwargs):
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     if quantile is not None:
-    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
-
-    #     if quantile is not None:
-    #         vmin, vmax = np.nanquantile(data, quantile)
-
-    #     # define symmetrical boundaries
-    #     if symmetrical is True and vmax > 0:
-    #         minmax = max(abs(vmin), vmax)
-    #         vmin = -minmax
-    #         vmax =  minmax
-
-    #     plt.figure()
-    #     data.plot.imshow(vmin=vmin, vmax=vmax, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    # def plot_phases(self, data, caption='Phase, [rad]', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
-    #                 quantile=None, vmin=None, vmax=None, symmetrical=False, **kwargs):
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     if quantile is not None:
-    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
-
-    #     if quantile is not None:
-    #         vmin, vmax = np.nanquantile(data, quantile)
-
-    #     # define symmetrical boundaries
-    #     if symmetrical is True and vmax > 0:
-    #         minmax = max(abs(vmin), vmax)
-    #         vmin = -minmax
-    #         vmax =  minmax
-
-    #     # multi-plots ineffective for linked lazy data
-    #     fg = data.plot.imshow(
-    #         col='pair',
-    #         col_wrap=cols, size=size, aspect=aspect,
-    #         vmin=vmin, vmax=vmax, cmap='turbo'
-    #     )
-    #     #fg.set_axis_labels('Range', 'Azimuth')
-    #     fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-    #     fg.fig.suptitle(caption, y=y)
-        
-    #     #self.plots_AOI(fg, **kwargs)
-    #     #self.plots_POI(fg, **kwargs)
-
-    # def plot_interferogram(self, data, caption='Phase, [rad]', cmap='gist_rainbow_r', aspect=None, **kwargs):
-    #     import xarray as xr
-    #     import numpy as np
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if isinstance(data, xr.Dataset):
-    #         data = data.phase
-
-    #     if data.dims == ('pair', 'y', 'x'):
-    #         data = data.isel(pair=0)
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     plt.figure()
-    #     self.wrap(self.interferogram(data) if np.issubdtype(data.dtype, np.complexfloating) else data)\
-    #         .plot.imshow(vmin=-np.pi, vmax=np.pi, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    def plot_stack(self, data, polarizations,
-                   cmap, vmin, vmax, quantile, symmetrical,
-                   caption, cols, rows, size, nbins, aspect, y, wrap, _size=None, **kwargs):
+    def plot_dataset(self,
+                     data: xr.Dataset | xr.DataArray,
+                     polarizations: list[str] | tuple[str] | str | None,
+                     cmap: matplotlib.colors.Colormap | str | None,
+                     vmin: float | None,
+                     vmax: float | None,
+                     quantile: float | None,
+                     symmetrical: bool,
+                     caption: str,
+                     cols: int,
+                     rows: int,
+                     size: float,
+                     nbins: int,
+                     aspect: float,
+                     y: float,
+                     wrap: bool,
+                     _size: tuple[int, int] | None,
+                     ):
         import xarray as xr
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
-        import warnings
-        # supress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         # no data means no plot and no error
         if data is None:
@@ -147,8 +75,11 @@ class Stack_plot(Stack_export):
             factor_y = int(np.round(size_y / (_size[1] / rows)))
             factor_x = int(np.round(size_x / (_size[0] / cols)))
             #print ('factor_x, factor_y', factor_x, factor_y)
-            # coarsen and materialize data for all the calculations and plotting
-            progressbar(da := da[:,::max(1, factor_y), ::max(1, factor_x)].persist(), desc=f'Computing {polarization} Plot'.ljust(25))
+            # decimate for faster plot, do not coarsening without antialiasing
+            # maybe data is already smoothed and maybe not, decimation is the only safe option
+            da = da[:,::max(1, factor_y), ::max(1, factor_x)]
+            # materialize for all the calculations and plotting
+            progressbar(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
 
             # calculate min, max when needed
             if quantile is not None:
@@ -170,26 +101,18 @@ class Stack_plot(Stack_export):
             )
             #fg.set_axis_labels('Range', 'Azimuth')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-            fg.fig.suptitle(f'{polarization} {caption}', y=y)            
-            #self.plots_AOI(fg, **kwargs)
-            #self.plots_POI(fg, **kwargs)
+            fg.fig.suptitle(f'{polarization} {caption}', y=y)
             return fg
 
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if not isinstance(data, (xr.Dataset, xr.DataArray, (dict, list, tuple))):
-            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray or list of xr.Dataset or xr.DataArray')
+        if not isinstance(data, (xr.Dataset, xr.DataArray)):
+            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray')
 
         if isinstance(data, xr.DataArray):
             # convert DataArray to Dataset to plot a single polarization
             data = data.to_dataset()
-        elif isinstance(data, (list, tuple)) and not isinstance(data[0], xr.Dataset):
-            # convert list of DataArray to list of Dataset to plot a single polarization
-            data = [da.to_dataset() for da in data]
-        elif isinstance(data, dict):
-            # convert dict of DataArray to dict of Dataset to plot a single polarization
-            data = {k: v.to_dataset() if not isinstance(v, xr.Dataset) else v for k, v in data.items()}
 
         if polarizations is None:
             polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
@@ -206,70 +129,48 @@ class Stack_plot(Stack_export):
 
     def plot_displacement_mm(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
+                   caption='Displacement, [mm]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
         data_los_mm = self.los_displacement_mm(data)
-        return self.plot_stack(data_los_mm, polarizations,
+        return self.plot_dataset(data_los_mm, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
 
     def plot_displacement(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
-        return self.plot_stack(data, polarizations,
+                   caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
+        return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
 
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
-                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
-        return self.plot_stack(data, polarizations,
+                   caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
+        return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
 
     def plot_interferogram(self, data, polarizations=None,
                            cmap='gist_rainbow_r',
-                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
+                           caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
         import numpy as np
-        return self.plot_stack(data, polarizations,
+        return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=-np.pi, vmax=np.pi, quantile=None, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
 
     def plot_correlation(self, data, polarizations=None,
                          cmap='auto', vmin=0, vmax=1, quantile=None, symmetrical=False,
-                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None, **kwargs):
+                         caption='Correlation', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
         import matplotlib.colors as mcolors
         if isinstance(cmap, str) and cmap == 'auto':
             cmap = mcolors.LinearSegmentedColormap.from_list(
                 name='custom_gray', 
                 colors=['black', 'whitesmoke']
             )
-        return self.plot_stack(data, polarizations,
+        return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=False,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size, **kwargs)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size)
 
-    # def plot_correlation(self, data, caption='Correlation', cmap='gray', aspect=None, **kwargs):
-    #     import xarray as xr
-    #     import pandas as pd
-    #     import matplotlib.pyplot as plt
-
-    #     if isinstance(data, xr.Dataset):
-    #         data = data.correlation
-
-    #     if data.dims == ('pair', 'y', 'x'):
-    #         data = data.isel(pair=0)
-
-    #     if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-    #         data = data.unstack('stack')
-
-    #     plt.figure()
-    #     data.plot.imshow(vmin=0, vmax=1, cmap=cmap)
-    #     #self.plot_AOI(**kwargs)
-    #     #self.plot_POI(**kwargs)
-    #     if aspect is not None:
-    #         plt.gca().set_aspect(aspect)
-    #     plt.title(caption)
-
-    def plot_stack_correlation(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto', **kwargs):
+    def plot_stack_correlation(self, data, threshold=None, caption='Correlation Stack', bins=100, cmap='auto'):
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
@@ -310,7 +211,5 @@ class Stack_plot(Stack_export):
         else:
             data.where(data).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1])
         axs[0].legend()
-        #self.plot_AOI(ax=axs[1], **kwargs)
-        #self.plot_POI(ax=axs[1], **kwargs)
         plt.suptitle(caption)
         plt.tight_layout()

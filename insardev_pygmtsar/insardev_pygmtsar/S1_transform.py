@@ -14,15 +14,19 @@ class S1_transform(S1_topo):
     import xarray as xr
     import numpy as np
 
-    def transform(self, ref: str, records: pd.DataFrame|None=None, degrees: float=12.0/3600,
-            resolution: tuple[int, int]=(20, 5), scale_factor: float=2.0, epsg: str|int|None='auto', timeout: str|int|None='30s', debug: bool=False):
-        from tqdm.auto import tqdm
+    def transform(self,
+                  ref: str,
+                  records: pd.DataFrame|None=None,
+                  epsg: str|int|None='auto',
+                  resolution: tuple[int, int]=(20, 5),
+                  dem_vertical_accuracy: float=0.5,
+                  alignment_spacing: float=12.0/3600,
+                  debug: bool=False):
         import dask
         from tqdm.auto import tqdm
         import joblib
         import os
         import tempfile
-        #from dask.distributed import get_client
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -52,7 +56,8 @@ class S1_transform(S1_topo):
                 for burst_ref in burst_refs:
                     self.align_ref(burst_ref[-1], basedir, debug=debug)
                 #print ('compute_transform')
-                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution, scale_factor=scale_factor, epsg=epsg)
+                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution,
+                                       scale_factor=1/dem_vertical_accuracy, epsg=epsg)
                 # for topo phase calculation
                 #print ('compute_transform_inverse')
                 self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
@@ -67,8 +72,10 @@ class S1_transform(S1_topo):
                     # align repeat bursts to the reference burst
                     if burst_rep not in burst_refs:
                         #print ('align_rep', burst_rep[-1], burst_ref[-1])
-                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=degrees, debug=debug)
-                    self.transform_slc(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=alignment_spacing, debug=debug)
+                    self.transform_slc_int16(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
+            # cleanup
+            import gc; gc.collect()
 
         # Dask cluster client
         # client = get_client()
@@ -81,13 +88,8 @@ class S1_transform(S1_topo):
             joblib.Parallel(n_jobs=1, backend='threading')(
                 [joblib.delayed(process_refrep)(refrep, debug=debug)]
             )
-            # cleanup - release all workers memory, call garbage collector before to prevent heartbeat errors
-            # import gc; gc.collect()
-            # if timeout is not None:
-            #     client.restart(wait_for_workers=False)
-            #     client.wait_for_workers(1, timeout=timeout)
 
-    def transform_slc(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
+    def transform_slc_int16(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -134,8 +136,8 @@ class S1_transform(S1_topo):
         
         # do not apply scale to complex_proj to preserve projection attributes
         data_proj = xr.merge([
-                        (complex_proj.real / scale).round().astype(np.int16).where(np.isfinite(complex_proj.real), np.iinfo(np.int16).min).rename('re'),
-                        (complex_proj.imag / scale).round().astype(np.int16).where(np.isfinite(complex_proj.imag), np.iinfo(np.int16).min).rename('im')
+                        (complex_proj.real / scale).round().astype(np.int16).where(np.isfinite(complex_proj.real), np.iinfo(np.int16).max).rename('re'),
+                        (complex_proj.imag / scale).round().astype(np.int16).where(np.isfinite(complex_proj.imag), np.iinfo(np.int16).max).rename('im')
                         ])
         del complex_proj
 
@@ -176,7 +178,7 @@ class S1_transform(S1_topo):
         for varname in ['re', 'im']:
             data_proj[varname].attrs['scale_factor'] = scale
             data_proj[varname].attrs['add_offset'] = 0
-            data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).min
+            data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
         
         encoding_vars = {var: self.get_encoding_zarr(chunks=(data_proj.x.size,),
                                                      dtype=data_proj[var].dtype,
