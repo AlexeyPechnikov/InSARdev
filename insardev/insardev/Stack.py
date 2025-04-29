@@ -93,6 +93,9 @@ class Stack(Stack_plot):
         #df['polarization'] = ','.join(polarizations)
         # convert polarizations to strings like "VV,VH" to pevent confusing with tuples in the dataframe
         df = df.assign(polarization=','.join(map(str, polarizations)))
+        # reorder columns to the same order as preprocessor uses
+        pol = df.pop("polarization")
+        df.insert(3, "polarization", pol)
         # round for human readability
         df['BPR'] = df['BPR'].round(1)
 
@@ -102,7 +105,7 @@ class Stack(Stack_plot):
         #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
         df['startTime'] = pd.to_datetime(df['startTime'])
         #df['date'] = df['startTime'].dt.date.astype(str)
-        df = df.sort_values(by=[group_col, 'polarization', burst_col]).set_index([group_col, 'polarization', burst_col])
+        df = df.sort_values(by=[group_col, burst_col]).set_index([group_col, burst_col])
         # move geometry to the end of the dataframe to be the most similar to insar_pygmtsar output
         df = df.loc[:, df.columns.drop("geometry").tolist() + ["geometry"]]
         
@@ -173,14 +176,12 @@ class Stack(Stack_plot):
     #     if len(dss) > 1:
     #         return self.to_datasets(records)[0]
 
-    def __init__(self, path:str, fs:fsspec.spec.AbstractFileSystem|None=None,
-                 pattern:str='S1_??????_IW?_????????T??????_[HV][HV]_????-BURST', attr_start:str='BPR', debug:bool=False):
+    def __init__(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, engine='zarr', attr_start:str='BPR', debug:bool=False, **kwargs):
         import numpy as np
         import xarray as xr
         import pandas as pd
         import geopandas as gpd
         from shapely import wkt
-        import fsspec
         import os
         from tqdm.auto import tqdm
         import warnings
@@ -202,6 +203,9 @@ class Stack(Stack_plot):
                 )
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
+
+        if engine=='zarr' and 'consolidated' not in kwargs:
+            kwargs['consolidated'] = True
 
         # use oter variables attr_start, debug
         def ds_preprocess(ds):
@@ -229,35 +233,47 @@ class Stack(Stack_plot):
                 del ds['re'], ds['im']
             date = pd.to_datetime(ds['startTime'].item())
             return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
-        
-        # specify dataset location locally or via fsspec
-        self.path = path
-        if not isinstance(fs, fsspec.spec.AbstractFileSystem):
-            fs = fsspec.filesystem("file")
-        self.fs = fs
+
+        if isinstance(urls, dict):
+            print ('NOTE: urls is a dict, using it as is.')
+            groups = urls
+        elif isinstance(urls.index, pd.MultiIndex) and urls.index.nlevels == 2:
+            print ('NOTE: Detected Pandas Dataframe with MultiIndex, using first level as fullBurstID and the first column as URLs.')
+            #groups = {key: group.index.get_level_values(1).tolist() for key, group in urls.groupby(level=0)}
+            groups = {key: group[urls.columns[0]].tolist() for key, group in urls.groupby(level=0)}
+        elif isinstance(urls, list):
+            print ('NOTE: urls is a list, convert to dict with burst as key and list of URLs as value.')
+            groups = {}
+            for url in urls:
+                parent = url.rsplit('/', 2)[1]
+                groups.setdefault(parent, []).append(url)
+        else:
+            raise ValueError(f'ERROR: urls is not a dict, list, or Pandas Dataframe: {type(urls)}')
 
         dss = {}
-        paths = fs.glob(path)
-        #print ('paths', paths)
-        if len(paths) == 0:
-            raise ValueError(f'ERROR: No files found for the path: {path}')
-        for path in tqdm(paths, desc='Loading Datasets'):
-            burst = os.path.basename(path)
+        for group in tqdm(groups.keys(), desc='Loading Datasets'):
+            burst = os.path.basename(group)
             #print (path, '->', burst)
-            filenames = fs.glob(os.path.join(path, pattern))
+            filenames = [url for url in groups[group] if not url.endswith('transform')]
             #print ('\tfilenames', filenames)
-            filename = os.path.join(path, 'transform')
+            filename = [url for url in groups[group] if url.endswith('transform')]
+            if len(filename) > 0:
+                filename = filename[0]
+            else:
+                filename = None
             #print ('\tfilename', filename)
 
             ds = xr.open_mfdataset(
                 filenames,
-                engine="zarr",
+                engine=engine,
                 parallel=True,
                 concat_dim='date',
                 chunks=self.chunksize,
                 #chunks='auto',
                 combine='nested',
                 preprocess=ds_preprocess,
+                storage_options=storage_options,
+                **kwargs
             )
 
             # in case of multiple polarizations, merge them into a single dataset
@@ -273,15 +289,18 @@ class Stack(Stack_plot):
                 ds = xr.merge(datas)
             else:
                 ds = ds.rename({'data': polarizations[0]})
-            # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
-            trans = xr.open_zarr(store=filename, consolidated=True, chunks=self.chunksize).astype('float32')
-            for var in trans.data_vars:
-                if var not in ['re', 'im']:
-                    ds[var] = trans[var]
-            del trans
+
+            if filename is not None:
+                # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
+                trans = xr.open_dataset(filename, engine=engine, chunks=self.chunksize, storage_options=storage_options, **kwargs).astype('float32')
+                for var in trans.data_vars:
+                    if var not in ['re', 'im']:
+                        ds[var] = trans[var]
+                del trans
 
             ds.rio.write_crs(ds.attrs['spatial_ref'], inplace=True)
             dss[burst] = ds
+            del ds
 
         #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
         self.dss = dss

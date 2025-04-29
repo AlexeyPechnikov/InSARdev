@@ -104,9 +104,9 @@ class S1_slc(S1_base):
                 # Extract all required fields from annotation
                 record = {
                     'fullBurstID': prefix,
-                    'polarization': annotation['product']['adsHeader']['polarisation'],
                     'burst': os.path.splitext(meta)[0],
                     'startTime': start_time,
+                    'polarization': annotation['product']['adsHeader']['polarisation'],
                     'flightDirection': annotation['product']['generalAnnotation']['productInformation']['pass'].upper(),
                     'pathNumber': ((int(annotation['product']['adsHeader']['absoluteOrbitNumber']) - 73) % 175) + 1,
                     'subswath': annotation['product']['adsHeader']['swath'],
@@ -121,8 +121,8 @@ class S1_slc(S1_base):
         df = pd.DataFrame(records)
         assert len(df), f'Bursts not found'
         df = gpd.GeoDataFrame(df, geometry='geometry')\
-            .sort_values(by=['fullBurstID','polarization','burst'])\
-            .set_index(['fullBurstID','polarization','burst'])
+            .sort_values(by=['fullBurstID','burst'])\
+            .set_index(['fullBurstID','burst'])
 
         path_numbers = df.pathNumber.unique().tolist()
         min_dates = [str(df[df.pathNumber==path].startTime.dt.date.min()) for path in path_numbers]

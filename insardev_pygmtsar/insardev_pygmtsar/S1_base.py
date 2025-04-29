@@ -92,7 +92,7 @@ class S1_base(progressbar_joblib, datagrid):
         pd.DataFrame
             The DataFrame containing reference record.
         """
-        df = self.df[self.df.index.get_level_values(2)==burst]
+        df = self.df[self.df.index.get_level_values(1)==burst]
         if len(df) == 0:
             df = self.df[self.df.index.get_level_values(0)==burst]
         assert len(df) > 0, f'Record not found'

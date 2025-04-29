@@ -27,6 +27,8 @@ class S1_transform(S1_topo):
         import joblib
         import os
         import tempfile
+        from distributed import get_client
+        import gc
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -49,11 +51,12 @@ class S1_transform(S1_topo):
             with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as basedir:
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
-                # burst format is like ('021_043788_IW1', 'VH', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
+                # burst format is like ('021_043788_IW1', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
                 burst_refs = bursts[0]
                 burst_reps = bursts[1]
                 # prepare reference burst for all polarizations
                 for burst_ref in burst_refs:
+                    #print ('burst_ref', burst_ref)
                     self.align_ref(burst_ref[-1], basedir, debug=debug)
                 #print ('compute_transform')
                 self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution,
@@ -67,27 +70,33 @@ class S1_transform(S1_topo):
                 # use sequential processing as it is well parallelized internally
                 #print ('transform_slc')
                 for burst_rep in burst_reps + burst_refs:
-                    burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
+                    burst_ref = [burst for burst in burst_refs if burst[:1]==burst_rep[:1]][0]
                     #print (burst_rep[-1], '->', burst_ref[-1])
                     # align repeat bursts to the reference burst
                     if burst_rep not in burst_refs:
-                        #print ('align_rep', burst_rep[-1], burst_ref[-1])
+                        #print ('align_rep', burst_rep, burst_ref)
                         self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=alignment_spacing, debug=debug)
                     self.transform_slc_int16(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
-            # cleanup
-            import gc; gc.collect()
+                #print ()
 
         # Dask cluster client
         # client = get_client()
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
-            
+        
+        # Dask cluster client
+        client = get_client()
+        client.restart(wait_for_workers=True, timeout=60)
+        gc.collect()
         for refrep in tqdm(refreps, desc='Transforming SLC'):
-            #process_refrep(refrep, debug=debug)
+            # process_refrep(refrep, debug=debug)
             joblib.Parallel(n_jobs=1, backend='threading')(
                 [joblib.delayed(process_refrep)(refrep, debug=debug)]
             )
+            # cleanup
+            client.run(lambda: __import__('gc').collect())
+            gc.collect()
 
     def transform_slc_int16(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
         """

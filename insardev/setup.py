@@ -58,7 +58,9 @@ setup(
                       'matplotlib',
                       'adjustText',
                       'seaborn',
-                      'bottleneck'
+                      'bottleneck',
+                      'fsspec',
+                      'aiohttp'
                       ],
 #    extras_require={
 #                      'vtk_support': ['vtk', 'panel']
