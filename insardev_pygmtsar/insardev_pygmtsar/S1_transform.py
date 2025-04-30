@@ -14,6 +14,27 @@ class S1_transform(S1_topo):
     import xarray as xr
     import numpy as np
 
+    def consolidate_metadata(self, resolution: tuple[int, int]=(20, 5), burst: str=None):
+        """
+        Consolidate metadata for a given resolution and burst.
+
+        Parameters
+        ----------
+        resolution : tuple[int, int]
+            The resolution to use.
+        burst : str
+            The burst to use.
+        """
+        import zarr
+        import os
+        root_dir = os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}')
+        if burst:
+            root_dir = os.path.join(root_dir, self.fullBurstId(burst))
+        #print ('root_dir', root_dir)
+        root_store = zarr.storage.LocalStore(root_dir)
+        root_group = zarr.group(store=root_store, overwrite=False)
+        zarr.consolidate_metadata(root_store)
+
     def transform(self,
                   ref: str,
                   records: pd.DataFrame|None=None,
@@ -78,6 +99,8 @@ class S1_transform(S1_topo):
                         self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=alignment_spacing, debug=debug)
                     self.transform_slc_int16(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
                 #print ()
+            # consolidate zarr metadata
+            self.consolidate_metadata(resolution=resolution, burst=burst_rep[-1])
 
         # Dask cluster client
         # client = get_client()
@@ -194,11 +217,11 @@ class S1_transform(S1_topo):
                                                      shuffle='noshuffle'
                                                      ) for var in data_proj.data_vars}
         #print ('encoding_vars', encoding_vars)
-        encoding_coords = {coord: self.get_encoding_zarr(chunks=(data_proj[coord].size,), dtype=data_proj[coord].dtype) for coord in data_proj.coords}
-        #print ('encoding_coords', encoding_coords)
+        # use transfrom coordinates
+        data_proj = data_proj.drop_vars(['x','y'])
         data_proj.to_zarr(
             store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
-            encoding=encoding_vars | encoding_coords,
+            encoding=encoding_vars,
             mode='w',
             consolidated=True
         )
