@@ -67,17 +67,17 @@ class S1_base(progressbar_joblib, datagrid):
                 assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
         return filename
    
-    def get_basename(self, burst: str) -> str:
-        import os
-        prefix = self.fullBurstId(burst)
-        basename = os.path.join(self.workdir, prefix, burst)
-        return basename
+    # def get_basename(self, workdir: str, burst: str) -> str:
+    #     import os
+    #     prefix = self.fullBurstId(burst)
+    #     basename = os.path.join(workdir, prefix, burst)
+    #     return basename
     
-    def get_dirname(self, burst: str) -> str:
-        import os
-        prefix = self.fullBurstId(burst)
-        dirname = os.path.join(self.workdir, prefix)
-        return dirname
+    # def get_dirname(self, workdir: str, burst: str) -> str:
+    #     import os
+    #     prefix = self.fullBurstId(burst)
+    #     dirname = os.path.join(workdir, prefix)
+    #     return dirname
 
     def get_record(self, burst: str) -> pd.DataFrame:
         """
@@ -92,7 +92,7 @@ class S1_base(progressbar_joblib, datagrid):
         pd.DataFrame
             The DataFrame containing reference record.
         """
-        df = self.df[self.df.index.get_level_values(1)==burst]
+        df = self.df[self.df.index.get_level_values(2)==burst]
         if len(df) == 0:
             df = self.df[self.df.index.get_level_values(0)==burst]
         assert len(df) > 0, f'Record not found'

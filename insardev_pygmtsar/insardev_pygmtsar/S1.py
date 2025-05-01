@@ -16,7 +16,6 @@ class S1(S1_transform):
 
     # class variables
     datadir: str|None = None
-    workdir: str|None = None
     DEM: str|xr.DataArray|xr.Dataset|None = None
     df: pd.DataFrame|None = None
 

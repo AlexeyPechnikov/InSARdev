@@ -189,7 +189,7 @@ class S1_topo(S1_geocode):
                             consolidated=True,
                             chunks="auto")['topo']
 
-    def compute_topo(self, burst_ref, basedir: str, resolution: tuple[int, int]):
+    def compute_topo(self, workdir: str, burst_ref: str, basedir: str, resolution: tuple[int, int]):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
             a NetCDF file for future use.
@@ -199,8 +199,14 @@ class S1_topo(S1_geocode):
 
         Parameters
         ----------
+        workdir : str
+            The work directory.
         burst_ref : str
             The reference burst name.
+        basedir : str
+            The basedir directory.
+        resolution : tuple[int, int]
+            The resolution of the transform data.
 
         Note
         ----
@@ -286,7 +292,7 @@ class S1_topo(S1_geocode):
             return np.asarray([grid_ele]).reshape((1, azis.size, rngs.size))
 
         # transformation matrix
-        transform = self.get_transform(burst_ref, resolution)
+        transform = self.get_transform(workdir, burst_ref, resolution)
         # calculate indices on the fly
         trans_blocks = transform[['azi', 'rng']].coarsen(y=self.chunksize, x=self.chunksize, boundary='pad')
         #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())

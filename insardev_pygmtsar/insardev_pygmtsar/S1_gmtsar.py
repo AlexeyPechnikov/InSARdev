@@ -52,8 +52,7 @@ class S1_gmtsar(S1_prm):
 
         return
 
-    # produce LED and PRM in workdir
-    # when date=None work on reference scene
+    # produce LED and PRM
     def _make_s1a_tops(self, burst: str, basedir: str, mode: int=0, rshift_fromfile: str|None=None, ashift_fromfile: str|None=None, debug: bool=False):
         """
         Produces LED and PRM in the base directory by executing GMTSAR binary `make_s1a_tops`.

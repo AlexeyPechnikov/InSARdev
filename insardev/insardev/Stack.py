@@ -16,10 +16,38 @@ class Stack(Stack_plot):
     import pandas as pd
     import xarray as xr
     import geopandas as gpd
-    import fsspec
+    #import fsspec
+    import zarr
 
     def __repr__(self):
         return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
+
+    def __add__(self, other):
+        """
+        Add two stacks together.
+
+        s3 = s1 + s2
+        """
+        import copy
+        if not isinstance(other, Stack):
+            return NotImplemented
+        # make a shallow copy of self
+        new = copy.copy(self)
+        # merge the dicts
+        new.dss = self.dss | other.dss
+        return new
+
+    def __iadd__(self, other):
+        """
+        Add two stacks together in place.
+
+        s1 += s2
+        """
+        if not isinstance(other, Stack):
+            return NotImplemented
+        # update in‐place
+        self.dss.update(other.dss)
+        return self
 
     def PRM(self, key:str) -> str|float|int:
         """
@@ -129,11 +157,10 @@ class Stack(Stack_plot):
                 # select all records for the current burst group
                 records = datas[datas.index.get_level_values(0)==id]
                 # filter dates
-                #dates = records.index.get_level_values(2).astype(str)
                 dates = records.startTime.dt.date.values.astype(str)
                 ds = self.dss[id].sel(date=dates)
                 # filter polarizations
-                pols = records.index.get_level_values(1).unique().values
+                pols = records.polarization.unique()
                 if len(pols) > 1:
                     raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
                 elif len(pols) == 0:
@@ -176,14 +203,17 @@ class Stack(Stack_plot):
     #     if len(dss) > 1:
     #         return self.to_datasets(records)[0]
 
-    def __init__(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, engine='zarr', attr_start:str='BPR', debug:bool=False, **kwargs):
+    def __init__(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
         import geopandas as gpd
+        import zarr
         from shapely import wkt
         import os
+        from insardev_toolkit import progressbar_joblib
         from tqdm.auto import tqdm
+        import joblib
         import warnings
         # suppress the "Sending large graph of size …"
         warnings.filterwarnings(
@@ -204,11 +234,9 @@ class Stack(Stack_plot):
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
 
-        if engine=='zarr' and 'consolidated' not in kwargs:
-            kwargs['consolidated'] = True
-
-        # use oter variables attr_start, debug
-        def ds_preprocess(ds):
+        def burst_preprocess(ds, attr_start:str='BPR', debug:bool=False):
+            import xarray as xr
+            import numpy as np
             #print ('ds_preprocess', ds)
             process_attr = True if debug else False
             for key in ds.attrs:
@@ -223,7 +251,7 @@ class Stack(Stack_plot):
                     # remove the attribute
                     del ds.attrs[key]
             
-            # remove attributes for repeat bursts
+            # remove attributes for repeat bursts to unify the attributes
             BPR = ds['BPR'].values.item(0)
             if BPR != 0:
                 ds.attrs = {}
@@ -234,76 +262,162 @@ class Stack(Stack_plot):
             date = pd.to_datetime(ds['startTime'].item())
             return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
 
-        if isinstance(urls, dict):
-            print ('NOTE: urls is a dict, using it as is.')
-            groups = urls
-        elif isinstance(urls.index, pd.MultiIndex) and urls.index.nlevels == 2:
-            print ('NOTE: Detected Pandas Dataframe with MultiIndex, using first level as fullBurstID and the first column as URLs.')
-            #groups = {key: group.index.get_level_values(1).tolist() for key, group in urls.groupby(level=0)}
-            groups = {key: group[urls.columns[0]].tolist() for key, group in urls.groupby(level=0)}
-        elif isinstance(urls, list):
-            print ('NOTE: urls is a list, convert to dict with burst as key and list of URLs as value.')
-            groups = {}
-            for url in urls:
-                parent = url.rsplit('/', 2)[1]
-                groups.setdefault(parent, []).append(url)
-        else:
-            raise ValueError(f'ERROR: urls is not a dict, list, or Pandas Dataframe: {type(urls)}')
-
-        dss = {}
-        for group in tqdm(groups.keys(), desc='Loading Datasets'):
-            burst = os.path.basename(group)
-            #print (path, '->', burst)
-            filenames = [url for url in groups[group] if not url.endswith('transform')]
-            #print ('\tfilenames', filenames)
-            filename = [url for url in groups[group] if url.endswith('transform')]
-            if len(filename) > 0:
-                filename = filename[0]
-            else:
-                filename = None
-            #print ('\tfilename', filename)
-
-            ds = xr.open_mfdataset(
-                filenames,
-                engine=engine,
-                parallel=True,
-                concat_dim='date',
-                chunks=self.chunksize,
-                #chunks='auto',
-                combine='nested',
-                preprocess=ds_preprocess,
-                storage_options=storage_options,
-                **kwargs
-            )
+        def _bursts_transform_preprocess(bursts, transform):
+            import xarray as xr
+            import numpy as np
 
             # in case of multiple polarizations, merge them into a single dataset
-            polarizations = np.unique(ds.polarization)
+            polarizations = np.unique(bursts.polarization)
             if len(polarizations) > 1:
                 datas = []
                 for polarization in polarizations:
-                    data = ds.isel(date=ds.polarization == polarization).rename({'data': polarization})
+                    data = bursts.isel(date=bursts.polarization == polarization)\
+                                .rename({'data': polarization})
                     # cannot combine in a single value VV and VH polarizations and corresponding burst names
-                    data.burst.values = [v.replace(polarization, 'XX') for v in data.burst.values]
+                    data.burst.values = [
+                        v.replace(polarization, 'XX') for v in data.burst.values
+                    ]
                     del data['polarization']
                     datas.append(data)
                 ds = xr.merge(datas)
+                del datas
             else:
                 ds = ds.rename({'data': polarizations[0]})
 
-            if filename is not None:
+            for var in transform.data_vars:
+                #if var not in ['re', 'im']:
+                ds[var] = transform[var]
+
+            ds.rio.write_crs(bursts.attrs['spatial_ref'], inplace=True)
+            return ds
+
+        def bursts_transform_preprocess(dss, transform):
+            """
+            Combine bursts and transform into a single dataset.
+            Only reference burst for every polarization has attributes (see burst_preprocess)
+            """
+            import xarray as xr
+            import numpy as np
+
+            polarizations = np.unique([ds.polarization for ds in dss])
+            #print ('polarizations', polarizations)
+
+            # convert generic 'data' variable for all polarizations to VV, VH,... variables
+            datas = []
+            for polarization in polarizations:
+                data = [ds for ds in dss if ds.polarization==polarization]
+                data = xr.concat(data, dim='date', combine_attrs='no_conflicts').rename({'data': polarization})
+                # cannot combine in a single value VV and VH polarizations and corresponding burst names
+                data.burst.values = [v.replace(polarization, 'XX') for v in data.burst.values]
+                del data['polarization']
+                datas.append(data)
+                del data
+            ds = xr.merge(datas)
+            # only reference burst has spatial_ref attribute, concat bursts before getting spatial_ref
+            spatial_ref = ds.attrs['spatial_ref']
+            del datas
+
+            # add transform variables
+            for var in transform.data_vars:
+                ds[var] = transform[var]
+
+            # set the coordinate reference system
+            ds.rio.write_crs(spatial_ref, inplace=True)
+            return ds
+
+        # if isinstance(urls, str):
+        #     print ('NOTE: urls is a string, convert to dict with burst as key and list of URLs as value.')
+        # elif isinstance(urls, dict):
+        #     print ('NOTE: urls is a dict, using it as is.')
+        #     groups = urls
+        # elif isinstance(urls.index, pd.MultiIndex) and urls.index.nlevels == 2:
+        #     print ('NOTE: Detected Pandas Dataframe with MultiIndex, using first level as fullBurstID and the first column as URLs.')
+        #     #groups = {key: group.index.get_level_values(1).tolist() for key, group in urls.groupby(level=0)}
+        #     groups = {key: group[urls.columns[0]].tolist() for key, group in urls.groupby(level=0)}
+        # elif isinstance(urls, list):
+        #     print ('NOTE: urls is a list, convert to dict with burst as key and list of URLs as value.')
+        #     groups = {}
+        #     for url in urls:
+        #         parent = url.rsplit('/', 2)[1]
+        #         groups.setdefault(parent, []).append(url)
+        # else:
+        #     raise ValueError(f'ERROR: urls is not a dict, list, or Pandas Dataframe: {type(urls)}')
+
+        # def store_open_burst(grp):
+        #     #ds = xr.open_zarr(root.store, group=f'021_043788_IW1/{burst}', consolidated=True, zarr_format=3)
+        #     #grp = root['021_043788_IW1'][burst]
+        #     ds = xr.open_zarr(grp.store, group=grp.path, consolidated=True, zarr_format=3)
+        #     return burst_preprocess(ds)
+        
+        def store_open_group(root, group):
+            # open group (fullBurstID)
+            grp = root[group]
+            # get all subgroups (bursts) except transform
+            grp_bursts = [grp[k] for k in grp.keys() if k!='transform']
+            dss = [xr.open_zarr(grp.store, group=grp.path, consolidated=True, zarr_format=3) for grp in grp_bursts]
+            dss = [burst_preprocess(ds) for ds in dss]
+            # get transform subgroup
+            grp_transform = grp['transform']
+            transform = xr.open_zarr(grp_transform.store, group=grp_transform.path, consolidated=True, zarr_format=3)
+            # combine bursts and transform
+            ds = bursts_transform_preprocess(dss, transform)
+            del dss, transform
+            return group, ds
+
+        if isinstance(urls, str):
+            root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
+            with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset', total=len(list(root.group_keys())))) as progress_bar:
+                dss = joblib.Parallel(n_jobs=-1, backend='loky')\
+                    (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
+            self.dss = dict(dss)
+            del dss
+        elif isinstance(urls, list) or isinstance(urls, pd.DataFrame):
+            # load bursts and transform specified by URLs
+            # this allows to load from multiple locations with precise control of the data
+            if isinstance(urls, list):
+                print ('NOTE: urls is a list, using it as is.')
+                df = pd.DataFrame(urls, columns=['url'])
+                df['fullBurstID'] = df['url'].str.rsplit('/', n=2).str[1]
+                df['burst'] = df["url"].str.rsplit("/", n=2).str[2]
+                urls = df.sort_values(by=['fullBurstID', 'burst']).set_index(['fullBurstID', 'burst'])
+                print (urls.head())
+            elif isinstance(urls.index, pd.MultiIndex) and urls.index.nlevels == 2 and len(urls.columns) == 1:
+                print ('NOTE: Detected Pandas Dataframe with MultiIndex, using first level as fullBurstID and the first column as URLs.')
+                #groups = {key: group.index.get_level_values(1).tolist() for key, group in urls.groupby(level=0)}
+                #groups = {key: group[urls.columns[0]].tolist() for key, group in urls.groupby(level=0)}
+            else:
+                raise ValueError(f'ERROR: urls is not a list, or Pandas Dataframe with multiindex: {type(urls)}')
+
+            dss = {}
+            for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets'):
+                #print ('fullBurstID', fullBurstID)
+                df = urls[urls.index.get_level_values(0) == fullBurstID]
+                bases = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
+                #print ('fullBurstID', fullBurstID, '=>', 'bases', bases)
+                base = df[df.index.get_level_values(1) == 'transform'].iloc[:,0].values[0]
+                #print ('fullBurstID', fullBurstID, '=>', 'base', base)
+                bursts = xr.open_mfdataset(
+                    bases,
+                    engine='zarr',
+                    zarr_format=3,
+                    consolidated=True,
+                    parallel=True,
+                    chunks=self.chunksize,
+                    concat_dim='date',
+                    combine='nested',
+                    preprocess=lambda ds: burst_preprocess(ds, attr_start=attr_start, debug=False),
+                    storage_options=storage_options,
+                )
                 # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
-                trans = xr.open_dataset(filename, engine=engine, chunks=self.chunksize, storage_options=storage_options, **kwargs).astype('float32')
-                for var in trans.data_vars:
-                    if var not in ['re', 'im']:
-                        ds[var] = trans[var]
-                del trans
+                transform = xr.open_dataset(base, engine='zarr', zarr_format=3, chunks=self.chunksize,consolidated=True, storage_options=storage_options).astype('float32')
 
-            ds.rio.write_crs(ds.attrs['spatial_ref'], inplace=True)
-            dss[burst] = ds
-            del ds
+                ds = _bursts_transform_preprocess(bursts, transform)
+                dss[fullBurstID] = ds
+                del ds, bursts, transform
 
-        #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
-        self.dss = dss
+            #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
+            self.dss = dss
+            del dss
 
     # def baseline_table(self):
     #     import xarray as xr

@@ -14,12 +14,14 @@ class S1_transform(S1_topo):
     import xarray as xr
     import numpy as np
 
-    def consolidate_metadata(self, resolution: tuple[int, int]=(20, 5), burst: str=None):
+    def consolidate_metadata(self, workdir: str, resolution: tuple[int, int]=(20, 5), burst: str=None):
         """
         Consolidate metadata for a given resolution and burst.
 
         Parameters
         ----------
+        workdir : str
+            The work directory.
         resolution : tuple[int, int]
             The resolution to use.
         burst : str
@@ -27,7 +29,7 @@ class S1_transform(S1_topo):
         """
         import zarr
         import os
-        root_dir = os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}')
+        root_dir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}')
         if burst:
             root_dir = os.path.join(root_dir, self.fullBurstId(burst))
         #print ('root_dir', root_dir)
@@ -36,6 +38,7 @@ class S1_transform(S1_topo):
         zarr.consolidate_metadata(root_store)
 
     def transform(self,
+                  workdir: str,
                   ref: str,
                   records: pd.DataFrame|None=None,
                   epsg: str|int|None='auto',
@@ -53,8 +56,6 @@ class S1_transform(S1_topo):
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
-        if self.workdir is None:
-            raise ValueError('ERROR: work directory (workdir) is not set. Please create a new instance of S1 with a workdir.')
 
         if records is None:
             records = self.to_dataframe(ref=ref)
@@ -80,27 +81,25 @@ class S1_transform(S1_topo):
                     #print ('burst_ref', burst_ref)
                     self.align_ref(burst_ref[-1], basedir, debug=debug)
                 #print ('compute_transform')
-                self.compute_transform(burst_refs[0][-1], basedir=basedir, resolution=resolution,
+                self.compute_transform(workdir, burst_refs[0][-1], basedir=basedir, resolution=resolution,
                                        scale_factor=1/dem_vertical_accuracy, epsg=epsg)
                 # for topo phase calculation
                 #print ('compute_transform_inverse')
-                self.compute_topo(burst_refs[0][-1], basedir=basedir, resolution=resolution)
+                self.compute_topo(workdir, burst_refs[0][-1], basedir=basedir, resolution=resolution)
 
-                # compute the transform data for the same polarization reference burst
-                # this allows to easily detect when topo phase is not applicable
                 # use sequential processing as it is well parallelized internally
                 #print ('transform_slc')
                 for burst_rep in burst_reps + burst_refs:
-                    burst_ref = [burst for burst in burst_refs if burst[:1]==burst_rep[:1]][0]
+                    burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
                     #print (burst_rep[-1], '->', burst_ref[-1])
                     # align repeat bursts to the reference burst
                     if burst_rep not in burst_refs:
-                        #print ('align_rep', burst_rep, burst_ref)
+                        #print ('align_rep', burst_rep, '=>', burst_ref)
                         self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=alignment_spacing, debug=debug)
-                    self.transform_slc_int16(burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                    self.transform_slc_int16(workdir, burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
                 #print ()
             # consolidate zarr metadata
-            self.consolidate_metadata(resolution=resolution, burst=burst_rep[-1])
+            self.consolidate_metadata(workdir, resolution=resolution, burst=burst_rep[-1])
 
         # Dask cluster client
         # client = get_client()
@@ -121,7 +120,7 @@ class S1_transform(S1_topo):
             client.run(lambda: __import__('gc').collect())
             gc.collect()
 
-    def transform_slc_int16(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
+    def transform_slc_int16(self, workdir: str, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -161,7 +160,7 @@ class S1_transform(S1_topo):
                 .where((slc_complex!=0+0j).sum('r') > 0.8 * slc_complex.r.size)
         # reproject as a single complex variable
         phase = self.topo_phase(burst_rep, burst_ref, basedir=basedir, resolution=resolution)
-        complex_proj = self.geocode(burst_rep, slc_complex * np.exp(-1j * phase), basedir=basedir, resolution=resolution)
+        complex_proj = self.geocode(workdir, burst_rep, slc_complex * np.exp(-1j * phase), basedir=basedir, resolution=resolution)
         # unify the order of dimensions
         complex_proj = complex_proj.transpose('y', 'x')
         del phase, slc_complex
@@ -220,7 +219,7 @@ class S1_transform(S1_topo):
         # use transfrom coordinates
         data_proj = data_proj.drop_vars(['x','y'])
         data_proj.to_zarr(
-            store=os.path.join(self.workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
+            store=os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
             encoding=encoding_vars,
             mode='w',
             consolidated=True

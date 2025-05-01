@@ -18,7 +18,7 @@ class S1_slc(S1_base):
     pattern_burst: str = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
     pattern_orbit: str = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
 
-    def __init__(self, datadir: str, workdir: str|None=None, DEM: str|xr.DataArray|xr.Dataset|None=None, drop_if_exists: bool=False):
+    def __init__(self, datadir: str, DEM: str|xr.DataArray|xr.Dataset|None=None):
         """
         Scans the specified directory for Sentinel-1 SLC (Single Look Complex) data and filters it based on the provided parameters.
     
@@ -26,12 +26,8 @@ class S1_slc(S1_base):
         ----------
         datadir : str
             The directory containing the data files.
-        workdir : str, optional
-            The directory to store the processed data.
         DEMfilename : str, optional
             The filename of the DEM file.
-        drop_if_exists : bool, optional
-            If True, delete the existing files in the work directory.
         
         Returns
         -------
@@ -44,7 +40,6 @@ class S1_slc(S1_base):
             If the bursts contain inconsistencies, such as mismatched .tiff and .xml files, or if invalid filter parameters are provided.
         """
         import os
-        import shutil
         from glob import glob
         import pandas as pd
         import geopandas as gpd
@@ -53,19 +48,8 @@ class S1_slc(S1_base):
         from datetime import datetime
         from dateutil.relativedelta import relativedelta
         oneday = relativedelta(days=1)
-
-        if workdir is not None:
-            # (re)create workdir only when force=True
-            if os.path.exists(workdir):
-                if drop_if_exists:
-                    shutil.rmtree(workdir, ignore_errors=True)
-                else:
-                    #raise ValueError('ERROR: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
-                    print('WARNING: The base directory already exists. Use drop_if_exists=True to delete it and start new processing.')
-            os.makedirs(workdir, exist_ok=True)
         
         self.datadir = datadir
-        self.workdir = workdir
         self.DEM = DEM
 
         orbits = glob(self.pattern_orbit, root_dir=self.datadir)
@@ -121,8 +105,8 @@ class S1_slc(S1_base):
         df = pd.DataFrame(records)
         assert len(df), f'Bursts not found'
         df = gpd.GeoDataFrame(df, geometry='geometry')\
-            .sort_values(by=['fullBurstID','burst'])\
-            .set_index(['fullBurstID','burst'])
+            .sort_values(by=['fullBurstID','polarization','burst'])\
+            .set_index(['fullBurstID','polarization','burst'])
 
         path_numbers = df.pathNumber.unique().tolist()
         min_dates = [str(df[df.pathNumber==path].startTime.dt.date.min()) for path in path_numbers]
