@@ -393,9 +393,9 @@ class Stack(Stack_plot):
                 #print ('fullBurstID', fullBurstID)
                 df = urls[urls.index.get_level_values(0) == fullBurstID]
                 bases = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
-                #print ('fullBurstID', fullBurstID, '=>', 'bases', bases)
+                #print ('fullBurstID', fullBurstID, '=>', bases)
                 base = df[df.index.get_level_values(1) == 'transform'].iloc[:,0].values[0]
-                #print ('fullBurstID', fullBurstID, '=>', 'base', base)
+                #print ('fullBurstID', fullBurstID, '=>', base)
                 bursts = xr.open_mfdataset(
                     bases,
                     engine='zarr',

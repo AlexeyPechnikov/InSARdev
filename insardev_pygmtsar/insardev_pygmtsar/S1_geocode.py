@@ -14,22 +14,16 @@ class S1_geocode(S1_align):
     import xarray as xr
     import numpy as np
 
-    def geocode(self, workdir: str, burst: str, data: xr.DataArray, basedir: str, resolution: tuple[int, int]) -> xr.DataArray:
+    def geocode(self, transform: xr.Dataset, data: xr.DataArray) -> xr.DataArray:
         """
         Perform geocoding from radar to projected coordinates.
 
         Parameters
         ----------
-        workdir : str
-            The work directory.
-        burst : str
-            The burst name.
+        transform : xarray.Dataset
+            The transform matrix.
         data : xarray.DataArray
             Grid(s) representing the interferogram(s) in radar coordinates.
-        basedir : str
-            The base directory.
-        resolution : tuple[int, int]
-            The resolution in the azimuth and range direction.
 
         Returns
         -------
@@ -86,7 +80,6 @@ class S1_geocode(S1_align):
             del coord_a, coord_r, points, values
             return grid_proj
 
-        transform = self.get_transform(workdir, burst, resolution)
         out = da.blockwise(
             trans_block,
             'yx',
@@ -96,8 +89,7 @@ class S1_geocode(S1_align):
         )
 
         da = xr.DataArray(out, transform.ele.coords).rename(data.name)
-        transform.close()
-        del out, transform
+        del out
         return da
 
     @staticmethod
@@ -118,7 +110,7 @@ class S1_geocode(S1_align):
         del transformer, from_crs, to_crs
         return ys_new, xs_new
 
-    def get_transform(self, workdir: str, burst: str, resolution: tuple[int, int]) -> xr.Dataset:
+    def get_transform(self, outdir: str, burst: str) -> xr.Dataset:
         """
         Retrieve the transform data.
 
@@ -142,9 +134,9 @@ class S1_geocode(S1_align):
         """
         import xarray as xr
         import os
-        ds = xr.open_zarr(store=os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst), 'transform'),
-                            consolidated=True,
-                            chunks='auto')
+        ds = xr.open_zarr(store=os.path.join(outdir, 'transform'),
+                         consolidated=True,
+                         chunks='auto')
         # variables are stored as int32, convert to float32 instead of default float64
         for v in ('azi','rng','ele'):
             ds[v] = ds[v].astype('float32')
@@ -153,7 +145,7 @@ class S1_geocode(S1_align):
         #.dropna(dim='x', how='all')
 
     def compute_transform(self,
-                          workdir: str,
+                          outdir: str,
                           burst_ref: str,
                           basedir: str,
                           resolution: tuple[int, int]=(10, 2.5),
@@ -403,7 +395,7 @@ class S1_geocode(S1_align):
         encoding_coords = {coord: self.get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
         #print ('encoding_coords', encoding_coords)
         trans.to_zarr(
-            store=os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_ref), 'transform'),
+            store=os.path.join(outdir, 'transform'),
             encoding=encoding_vars | encoding_coords,
             mode='w',
             consolidated=True

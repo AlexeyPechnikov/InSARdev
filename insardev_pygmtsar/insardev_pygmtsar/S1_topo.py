@@ -12,7 +12,7 @@ from .S1_geocode import S1_geocode
 class S1_topo(S1_geocode):
     import xarray as xr
 
-    def topo_phase(self, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int]) -> xr.DataArray:
+    def flat_earth_topo_phase(self, topo: xr.DataArray, burst_rep: str, burst_ref: str, basedir: str) -> xr.DataArray:
         """
         np.arctan2(np.sin(topo_phase), np.cos(topo_phase))[0].plot.imshow()
         """
@@ -137,16 +137,14 @@ class S1_topo(S1_geocode):
             prm_rep.set(prm_ref.SAT_baseline(prm_rep, tail=9)).fix_aligned()
             prm_ref.set(prm_ref.SAT_baseline(prm_ref).sel('SC_height','SC_height_start','SC_height_end')).fix_aligned()
             return (prm_ref, prm_rep)
-
-        #topo = self.get_topo(burst_ref, resolution)
-        topo = self.get_topo(burst_ref, basedir, resolution)
+        
         prms = prepare_prms(burst_rep, burst_ref)
         # fill NaNs by 0 and expand to 3d
-        topo2d = da.where(da.isnan(topo.data), 0, topo.data)
+        topo_dask = da.where(da.isnan(topo.data), 0, topo.data)
         out = da.blockwise(
             block_phase_dask,
             'yx',
-            topo2d, 'yx',
+            topo_dask, 'yx',
             topo.a, 'y',
             topo.r, 'x',
             prm1=prms[0],
@@ -154,14 +152,13 @@ class S1_topo(S1_geocode):
             #dtype=np.complex64
             dtype=np.float32
         )
-        del topo2d, prms
+        del topo_dask, prms
 
         topo_phase = xr.DataArray(out, topo.coords).where(da.isfinite(topo)).rename('phase')
-        topo.close()
-        del out, topo
+        del out
         return topo_phase
 
-    def get_topo(self, burst, basedir: str, resolution: tuple[int, int]):
+    def get_topo(self, burst, basedir: str):
         """
         Retrieve the inverse transform data.
 
@@ -189,7 +186,7 @@ class S1_topo(S1_geocode):
                             consolidated=True,
                             chunks="auto")['topo']
 
-    def compute_topo(self, workdir: str, burst_ref: str, basedir: str, resolution: tuple[int, int]):
+    def compute_topo(self, workdir: str, transform: xr.Dataset, burst_ref: str, basedir: str):
         """
         Retrieve or calculate the transform data. This transform data is then saved as
             a NetCDF file for future use.
@@ -291,8 +288,6 @@ class S1_topo(S1_geocode):
             # pack all the outputs into one 3D array
             return np.asarray([grid_ele]).reshape((1, azis.size, rngs.size))
 
-        # transformation matrix
-        transform = self.get_transform(workdir, burst_ref, resolution)
         # calculate indices on the fly
         trans_blocks = transform[['azi', 'rng']].coarsen(y=self.chunksize, x=self.chunksize, boundary='pad')
         #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
@@ -354,4 +349,4 @@ class S1_topo(S1_geocode):
             mode='w',
             consolidated=True
         )
-        del topo, transform
+        del topo

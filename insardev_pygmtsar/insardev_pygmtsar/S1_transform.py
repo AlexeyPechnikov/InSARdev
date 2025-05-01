@@ -43,6 +43,7 @@ class S1_transform(S1_topo):
                   records: pd.DataFrame|None=None,
                   epsg: str|int|None='auto',
                   resolution: tuple[int, int]=(20, 5),
+                  topo_correction: bool = True,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   debug: bool=False):
@@ -70,22 +71,34 @@ class S1_transform(S1_topo):
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
         def process_refrep(bursts, debug=False):
-            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as basedir:
+            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as tmpdir:             
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
                 # burst format is like ('021_043788_IW1', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
                 burst_refs = bursts[0]
                 burst_reps = bursts[1]
+                # output directory
+                outdir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_refs[0][-1]))
+
                 # prepare reference burst for all polarizations
                 for burst_ref in burst_refs:
                     #print ('burst_ref', burst_ref)
-                    self.align_ref(burst_ref[-1], basedir, debug=debug)
+                    self.align_ref(burst_ref[-1], tmpdir, debug=debug)
                 #print ('compute_transform')
-                self.compute_transform(workdir, burst_refs[0][-1], basedir=basedir, resolution=resolution,
-                                       scale_factor=1/dem_vertical_accuracy, epsg=epsg)
+                # transform is saved in the output directory to be used for the future analysis
+                self.compute_transform(outdir, burst_refs[0][-1], basedir=tmpdir, resolution=resolution, scale_factor=1/dem_vertical_accuracy, epsg=epsg)
+                # transformation matrix
+                transform = self.get_transform(outdir, burst_refs[0][-1])
                 # for topo phase calculation
                 #print ('compute_transform_inverse')
-                self.compute_topo(workdir, burst_refs[0][-1], basedir=basedir, resolution=resolution)
+                
+                if topo_correction:
+                    # topo in radar coordinate saved in the temp directory for the processing time only
+                    self.compute_topo(workdir, transform, burst_refs[0][-1], basedir=tmpdir)
+                    topo = self.get_topo(burst_ref, tmpdir)
+                else:
+                    # topographic phase is not needed when topo correction is not applied
+                    topo = 0
 
                 # use sequential processing as it is well parallelized internally
                 #print ('transform_slc')
@@ -95,32 +108,45 @@ class S1_transform(S1_topo):
                     # align repeat bursts to the reference burst
                     if burst_rep not in burst_refs:
                         #print ('align_rep', burst_rep, '=>', burst_ref)
-                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=basedir, degrees=alignment_spacing, debug=debug)
-                    self.transform_slc_int16(workdir, burst_rep[-1], burst_ref[-1], basedir=basedir, resolution=resolution, epsg=epsg)
+                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=tmpdir, degrees=alignment_spacing, debug=debug)
+                    # processed bursts saved in the output directory to be used for the future analysis
+                    self.transform_slc_int16(outdir, transform, topo, burst_rep[-1], burst_ref[-1], basedir=tmpdir, epsg=epsg)
                 #print ()
-            # consolidate zarr metadata
+
+                # cleanup
+                del topo, transform
+            # consolidate zarr metadata for the bursts directory
             self.consolidate_metadata(workdir, resolution=resolution, burst=burst_rep[-1])
 
-        # Dask cluster client
-        # client = get_client()
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         
-        # Dask cluster client
+        # restart Dask cluster to avoid issues with the previous workers
         client = get_client()
         client.restart(wait_for_workers=True, timeout=60)
         gc.collect()
         for refrep in tqdm(refreps, desc='Transforming SLC'):
-            # process_refrep(refrep, debug=debug)
+            # single worker is used to avoid Dask issues
             joblib.Parallel(n_jobs=1, backend='threading')(
                 [joblib.delayed(process_refrep)(refrep, debug=debug)]
             )
-            # cleanup
+            # cleanup workers and the main process
             client.run(lambda: __import__('gc').collect())
             gc.collect()
+        # consolidate zarr metadata for the resolution directory
+        self.consolidate_metadata(workdir, resolution=resolution)
 
-    def transform_slc_int16(self, workdir: str, burst_rep: str, burst_ref: str, basedir: str, resolution: tuple[int, int], epsg: int, scale: float=2.5e-07):
+    def transform_slc_int16(self,
+                            outdir: str,
+                            transform: xr.Dataset,
+                            topo: xr.DataArray,
+                            burst_rep: str,
+                            burst_ref: str,
+                            basedir: str,
+                            epsg: int,
+                            scale: float=2.5e-07
+                            ):
         """
         Perform geocoding from radar to geographic coordinates.
 
@@ -158,9 +184,11 @@ class S1_transform(S1_topo):
         slc_complex = slc_complex\
                 .where((slc_complex!=0+0j).sum('a') > 0.8 * slc_complex.a.size)\
                 .where((slc_complex!=0+0j).sum('r') > 0.8 * slc_complex.r.size)
+        # compute the topo phase
+        #print ('burst_rep, burst_ref', burst_rep, burst_ref)
+        phase = self.flat_earth_topo_phase(topo, burst_rep, burst_ref, basedir=basedir)
         # reproject as a single complex variable
-        phase = self.topo_phase(burst_rep, burst_ref, basedir=basedir, resolution=resolution)
-        complex_proj = self.geocode(workdir, burst_rep, slc_complex * np.exp(-1j * phase), basedir=basedir, resolution=resolution)
+        complex_proj = self.geocode(transform, slc_complex * np.exp(-1j * phase))
         # unify the order of dimensions
         complex_proj = complex_proj.transpose('y', 'x')
         del phase, slc_complex
@@ -219,7 +247,7 @@ class S1_transform(S1_topo):
         # use transfrom coordinates
         data_proj = data_proj.drop_vars(['x','y'])
         data_proj.to_zarr(
-            store=os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_rep), burst_rep),
+            store=os.path.join(outdir, burst_rep),
             encoding=encoding_vars,
             mode='w',
             consolidated=True
