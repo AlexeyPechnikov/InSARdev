@@ -26,3 +26,5 @@ from .Tiles import Tiles
 from .XYZTiles import XYZTiles
 # managing any type of object instances
 from .MultiInstanceManager import MultiInstanceManager
+# downloading tools
+from .HTTP import download, unzip
