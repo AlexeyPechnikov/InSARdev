@@ -20,7 +20,7 @@ class Stack(Stack_plot):
     import zarr
 
     def __repr__(self):
-        return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(self.dss[0].date)} dates"
+        return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(next(iter(self.dss.values())).date)} dates"
 
     def __add__(self, other):
         """
