@@ -16,7 +16,7 @@ class Stack(Stack_plot):
     import pandas as pd
     import xarray as xr
     import geopandas as gpd
-    #import fsspec
+    from zarr.storage._fsspec import FsspecStore
     import zarr
 
     def __repr__(self):
@@ -364,13 +364,21 @@ class Stack(Stack_plot):
             del dss, transform
             return group, ds
 
-        if isinstance(urls, str):
+        if isinstance(urls, str) or isinstance(urls, zarr.storage.ZipStore):
+            desc = 'Loading Dataset' if isinstance(urls, str) else 'Loading Zipped Dataset'
             root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
-            with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset', total=len(list(root.group_keys())))) as progress_bar:
+            with progressbar_joblib.progressbar_joblib(tqdm(desc=desc, total=len(list(root.group_keys())))) as progress_bar:
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
             self.dss = dict(dss)
             del dss
+        # elif isinstance(urls, FsspecStore):
+        #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
+        #     dss = []
+        #     for group in tqdm(list(root.group_keys()), desc='Loading Store'):
+        #         dss.append(store_open_group(root, group))
+        #     self.dss = dict(dss)
+        #     del dss
         elif isinstance(urls, list) or isinstance(urls, pd.DataFrame):
             # load bursts and transform specified by URLs
             # this allows to load from multiple locations with precise control of the data
