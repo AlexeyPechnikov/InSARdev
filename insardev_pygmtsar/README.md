@@ -1,4 +1,20 @@
-## InSAR.dev Professional
+# insardev_pygmtsar
 
-This is a proof of concept and it works. The complete bursts are available and while in the example bursts averaged for overlapped areas, we can use the overlaps to calculate inter-bursts interferograms and detect bursts phase offsets for precise phase shift between them. Different orbital path bursts can be merged as well and we can create continuous interferograms covering more than common 3 Sentinel-1 subswaths. Ascending and descending interferograms are calculated in the same coordinates and no computational expensive data interpolation is needed with accuracy lost. The projected coordinate system can be selected to cover large areas like the whole USA without reprojecting related precision degradation. Geocoded corrected SLC resolution is user-specified and can be selected as 10x2.5 meters for mountain areas or 15x5 for flat areas (by default). Furthermore, the corrected SLCs are 2 times smaller than the original ones! That seems fantastic but we have so many benefits without downsides.
+GMTSAR-based Sentinel-1 SLC preprocessing for the InSAR.dev ecosystem.
 
+## License
+
+See [LICENSE](./LICENSE) for full terms.  
+
+## No Warranty
+
+This software is provided “as is”, without warranty of any kind, express or implied,  
+including but not limited to the warranties of merchantability, fitness for a particular  
+purpose, and non-infringement. In no event shall the authors or copyright holders be  
+liable for any claim, damages or other liability, whether in an action of contract, tort  
+or otherwise, arising from, out of or in connection with the software or the use or other  
+dealings in the software.
+
+## Support
+
+Official support and priority issue handling are available exclusively to **InSAR.dev Professional** members on [Patreon](https://www.patreon.com/pechnikov/).
