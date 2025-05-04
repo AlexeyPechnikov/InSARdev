@@ -127,7 +127,15 @@ class S1_base(progressbar_joblib, datagrid):
         for rec in recs_rep.itertuples():
             reps_dict.setdefault(rec.Index[0], []).append(rec.Index)
 
-        return {key: (refs_dict[key], reps_dict[key]) for key in refs_dict}
+        for key in refs_dict:
+            if key not in reps_dict:
+                print (f'NOTE: {key} has no repeat bursts, ignore.')
+        for key in reps_dict:
+            if key not in refs_dict:
+                print (f'NOTE: {key} has no reference bursts, ignore.')
+
+        # return only pairs with both reference and repeat bursts
+        return {key: (refs_dict[key], reps_dict[key]) for key in refs_dict if key in reps_dict}
 
     def julian_to_datetime(self, julian_timestamp: float) -> pd.Timestamp:
         """

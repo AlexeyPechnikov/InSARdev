@@ -46,6 +46,7 @@ setup(
                       'geopandas',
                       'distributed>=2024.1.0',
                       'dask[complete]>=2024.4.1',
+                      'zarr',
                       'joblib',
                       'tqdm',
                       'ipywidgets',

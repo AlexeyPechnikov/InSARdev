@@ -50,6 +50,7 @@ setup(
                       'geopandas',
                       'distributed',
                       'dask[complete]',
+                      'zarr',
                       'scipy',
                       'xgboost',
                       'cffi',
