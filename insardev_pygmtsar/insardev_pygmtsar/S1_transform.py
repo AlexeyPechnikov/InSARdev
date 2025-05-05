@@ -46,6 +46,7 @@ class S1_transform(S1_topo):
                   topo_correction: bool = True,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
+                  overwrite: bool=False,
                   debug: bool=False):
         import dask
         from tqdm.auto import tqdm
@@ -54,6 +55,7 @@ class S1_transform(S1_topo):
         import tempfile
         from distributed import get_client
         import gc
+        import shutil
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -70,7 +72,12 @@ class S1_transform(S1_topo):
             epsg = epsgs[0]
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
-        def process_refrep(bursts, debug=False):
+        # remove the directory if needed
+        rootdir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}')
+        if overwrite and os.path.exists(rootdir):
+            shutil.rmtree(rootdir)
+
+        def process_refrep(bursts, rootdir, debug=False):
             with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as tmpdir:             
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
@@ -78,7 +85,21 @@ class S1_transform(S1_topo):
                 burst_refs = bursts[0]
                 burst_reps = bursts[1]
                 # output directory
-                outdir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}', self.fullBurstId(burst_refs[0][-1]))
+                fullBurstId = self.fullBurstId(burst_refs[0][-1])
+                outdir = os.path.join(rootdir, fullBurstId)
+
+                # check if the directory is already exists and processing completed
+                # consolidated metadata file zarr.json is saved at the end of the processing
+                metafile = os.path.join(outdir, 'zarr.json')
+                if True \
+                    and os.path.exists(outdir) \
+                    and os.path.isdir(outdir) \
+                    and os.path.exists(metafile) \
+                    and os.path.isfile(metafile) \
+                    and os.path.getsize(metafile) > 0:
+                    if debug:
+                        print(f'NOTE: {fullBurstId} directory already exists and processing completed. Skipping...')
+                    return
 
                 # prepare reference burst for all polarizations
                 for burst_ref in burst_refs:
@@ -129,7 +150,7 @@ class S1_transform(S1_topo):
         for refrep in tqdm(refreps, desc='Transforming SLC'):
             # single worker is used to avoid Dask issues
             joblib.Parallel(n_jobs=1, backend='threading')(
-                [joblib.delayed(process_refrep)(refrep, debug=debug)]
+                [joblib.delayed(process_refrep)(refrep, rootdir, debug=debug)]
             )
             # cleanup workers and the main process
             client.run(lambda: __import__('gc').collect())
