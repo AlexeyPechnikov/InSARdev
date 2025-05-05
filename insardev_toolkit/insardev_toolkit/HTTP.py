@@ -87,13 +87,16 @@ class HTTPRangeReader(io.RawIOBase):
         self.bar.close()
         return super().close()
 
-def unzip(url: str, target_dir: str, buffer_size: int = 4 << 20):
+def unzip(url: str, target_dir: str|None = None, buffer_size: int = 4 << 20):
     """
     Stream-download unpacking remote ZIP content via HTTP Range requests.
     Skips already-extracted files (filling the bar by the compressed size).
     Works well with large files on Zenodo not hummering the server.
     """
-    target_dir = os.path.expanduser(target_dir)
+    if target_dir is None:
+        target_dir = os.path.basename(url).split('.')[0]
+    else:
+        target_dir = os.path.expanduser(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
     raw = HTTPRangeReader(url)
