@@ -157,7 +157,7 @@ class Tiles(datagrid, progressbar_joblib):
                 raise Exception(f'ERROR:: unknown tiles file type {filetype}. Expected "netcdf" or "geotif".')
         except requests.exceptions.RequestException as e:
             # offshore tiles are missed by design
-            print(f'Request error for {tile_id}: {e}')
+            print (f'NOTE: Tile not found, skip it: {tile_url}')
             tile = None
         except Exception as e:
             print(e)
