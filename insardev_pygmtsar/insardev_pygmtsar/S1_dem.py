@@ -125,5 +125,6 @@ class S1_dem(S1_tidal):
 
         # heights correction
         geoid = self.get_geoid(ortho)
-        ds = (ortho + geoid).astype(np.float32).transpose('lat','lon').rename("dem")
+        # suppose missed values are water surface
+        ds = (ortho.fillna(0) + geoid).astype(np.float32).transpose('lat','lon').rename("dem")
         return self.spatial_ref(ds, 4326)
