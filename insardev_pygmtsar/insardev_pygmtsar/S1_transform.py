@@ -14,31 +14,29 @@ class S1_transform(S1_topo):
     import xarray as xr
     import numpy as np
 
-    def consolidate_metadata(self, workdir: str, resolution: tuple[int, int]=(20, 5), burst: str=None):
+    def consolidate_metadata(self, target: str, resolution: tuple[int, int]=(20, 5), burst: str=None):
         """
         Consolidate metadata for a given resolution and burst.
 
         Parameters
         ----------
-        workdir : str
-            The work directory.
-        resolution : tuple[int, int]
-            The resolution to use.
+        target : str
+            The output directory where the results are saved.
         burst : str
             The burst to use.
         """
         import zarr
         import os
-        root_dir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}')
+        root_dir = target
         if burst:
-            root_dir = os.path.join(root_dir, self.fullBurstId(burst))
+            root_dir = os.path.join(target, self.fullBurstId(burst))
         #print ('root_dir', root_dir)
         root_store = zarr.storage.LocalStore(root_dir)
         root_group = zarr.group(store=root_store, overwrite=False)
         zarr.consolidate_metadata(root_store)
 
     def transform(self,
-                  workdir: str,
+                  target: str,
                   ref: str,
                   records: pd.DataFrame|None=None,
                   epsg: str|int|None='auto',
@@ -47,7 +45,40 @@ class S1_transform(S1_topo):
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
+                  append: bool=False,
                   debug: bool=False):
+        """
+        Transform SLC data to geographic coordinates.
+
+        Parameters
+        ----------
+        target : str
+            The output directory where the results are saved.
+        ref : str
+            The reference burst data. For multi-path processing only the path with this data is processed.
+        records : pd.DataFrame, optional
+            The records to use. By default, all records are used.
+        epsg : str|int|None, optional
+            The EPSG code to use for the output data. By default, the EPSG code is computed automatically for each burst.
+        resolution : tuple[int, int], optional
+            The resolution to use in meters per pixel in the projected coordinate system.
+        topo_correction : bool, optional
+            Apply topographic correction to the SLC data for future interferometric processing.
+        dem_vertical_accuracy : float, optional
+            The DEM vertical accuracy in meters.
+        alignment_spacing : float, optional
+            The alignment spacing in decimal degrees.
+        overwrite : bool, optional
+            Overwrite existing results and process all bursts. 
+        append : bool, optional
+            Append new burstID processed with the same parameters to the existing results.
+        debug : bool, optional
+            Whether to print debug information.
+
+        Notes
+        -----
+        The processing is parallelized internally using Dask. GMTSAR files are saved in the temp directory.
+        """
         import dask
         from tqdm.auto import tqdm
         import joblib
@@ -72,12 +103,27 @@ class S1_transform(S1_topo):
             epsg = epsgs[0]
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
-        # remove the directory if needed
-        rootdir = os.path.join(workdir, f'{resolution[0]}x{resolution[1]}')
-        if overwrite and os.path.exists(rootdir):
-            shutil.rmtree(rootdir)
+        # add asserts for the obvious expectations
+        assert os.path.isdir(target), f'ERROR: target exists but is not a directory'
+        if overwrite and os.path.exists(target):
+            # remove all previous results and process all bursts
+            print(f'NOTE: Removing all previous results and processing all bursts.')
+            shutil.rmtree(target)
+        # consolidated metadata file zarr.json is saved at the end of the processing
+        metafile = os.path.join(target, 'zarr.json')
+        assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: target metadata is not a file'
+        # check if the processing is completed
+        if not os.path.exists(metafile) or os.path.getsize(metafile) == 0:
+            print(f'NOTE: target processing is not completed before. Continuing...')
+        elif not append:
+            # processing is completed before, nothing to do
+            print(f'NOTE: target processing is completed before. Skipping...')
+            return
+        # remove the consolidated metadata file when appending
+        if os.path.exists(metafile):
+            os.remove(metafile)
 
-        def process_refrep(bursts, rootdir, debug=False):
+        def process_refrep(bursts, target, debug=False):
             with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as tmpdir:             
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
@@ -86,20 +132,25 @@ class S1_transform(S1_topo):
                 burst_reps = bursts[1]
                 # output directory
                 fullBurstId = self.fullBurstId(burst_refs[0][-1])
-                outdir = os.path.join(rootdir, fullBurstId)
-
+                outdir = os.path.join(target, fullBurstId)
                 # check if the directory is already exists and processing completed
                 # consolidated metadata file zarr.json is saved at the end of the processing
                 metafile = os.path.join(outdir, 'zarr.json')
-                if True \
-                    and os.path.exists(outdir) \
-                    and os.path.isdir(outdir) \
-                    and os.path.exists(metafile) \
-                    and os.path.isfile(metafile) \
-                    and os.path.getsize(metafile) > 0:
-                    if debug:
-                        print(f'NOTE: {fullBurstId} directory already exists and processing completed. Skipping...')
-                    return
+
+                # check the specific case when the directory exists and the processing is performed before, completed or not
+                if os.path.exists(outdir):
+                    # add asserts for the obvious expectations
+                    assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
+                    assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: {fullBurstId} metadata is not a file'
+                    # check if the processing is completed
+                    if os.path.exists(metafile) and os.path.getsize(metafile) > 0:
+                        # file exists and is not empty, the burstID successfully processed before
+                        return
+                    else:
+                        # remove the directory when the consolidated metadata file is missing
+                        # processing is not completed before, data are corrupted
+                        print(f'NOTE: {fullBurstId} directory exists but consolidated metadata file is missing. Removing...')
+                        shutil.rmtree(outdir)
 
                 # prepare reference burst for all polarizations
                 for burst_ref in burst_refs:
@@ -115,7 +166,7 @@ class S1_transform(S1_topo):
                 
                 if topo_correction:
                     # topo in radar coordinate saved in the temp directory for the processing time only
-                    self.compute_topo(workdir, transform, burst_refs[0][-1], basedir=tmpdir)
+                    self.compute_topo(target, transform, burst_refs[0][-1], basedir=tmpdir)
                     topo = self.get_topo(burst_ref, tmpdir)
                 else:
                     # topographic phase is not needed when topo correction is not applied
@@ -137,7 +188,7 @@ class S1_transform(S1_topo):
                 # cleanup
                 del topo, transform
             # consolidate zarr metadata for the bursts directory
-            self.consolidate_metadata(workdir, resolution=resolution, burst=burst_rep[-1])
+            self.consolidate_metadata(target, burst=burst_rep[-1])
 
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
@@ -150,13 +201,13 @@ class S1_transform(S1_topo):
         for refrep in tqdm(refreps, desc='Transforming SLC'):
             # single worker is used to avoid Dask issues
             joblib.Parallel(n_jobs=1, backend='threading')(
-                [joblib.delayed(process_refrep)(refrep, rootdir, debug=debug)]
+                [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
             )
             # cleanup workers and the main process
             client.run(lambda: __import__('gc').collect())
             gc.collect()
         # consolidate zarr metadata for the resolution directory
-        self.consolidate_metadata(workdir, resolution=resolution)
+        self.consolidate_metadata(target, resolution=resolution)
 
     def transform_slc_int16(self,
                             outdir: str,
