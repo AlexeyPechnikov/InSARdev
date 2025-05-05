@@ -17,6 +17,50 @@ class Stack_plot(Stack_export):
     import pandas as pd
     import matplotlib
 
+    def plot(self, records:pd.DataFrame|None=None, cmap='turbo', alpha=1):
+        import pandas as pd
+        import matplotlib
+        import matplotlib.pyplot as plt
+        from matplotlib import patheffects
+
+        if records is None:
+            records = self.to_dataframe()
+
+        df = records.reset_index()
+        df['date'] = df['startTime'].dt.date
+
+        df['label'] = df.apply(lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} {rec['date']} [{rec['pathNumber']}]", axis=1)
+        unique_labels = sorted(df['label'].unique())
+        unique_paths = sorted(df['pathNumber'].astype(str).unique())
+        #colors = {label[-4:-1]: 'orange' if label[0] == 'A' else 'cyan' for i, label in enumerate(unique_labels)}
+        n = len(unique_labels)
+        colormap = matplotlib.cm.get_cmap(cmap, n)
+        color_map = {label[-4:-1]: colormap(i) for i, label in enumerate(unique_labels)}
+        fig, ax = plt.subplots(figsize=(10, 8))
+        for label, group in df.groupby('label'):
+            group.plot(ax=ax, edgecolor=color_map[label[-4:-1]], facecolor='none', lw=0.25, label=label)
+        handles = [matplotlib.lines.Line2D([0], [0], color=color_map[label[-4:-1]], lw=1, label=label) for label in unique_labels]
+        ax.legend(handles=handles, loc='upper right')
+
+        col = df.columns[0]
+        for _, row in df.iterrows():
+            # compute centroid
+            x, y = row.geometry.centroid.coords[0]
+            ax.annotate(
+                str(row[col]),
+                xy=(x, y),
+                xytext=(0, 0),
+                textcoords='offset points',
+                ha='center', va='bottom',
+                color=color_map[row['label'][-4:-1]],
+                path_effects=[patheffects.withStroke(linewidth=1.5, foreground='black')],
+                alpha=alpha
+            )
+
+        ax.set_title('Sentinel-1 Burst Footprints')
+        ax.set_xlabel('easting [m]')
+        ax.set_ylabel('northing [m]')
+
     def plot_dataset(self,
                      data: xr.Dataset | xr.DataArray,
                      polarizations: list[str] | tuple[str] | str | None,
