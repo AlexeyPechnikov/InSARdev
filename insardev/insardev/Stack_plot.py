@@ -135,7 +135,7 @@ class Stack_plot(Stack_export):
                 minmax = max(abs(_vmin), _vmax)
                 _vmin = -minmax
                 _vmax =  minmax
-
+            
             # multi-plots ineffective for linked lazy data
             fg = (self.wrap(da) if wrap else da).rename(caption)\
                 .plot.imshow(
@@ -177,21 +177,21 @@ class Stack_plot(Stack_export):
         data_los_mm = self.los_displacement_mm(data)
         return self.plot_dataset(data_los_mm, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size)
 
     def plot_displacement(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Displacement, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
         return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size)
 
     def plot_phase(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,
                    caption='Phase, [rad]', cols=4, rows=4, size=4, nbins=5, aspect=1.2, y=1.05, _size=None):
         return self.plot_dataset(data, polarizations,
                         cmap=cmap, vmin=vmin, vmax=vmax, quantile=quantile, symmetrical=symmetrical,
-                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=True, _size=_size)
+                        caption=caption, cols=cols, rows=rows, size=size, nbins=nbins, aspect=aspect, y=y, wrap=False, _size=_size)
 
     def plot_interferogram(self, data, polarizations=None,
                            cmap='gist_rainbow_r',
