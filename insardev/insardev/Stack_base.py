@@ -13,6 +13,158 @@ from .dataset import dataset
 
 class Stack_base(progressbar_joblib, dataset):
 
+    def checkout(self, *args, name: str | None = None, n_jobs: int = -1, compat: bool = True, interleave: bool = False):
+        self.save(*args, name=name, n_jobs=n_jobs, compat=compat, interleave=interleave)
+        return self.open(name=name, n_jobs=n_jobs, compat=compat, interleave=interleave)
+
+    def save(self, *args, name: str | None = None, caption: str | None = 'Saving...', n_jobs: int = -1, compat: bool = True, interleave: bool = False):
+        """
+        Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
+
+        Parameters
+        ----------
+        *args : xr.Dataset or dict[str, xr.Dataset]
+            Multiple datasets to save. Can be:
+            - Individual xarray.Datasets
+            - Dictionary of xarray.Datasets
+            - List of xarray.Datasets
+        name : str, optional
+            base name for the store directory.
+        compat : bool, optional
+            If True, automatically pack datasets saved as a list or a single dataset into a dictionary.
+            If False, only allow a dictionary of datasets. Default is True.
+        n_jobs : int, optional
+            Number of parallel jobs to use for saving. Default is -1 (use all available cores).
+        Notes
+        -----
+        This implementation is slightly inaccurate since some data processing occurs outside 
+        the progressbar section.
+        """
+        import xarray as xr
+        import dask
+        import zarr
+        import os
+        import shutil
+        import joblib
+        from tqdm.auto import tqdm
+
+        if name is None:
+            raise ValueError('name is required')
+        store_path = f'{name}.zarr'
+
+        # remove any existing store
+        if os.path.exists(store_path):
+            shutil.rmtree(store_path)
+
+        # process all arguments into a single dictionary
+        datas = {}
+        if interleave:
+            if len(args) == 2 and (isinstance(args[0], dict) or isinstance(args[1], dict)):
+                for (k0, v0), (k1, v1) in zip(args[0].items(), args[1].items()):
+                    datas[f'i0_{k0}'] = v0
+                    datas[f'i1_{k1}'] = v1
+            elif len(args) == 2 and (isinstance(args[0], xr.Dataset) and isinstance(args[1], xr.Dataset)):
+                datas['i0_default'] = args[0]
+                datas['i1_default'] = args[1]
+            else:
+                raise ValueError('Arguments must be two xarray.Datasets or dictionaries of xarray.Datasets when interleave is True')
+        elif compat and len(args) == 1 and isinstance(args[0], xr.Dataset):
+            datas = {'default': args[0]}
+        else:
+            for i, arg in enumerate(args):
+                if isinstance(arg, xr.Dataset):
+                    if not compat:
+                        raise ValueError('Arguments must be dictionaries of xarray.Datasets when compat is False')
+                    datas[f'default_{i}'] = arg
+                elif isinstance(arg, dict):
+                    datas.update(arg)
+                else:
+                    raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
+
+        def _save_grp(grp, ds):
+            # silently drop problematic attributes
+            ds_clean = ds.copy()
+            for v in ds_clean.data_vars:
+                ds_clean[v].attrs.pop('grid_mapping', None)
+            # save to subdirectory
+            ds_clean.to_zarr(
+                store=f'{store_path}/{grp}',
+                mode='w',
+                consolidated=True,
+                zarr_format=3
+            )
+
+        with self.progressbar_joblib(tqdm(desc='Saving...'.ljust(25), total=len(datas))) as progress_bar:
+            joblib.Parallel(n_jobs=n_jobs, backend='threading')(joblib.delayed(_save_grp) (grp, ds) for grp, ds in datas.items())
+
+        # consolidate metadata for the whole store
+        root_store = zarr.storage.LocalStore(store_path)
+        root_group = zarr.group(store=root_store, zarr_format=3, overwrite=False)
+        zarr.consolidate_metadata(root_store, zarr_format=3)
+        del datas
+
+    def open(self, name: str, n_jobs: int = -1, compat: bool = True, interleave: bool = False):
+        """
+        Load a Zarr store created by save(...).
+
+        Parameters
+        ----------
+        name : str
+            Base name of the store (directory '<name>.zarr').
+        compat : bool, optional
+            If True, automatically unpack datasets saved as a list or a single dataset.
+            If False, return a dictionary of datasets. Default is True.
+
+        Returns
+        -------
+        Stack
+        """
+        import os
+        import zarr
+        import xarray as xr
+        import joblib
+        from tqdm.auto import tqdm
+
+        store_path = f'{name}.zarr'
+        if not os.path.isdir(store_path):
+            raise FileNotFoundError(f'No such Zarr store: {store_path!r}')
+
+        # open store
+        # store = zarr.storage.LocalStore(store_path)
+        # root = zarr.open_consolidated(store)
+        # dss = {grp: xr.open_zarr(store, group=grp) for grp in root.group_keys()}
+
+        store = zarr.storage.LocalStore(store_path)
+        root = zarr.open_consolidated(store)
+        groups = list(root.group_keys())
+        print(len(groups))
+
+        def _load_grp(grp):
+            #ds = xr.open_zarr(store, group=grp, consolidated=True, zarr_format=3)
+            ds = xr.open_zarr(f'{store_path}/{grp}', consolidated=True, zarr_format=3)
+            return grp, ds
+        with self.progressbar_joblib(tqdm(desc='Opening...'.ljust(25), total=len(groups))) as progress_bar:
+            results = joblib.Parallel(n_jobs=n_jobs, backend='threading')(joblib.delayed(_load_grp) (grp) for grp in groups)
+        dss = dict(results)
+        del results
+
+        if interleave:
+            # unpack interleaved datasets
+            if len(dss) == 2 and 'i0_default' in dss and 'i1_default' in dss:
+                # special case for two datasets
+                return dss['i0_default'], dss['i1_default']
+            dss0 = {k[len('i0_'):]: v for k, v in dss.items() if k.startswith('i0_')}
+            dss1 = {k[len('i1_'):]: v for k, v in dss.items() if k.startswith('i1_')}
+            return dss0, dss1
+        elif compat and len(dss) == 1 and 'default' in dss:
+            # unpack single dataset
+            return dss['default']
+        elif compat and 'default_0' in dss:
+            # default_0, default_1, etc. means that the datasets were saved as a list, unpack them
+            return [dss[f'default_{i}'] for i in range(len(dss))]
+
+        return dss
+
     def get_pairs(self, pairs, dates=False):
         """
         Get pairs as DataFrame and optionally dates array.
