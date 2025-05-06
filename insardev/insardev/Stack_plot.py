@@ -101,7 +101,7 @@ class Stack_plot(Stack_export):
                 data = list(data.values())
 
             if isinstance(data, xr.Dataset):
-                stackvar = list(data.dims)[0]
+                stackvar = list(data[polarization].dims)[0]
                 da = data[polarization].isel({stackvar: slice(0, rows)})
             else:
                 stackvar = list(data[0].dims)[0]
