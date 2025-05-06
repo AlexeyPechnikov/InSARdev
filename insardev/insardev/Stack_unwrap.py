@@ -579,7 +579,8 @@ class Stack_unwrap(Stack_unwrap_snaphu):
             for pol in polarizations:
                 unwrap, comp = self._unwrap_snaphu(phase=data[pol],
                                                 weight=weight[pol] if weight is not None else None,
-                                                conncomp=conncomp)
+                                                conncomp=conncomp,
+                                                conf=conf)
                 unwraps.append(unwrap)
                 comps.append(comp)
             unwraps = xr.merge(unwraps).assign_attrs(id=ids[idx])
