@@ -136,6 +136,7 @@ class S1_geocode(S1_align):
         import os
         ds = xr.open_zarr(store=os.path.join(outdir, 'transform'),
                          consolidated=True,
+                          zarr_format=3,
                          chunks='auto')
         # variables are stored as int32, convert to float32 instead of default float64
         for v in ('azi','rng','ele'):
@@ -394,10 +395,11 @@ class S1_geocode(S1_align):
         #print ('encoding_vars', encoding_vars)
         encoding_coords = {coord: self.get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
         #print ('encoding_coords', encoding_coords)
-        trans.to_zarr(
+        trans.chunk(self.zarr_chunksize).to_zarr(
             store=os.path.join(outdir, 'transform'),
             encoding=encoding_vars | encoding_coords,
             mode='w',
+            zarr_format=3,
             consolidated=True
         )
         del trans

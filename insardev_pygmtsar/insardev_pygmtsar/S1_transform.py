@@ -32,7 +32,7 @@ class S1_transform(S1_topo):
             root_dir = os.path.join(target, self.fullBurstId(burst))
         #print ('root_dir', root_dir)
         root_store = zarr.storage.LocalStore(root_dir)
-        root_group = zarr.group(store=root_store, overwrite=False)
+        root_group = zarr.group(store=root_store, zarr_format=3, overwrite=False)
         zarr.consolidate_metadata(root_store)
 
     def transform(self,
@@ -104,7 +104,7 @@ class S1_transform(S1_topo):
             print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
         # add asserts for the obvious expectations
-        assert os.path.isdir(target), f'ERROR: target exists but is not a directory'
+        assert not os.path.exists(target) or os.path.isdir(target), f'ERROR: target exists but is not a directory'
         if overwrite and os.path.exists(target):
             # remove all previous results and process all bursts
             print(f'NOTE: Removing all previous results and processing all bursts.')
@@ -113,12 +113,13 @@ class S1_transform(S1_topo):
         metafile = os.path.join(target, 'zarr.json')
         assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: target metadata is not a file'
         # check if the processing is completed
-        if not os.path.exists(metafile) or os.path.getsize(metafile) == 0:
-            print(f'NOTE: target processing is not completed before. Continuing...')
-        elif not append:
-            # processing is completed before, nothing to do
-            print(f'NOTE: target processing is completed before. Skipping...')
-            return
+        if os.path.exists(target):
+            if not os.path.exists(metafile) or os.path.getsize(metafile) == 0:
+                print(f'NOTE: target processing is not completed before. Continuing...')
+            elif not append:
+                # processing is completed before, nothing to do
+                print(f'NOTE: target processing is completed before. Skipping...')
+                return
         # remove the consolidated metadata file when appending
         if os.path.exists(metafile):
             os.remove(metafile)
@@ -149,7 +150,7 @@ class S1_transform(S1_topo):
                     else:
                         # remove the directory when the consolidated metadata file is missing
                         # processing is not completed before, data are corrupted
-                        print(f'NOTE: {fullBurstId} directory exists but consolidated metadata file is missing. Removing...')
+                        print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
                         shutil.rmtree(outdir)
 
                 # prepare reference burst for all polarizations
@@ -318,10 +319,11 @@ class S1_transform(S1_topo):
         #print ('encoding_vars', encoding_vars)
         # use transfrom coordinates
         data_proj = data_proj.drop_vars(['x','y'])
-        data_proj.to_zarr(
+        data_proj.chunk(self.zarr_chunksize).to_zarr(
             store=os.path.join(outdir, burst_rep),
             encoding=encoding_vars,
             mode='w',
+            zarr_format=3,
             consolidated=True
         )
         slc.close()

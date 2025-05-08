@@ -183,6 +183,7 @@ class S1_topo(S1_geocode):
         import xarray as xr
         import os
         return xr.open_zarr(os.path.join(basedir, 'topo'),
+                             zarr_format=3,
                             consolidated=True,
                             chunks="auto")['topo']
 
@@ -341,12 +342,13 @@ class S1_topo(S1_geocode):
         del trans_inv
         #print ('topo', topo)
 
-        encoding = {'topo': self.get_encoding_zarr()}
+        #encoding = {'topo': self.get_encoding_zarr()}
         #print ('encoding', encoding)
         topo.to_zarr(
             store=os.path.join(basedir, 'topo'),
-            encoding=encoding,
+            #encoding=encoding,
             mode='w',
+            zarr_format=3,
             consolidated=True
         )
         del topo
