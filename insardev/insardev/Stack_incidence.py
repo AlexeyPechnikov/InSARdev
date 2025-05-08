@@ -134,7 +134,7 @@ class Stack_incidence(Stack_sbas):
         if isinstance(data, (list, tuple)):
             return scale*np.asarray(data)
         elif isinstance(data, (xr.DataArray)):
-            return (scale*data).rename('los')
+            return (scale*data)
         else:
             return scale*data
 
