@@ -98,6 +98,8 @@ class PRM_gmtsar:
                              stderr=subprocess.PIPE, pass_fds=[pipe1[0], pipe2[0]],
                              cwd=cwd, encoding='utf8')
         stdout_data, stderr_data = p.communicate()
+        os.close(pipe1[0])
+        os.close(pipe2[0])
         #print ('stdout_data', stdout_data)
         if len(stderr_data) > 0 and debug:
             print ('DEBUG: SAT_baseline', stderr_data)
@@ -189,6 +191,7 @@ class PRM_gmtsar:
                              stderr=subprocess.PIPE, pass_fds=[pipe[0]],
                              cwd=cwd, bufsize=10*1000*1000)
         stdout_data, stderr_data = p.communicate(input=stdin_data)
+        os.close(pipe[0])
 
         stderr_data = stderr_data.decode('utf8', errors='ignore')
         if stderr_data.startswith('interpolation point outside of data constraints'):
@@ -272,6 +275,7 @@ class PRM_gmtsar:
                              stderr=subprocess.PIPE, pass_fds=[pipe[0]],
                              cwd=cwd, bufsize=10*1000*1000)
         stdout_data, stderr_data = p.communicate(input=stdin_data)
+        os.close(pipe[0])
 
         stderr_data = stderr_data.decode('utf8')
         if stderr_data is not None and len(stderr_data) and debug:
