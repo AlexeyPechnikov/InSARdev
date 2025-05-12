@@ -19,6 +19,50 @@ class Stack(Stack_plot):
     from zarr.storage._fsspec import FsspecStore
     import zarr
 
+    @staticmethod
+    def restore(store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1) -> "Stack":
+        """
+        Restore a previously saved Stack from a Zarr store.
+        
+        Parameters
+        ----------
+        store : str or zarr.Store
+            Path (e.g. 'intfs.zarr') or any zarr.Store (DirectoryStore, FsspecStore, …).
+        storage_options : dict, optional
+            Passed through to fsspec if you need retries, timeouts, etc.
+        n_jobs : int, optional
+            Number of parallel jobs to use for saving. Default is -1 (use all available cores).
+        
+        Returns
+        -------
+        Stack
+            A Stack whose .dss is populated from the store.
+
+        Example:
+        ```python
+        # open the dataset
+        stack = Stack('s1-myanmar_2025-earthquake-10x2.5-062')
+        # save the dataset
+        stack.save(stack.dss, store='dump.zarr')
+        # restore the dataset to a new stack
+        stack = Stack.restore('dump.zarr')
+        ``` 
+        """
+        
+        # a new Stack without calling __init__
+        self = Stack.__new__(Stack)
+        # open the data
+        self.dss = self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, compat=False)
+        return self
+
+    # @staticmethod
+    # def set(datas: dict[str, xr.Dataset] ) -> "Stack":
+    #     # a new Stack without calling __init__
+    #     self = Stack.__new__(Stack)
+    #     # set the data
+    #     self.dss = datas
+    #     return self
+
     def __repr__(self):
         return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(next(iter(self.dss.values())).date)} dates"
 
@@ -105,7 +149,9 @@ class Stack(Stack_plot):
             for date_idx, date in enumerate(ds.date.values):
                 processed_attr = {}
                 for attr in attrs[:attr_start_idx+1]:
+                    #NotImplementedError: 'item' is not yet a valid method on dask arrays
                     value = ds[attr].item(date_idx)
+                    #value = ds[attr].values[date_idx]
                     #print (attr, date_idx, date, value)
                     #processed_attr['date'] = date
                     if hasattr(value, 'item'):
@@ -488,8 +534,7 @@ class Stack(Stack_plot):
         import numpy as np
         import dask
 
-        #print ('datas', datas, 'polarizations', polarizations)
-        #print ()
+        #print (type(datas))
         if datas is None:
             datas = self.dss
         elif isinstance(datas, xr.Dataset):
@@ -521,6 +566,8 @@ class Stack(Stack_plot):
         if isinstance(datas[0], xr.Dataset):
             das_total = []
             for pol in polarizations:
+                # TODO: workaround to preserve crs for variables
+                #das = self.to_dataset([ds[pol].rio.set_crs(datas[0].rio.crs) for ds in datas])
                 das = self.to_dataset([ds[pol] for ds in datas])
                 das_total.append(das)
                 del das

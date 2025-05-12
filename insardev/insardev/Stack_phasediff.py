@@ -18,17 +18,15 @@ class Stack_phasediff(Stack_base):
 
     # internal method to compute interferogram on single polarization data array(s)
     def _interferogram(self,
-                       pairs:list[tuple[str,str]]|np.ndarray|pd.DataFrame,
+                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
                        datas:dict[str,xr.DataArray],
                        polarization: str,
                        weight:xr.DataArray|None=None,
                        phase:xr.DataArray|None=None,
-                       resolution:float|None=None,
                        wavelength:float|None=None,
                        gaussian_threshold:float=0.5,
-                       psize:int|list[int,int]|None=None,
-                       coarsen:list[int,int]|None=None,
-                       stack:xr.DataArray|None=None,
+                       multilook:bool=False,
+                       goldstein_window:int|list[int,int]|None=None,
                        compute:bool=False,
                        debug:bool=False
                        ):
@@ -52,22 +50,17 @@ class Stack_phasediff(Stack_base):
 
         assert isinstance(datas, (list, tuple, xr.DataArray)), 'ERROR: datas should be a list or tuple or DataArray'
 
-        # define anti-aliasing filter for the specified output resolution
-        if wavelength is None:
-            wavelength = resolution
+        # wrap simplified single pair argument in a list
+        pairs = pairs if isinstance(pairs[0], (list, tuple)) else [pairs]
 
         if weight is not None:
            # convert to lazy data
            weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
     
-        # Initialize decimators to None by default
-        decimator_intf = None
-        decimator_corr = None
-        
-        # decimate the 1:4 multilooking grids to specified resolution
-        if resolution is not None:
-            decimator_intf = self.decimator(resolution=resolution, grid=datas, coarsen=coarsen, wrap=True,  debug=debug)
-            decimator_corr = self.decimator(resolution=resolution, grid=datas, coarsen=coarsen, wrap=False, debug=debug)
+        # decimate multilooking grids to specified resolution
+        #if resolution is not None:
+        #    decimator_intf = self.decimator_interferogram(resolution=resolution, grid=datas, coarsen=coarsen, debug=debug)
+        #    decimator_corr = self.decimator_correlation(resolution=resolution, grid=datas, coarsen=coarsen, debug=debug)
         
         intfs = []
         corrs = []
@@ -75,69 +68,55 @@ class Stack_phasediff(Stack_base):
             #data_vars = data.drop(['VV','VH','HH','HV'], errors='ignore').data_vars
             #data_attrs = data.attrs
             #print (data_vars)
+            
+            # convert numeric pairs to date pairs
+            _pairs = [pair if isinstance(pair[0], str) else (data.date.isel(date=pair[0]).item(), data.date.isel(date=pair[1]).item()) for pair in pairs]
+            
             data = data[polarization]
 
             if weight is not None:
+                # unify shape of data and weight
                 data = data.reindex_like(weight, fill_value=np.nan)
             intensity = np.square(np.abs(data))
             # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
-            intensity_look = self.multilooking(intensity, weight=weight,
-                                               wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
+            intensity_look = self._multilooking(intensity, weight=weight,
+                                               wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
             del intensity
             # calculate phase difference with topography correction
-            phasediff = self.phasediff(pairs, data, phase=phase, debug=debug)
+            phasediff = self._phasediff(_pairs, data, debug=debug)
+            if phase is not None:
+                phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
             # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
-            phasediff_look = self.multilooking(phasediff, weight=weight,
-                                               wavelength=wavelength, coarsen=coarsen, gaussian_threshold=gaussian_threshold, debug=debug)
+            phasediff_look = self._multilooking(phasediff, weight=weight,
+                                               wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
+            # correlation requires multilooking to detect influence between pixels
+            # hint: use multilook=False argument to keep phase difference without multilooking
+            corr_look = self._correlation(phasediff_look, intensity_look, debug=debug)
+            if not multilook:
+                # keep phase difference without multilooking
+                phasediff_look = phasediff
             del phasediff
-            # correlation with optional range decimation
-            corr_look = self.correlation(phasediff_look, intensity_look, debug=debug)
             del intensity_look
-            if psize is not None:
-                # Goldstein filter in psize pixel patch size on square grid cells produced using 1:4 range multilooking
-                phasediff_look_goldstein = self.goldstein(phasediff_look, corr_look, psize, debug=debug)
-                del phasediff_look
-                # convert complex phase difference to interferogram
-                #intf_look = self.interferogram(phasediff_look_goldstein, debug=debug)
-                phasediff_look = phasediff_look_goldstein
-                del phasediff_look_goldstein
+            if goldstein_window is not None:
+                # Goldstein filter in "psize" patch size, pixels
+                phasediff_look = self._goldstein(phasediff_look, corr_look, psize=goldstein_window, debug=debug)
 
             # filter out not valid pixels
             if weight is not None:
-                weight_look = self.multilooking(weight, wavelength=None, coarsen=coarsen, debug=debug)
-                phasediff_look = phasediff_look.where(np.isfinite(weight_look))
-                corr_look = corr_look.where(np.isfinite(weight_look))
-                del weight_look
+                # apply coarsening to weight to match the phase difference grid
+                # no multilooking for weight because wavelength=None
+                weight_coarsen = self._multilooking(weight, wavelength=None, debug=debug)
+                phasediff_look = phasediff_look.where(np.isfinite(weight_coarsen))
+                corr_look = corr_look.where(np.isfinite(weight_coarsen))
+                del weight_coarsen
                 
             # convert complex phase difference to interferogram
-            intf_look = self.phase2interferogram(phasediff_look, debug=debug)
+            intf_look = self._phase2interferogram(phasediff_look, debug=debug)
             del phasediff_look
     
-            # compute together because correlation depends on phase, and filtered phase depends on correlation.
-            # anti-aliasing filter for the output resolution is applied above
-            if decimator_intf is not None and decimator_corr is not None:
-                das = (decimator_intf(intf_look),  decimator_corr(corr_look))
-            else:
-                das = (intf_look,  corr_look)
+            intfs.append(intf_look.assign_attrs(data.attrs))
+            corrs.append(corr_look.assign_attrs(data.attrs))
             del corr_look, intf_look
-
-            # append original data attributes to the result
-            das = [da.assign_attrs(data.attrs) for da in das]
-
-            if isinstance(stack, xr.DataArray):
-                intfs.append(das[0].interp(y=stack.y, x=stack.x, method='nearest'))
-                corrs.append(das[1].interp(y=stack.y, x=stack.x, method='nearest'))
-            else:
-                intfs.append(das[0])
-                corrs.append(das[1])
-            del das
-
-        # clean up decimators after all iterations are complete
-        del decimator_intf, decimator_corr
-
-        if not isinstance(datas, (list, tuple)):
-            intfs = intfs[0]
-            corrs = corrs[0]
 
         if compute:
             progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
@@ -146,16 +125,14 @@ class Stack_phasediff(Stack_base):
         return (intfs, corrs)
 
     def interferogram(self,
-                      pairs:list[tuple[str,str]]|np.ndarray|pd.DataFrame,
-                      datas:dict[str,xr.DataArray]|xr.Dataset|xr.DataArray,
-                      weight:xr.DataArray|None=None,
-                      phase:xr.DataArray|None=None,
-                      resolution:float|None=None,
+                      pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
+                      datas:dict[str,xr.DataArray],
+                      weight:dict[str,xr.DataArray]|None=None,
+                      phase:dict[str,xr.DataArray]|None=None,
                       wavelength:float|None=None,
                       gaussian_threshold:float=0.5,
-                      psize:int|list[int,int]|None=None,
-                      coarsen:list[int,int]|None=None,
-                      stack:xr.DataArray|None=None,
+                      multilook:bool=False,
+                      goldstein_window:int|list[int,int]|None=None,
                       compute:bool=False,
                       debug:bool=False
                       ):
@@ -163,17 +140,9 @@ class Stack_phasediff(Stack_base):
         import numpy as np
         import dask
 
-        assert isinstance(datas, (dict, xr.Dataset, xr.DataArray)), 'ERROR: datas should be a dict, Dataset or DataArray'
-
-        # if datas is None:
-        #     datas = self.dss
-
-        datas_iterable = isinstance(datas, dict)
+        assert isinstance(datas, dict), 'ERROR: datas should be a dict of xarray.Dataset'
         # workaround for previous code
-        datas = list(datas.values()) if datas_iterable else datas
-        #print ('datas_iterable', datas_iterable)
-        datas_dataset = isinstance(datas[0], xr.Dataset) if datas_iterable else isinstance(datas, xr.Dataset)
-        #print ('datas_dataset', datas_dataset)
+        datas = list(datas.values())
 
         if not isinstance(datas, (list, tuple)):
             if isinstance(datas, xr.Dataset):
@@ -200,12 +169,10 @@ class Stack_phasediff(Stack_base):
                                                polarization=pol,
                                                weight=weight,
                                                phase=phase,
-                                               resolution=resolution,
                                                wavelength=wavelength,
                                                gaussian_threshold=gaussian_threshold,
-                                               psize=psize,
-                                               coarsen=coarsen,
-                                               stack=stack,
+                                               multilook=multilook,
+                                               goldstein_window=goldstein_window,
                                                compute=compute,
                                                debug=debug
                                                )
@@ -213,18 +180,11 @@ class Stack_phasediff(Stack_base):
             corrs_pols.append(corrs)
             del intfs, corrs
 
-        # if not datas_iterable:
-        #     intfs_pols = [intfs[0].assign_attrs(id=ids[0]) for intfs in intfs_pols]
-        #     corrs_pols = [corrs[0].assign_attrs(id=ids[0]) for corrs in corrs_pols]
-        #     return (intfs_pols[0], corrs_pols[0]) 
-        #     #return (intfs_pols[0], corrs_pols[0]) if datas_dataset else (intfs_pols[0][polarizations[0]], corrs_pols[0][polarizations[0]])
-
         intfs_pols = [xr.merge([das[idx] for das in intfs_pols]) for idx in range(len(intfs_pols[0]))]
         corrs_pols = [xr.merge([das[idx] for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
-        dss = (intfs_pols, corrs_pols) if datas_dataset else ([intf[polarizations[0]] for intf in intfs_pols], [corrs[polarizations[0]] for corrs in corrs_pols])
+        dss = (intfs_pols, corrs_pols)
         # workaround for previous code, use attributes from the original data for keys to build a dict
-        return self.to_dict(dss[0]), self.to_dict(dss[1]) if datas_iterable else dss
-        #return dss
+        return self.to_dict(dss[0]), self.to_dict(dss[1])
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
@@ -235,8 +195,7 @@ class Stack_phasediff(Stack_base):
                                 phase=None,
                                 wavelength=None,
                                 gaussian_threshold=0.5,
-                                psize=None,
-                                stack=None,
+                                goldstein_window=None,
                                 compute=False,
                                 debug=False):
         return self.interferogram(pairs,
@@ -245,8 +204,8 @@ class Stack_phasediff(Stack_base):
                                 phase=phase,
                                 wavelength=wavelength,
                                 gaussian_threshold=gaussian_threshold,
-                                psize=psize,
-                                stack=stack,
+                                multilook=False,
+                                goldstein_window=goldstein_window,
                                 compute=compute,
                                 debug=debug)
 
@@ -257,29 +216,24 @@ class Stack_phasediff(Stack_base):
                               datas=None,
                               weight=None,
                               phase=None,
-                              resolution=None,
                               wavelength=None,
                               gaussian_threshold=0.5,
-                              psize=None,
-                              coarsen=(1,4),
-                              stack=None,
+                              goldstein_window=None,
                               compute=False,
                               debug=False):
         return self.interferogram(pairs,
                                 datas=datas,
                                 weight=weight,
                                 phase=phase,
-                                resolution=resolution,
                                 wavelength=wavelength,
                                 gaussian_threshold=gaussian_threshold,
-                                psize=psize,
-                                coarsen=coarsen,
-                                stack=stack,
+                                multilook=True,
+                                goldstein_window=goldstein_window,
                                 compute=compute,
                                 debug=debug)
 
     @staticmethod
-    def phase2interferogram(phase, debug=False):
+    def _phase2interferogram(phase, debug=False):
         import numpy as np
 
         if debug:
@@ -289,21 +243,7 @@ class Stack_phasediff(Stack_base):
             return np.arctan2(phase.imag, phase.real)
         return phase
 
-#     @staticmethod
-#     def correlation(I1, I2, amp):
-#         import xarray as xr
-#         import numpy as np
-#         # constant from GMTSAR code
-#         thresh = 5.e-21
-#         i = I1 * I2
-#         corr = xr.where(i > 0, amp / np.sqrt(i), 0)
-#         corr = xr.where(corr < 0, 0, corr)
-#         corr = xr.where(corr > 1, 1, corr)
-#         # mask too low amplitude areas as invalid
-#         # amp1 and amp2 chunks are high for SLC, amp has normal chunks for NetCDF
-#         return xr.where(i >= thresh, corr, np.nan).chunk(a.chunksizes).rename('phase')
-
-    def correlation(self, phase, intensity, debug=False):
+    def _correlation(self, phase, intensity, debug=False):
         """
         Example:
         data_200m = stack.multilooking(np.abs(sbas.open_data()), wavelength=200, coarsen=(4,16))
@@ -333,34 +273,29 @@ class Stack_phasediff(Stack_base):
             module=r"dask\._task_spec"
         )
 
+        # check correctness for user-defined data arguments
+        assert np.issubdtype(phase.dtype, np.complexfloating), 'ERROR: Phase should be complex-valued data.'
+        assert not np.issubdtype(intensity.dtype, np.complexfloating), 'ERROR: Intensity cannot be complex-valued data.'
+
         if debug:
             print ('DEBUG: correlation')
 
         # convert pairs (list, array, dataframe) to 2D numpy array
-        pairs, dates = self.get_pairs(phase, dates=True)
+        pairs, dates = self._get_pairs(phase, dates=True)
         pairs = pairs[['ref', 'rep']].astype(str).values
-
-        # check correctness for user-defined data arguments
-        assert np.issubdtype(phase.dtype, np.complexfloating), 'ERROR: Phase should be complex-valued data.'
-        assert not np.issubdtype(intensity.dtype, np.complexfloating), 'ERROR: Intensity cannot be complex-valued data.'
 
         stack = []
         for stack_idx, pair in enumerate(pairs):
             date1, date2 = pair
             # calculate correlation
             corr = (np.abs(phase.sel(pair=' '.join(pair)) / np.sqrt(intensity.sel(date=date1) * intensity.sel(date=date2)))).clip(0, 1)
-            # modify values in place
-            #corr = xr.where(corr < 0, 0, corr)
-            #corr = xr.where(corr > 1, 1, corr)
-            #corr = corr.where(corr.isnull() | (corr >= 0), 0)
-            #corr = corr.where(corr.isnull() | (corr <= 1), 1)
             # add to stack
             stack.append(corr)
             del corr
 
         return xr.concat(stack, dim='pair')
 
-    def phasediff(self, pairs, data, phase=None, debug=False):
+    def _phasediff(self, pairs, data, debug=False):
         import dask.array as da
         import xarray as xr
         import numpy as np
@@ -383,12 +318,8 @@ class Stack_phasediff(Stack_base):
         if debug:
             print ('DEBUG: phasediff')
 
-        assert phase is None or \
-               np.issubdtype(phase.dtype, np.floating) or \
-               np.issubdtype(phase.dtype, np.complexfloating)
-
         # convert pairs (list, array, dataframe) to 2D numpy array
-        pairs, dates = self.get_pairs(pairs, dates=True)
+        pairs, dates = self._get_pairs(pairs, dates=True)
         pairs = pairs[['ref', 'rep']].astype(str).values
         # append coordinates which usually added from topo phase dataarray
         coord_pair = [' '.join(pair) for pair in pairs]
@@ -399,19 +330,12 @@ class Stack_phasediff(Stack_base):
         data1 = data.sel(date=pairs[:,0]).drop_vars('date').rename({'date': 'pair'})
         data2 = data.sel(date=pairs[:,1]).drop_vars('date').rename({'date': 'pair'})
 
-        if phase is None:
-            phase_correction = 1
-        else:
-            # convert real phase values to complex if needed 
-            phase_correction = np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase
-
-        da = (phase_correction * data1 * data2.conj())\
-               .assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
-        del phase_correction, data1, data2
+        da = (data1 * data2.conj()).assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
+        del data1, data2
         
         return da
 
-    def goldstein(self, phase, corr, psize=32, debug=False):
+    def _goldstein(self, phase, corr, psize=32, debug=False):
         import xarray as xr
         import numpy as np
         import dask

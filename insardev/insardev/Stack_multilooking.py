@@ -13,167 +13,8 @@ from .utils import utils
 
 class Stack_multilooking(Stack_phasediff):
 
-    @staticmethod
-    def coarsen_start(da, name, spacing, grid_factor=1):
-        """
-        Calculate start coordinate to align coarsened grids.
-        
-        Parameters
-        ----------
-        da : xarray.DataArray
-            Input data array
-        name : str
-            Coordinate name to align
-        spacing : int
-            Coarsening spacing
-        grid_factor : int, optional
-            Grid factor for alignment, default is 1
-            
-        Returns
-        -------
-        int or None
-            Start index for optimal alignment, or None if no good alignment found
-        """
-        import numpy as np
-        
-        # get coordinate values
-        coords = da[name].values
-        if len(coords) < spacing:
-            print(f'calculate_coarsen_start: Not enough points for spacing {spacing}')
-            return None
-            
-        # calculate coordinate differences
-        diffs = np.diff(coords)
-        if not np.allclose(diffs, diffs[0], rtol=1e-5):
-            print(f'calculate_coarsen_start: Non-uniform spacing detected for {name}')
-            return None
-            
-        # calculate target spacing
-        target_spacing = diffs[0] * spacing * grid_factor
-        
-        # find best alignment point
-        best_offset = None
-        min_error = float('inf')
-        
-        for i in range(spacing):
-            # get coarsened coordinates
-            coarse_coords = coords[i::spacing]
-            if len(coarse_coords) < 2:
-                continue
-                
-            # calculate alignment error
-            error = np.abs(coarse_coords[0] % target_spacing)
-            if error < min_error:
-                min_error = error
-                best_offset = i
-                
-        if best_offset is not None:
-            #print(f'calculate_coarsen_start: {name} spacing={spacing} grid_factor={grid_factor} => {best_offset} (error={min_error:.2e})')
-            return best_offset
-            
-        print(f'calculate_coarsen_start: No good alignment found for {name}')
-        return None
-
-    @staticmethod
-    def nanconvolve2d_gaussian(data,
-                        weight=None,
-                        sigma=None,
-                        mode='reflect',
-                        truncate=4.0,
-                        threshold=0.5):
-        """
-        Convolve a data array with a Gaussian kernel.
-
-        Parameters
-        ----------
-        data : xarray.DataArray
-            The data array to convolve.
-        weight : xarray.DataArray, optional
-            The weight array to use for the convolution.
-        sigma : float or tuple of floats, optional
-            The standard deviation of the Gaussian kernel.
-        mode : str, optional
-            The mode to use for the convolution.
-        truncate : float, optional
-            The truncation factor for the Gaussian kernel.
-        threshold : float, optional
-            The threshold for the convolution.
-
-        We use a threshold defined as a fraction of the weight as an indicator that the Gaussian window
-        covers enough valid (non-NaN) pixels. When the accumulated weight is below this threshold, we replace
-        the output with NaN, since the result is unreliable due to insufficient data within the window.
-        This is a simple way to prevent border effects when most of the filter window is empty.
-        """
-        import numpy as np
-        import xarray as xr
-    
-        if sigma is None:
-            return data
-    
-        if not isinstance(sigma, (list, tuple, np.ndarray)):
-            sigma = (sigma, sigma)
-        depth = [np.ceil(_sigma * truncate).astype(int) for _sigma in sigma]
-        #print ('sigma', sigma, 'depth', depth)
-    
-        # weighted Gaussian filtering for real floats with NaNs
-        def nanconvolve2d_gaussian_floating_dask_chunk(data, weight=None, **kwargs):
-            import numpy as np
-            from scipy.ndimage import gaussian_filter
-            assert not np.issubdtype(data.dtype, np.complexfloating)
-            assert np.issubdtype(data.dtype, np.floating)
-            if weight is not None:
-                assert not np.issubdtype(weight.dtype, np.complexfloating)
-                assert np.issubdtype(weight.dtype, np.floating)
-            # all other arguments are passed to gaussian_filter
-            threshold = kwargs.pop('threshold')
-            # replace nan + 1j to to 0.+0.j
-            data_complex  = (1j + data) * (weight if weight is not None else 1)
-            conv_complex = gaussian_filter(np.nan_to_num(data_complex, 0), **kwargs)
-            #conv = conv_complex.real/conv_complex.imag
-            # to prevent "RuntimeWarning: invalid value encountered in divide" even when warning filter is defined
-            conv = np.where(conv_complex.imag <= threshold*(weight if weight is not None else 1), np.nan, conv_complex.real/(conv_complex.imag + 1e-17))
-            del data_complex, conv_complex
-            return conv
-    
-        def nanconvolve2d_gaussian_dask_chunk(data, weight=None, **kwargs):
-            import numpy as np
-            if np.issubdtype(data.dtype, np.complexfloating):
-                #print ('complexfloating')
-                real = nanconvolve2d_gaussian_floating_dask_chunk(data.real, weight, **kwargs)
-                imag = nanconvolve2d_gaussian_floating_dask_chunk(data.imag, weight, **kwargs)
-                conv = real + 1j*imag
-                del real, imag
-            else:
-                #print ('floating')
-                conv = nanconvolve2d_gaussian_floating_dask_chunk(data.real, weight, **kwargs)
-            return conv
-    
-        # weighted Gaussian filtering for real or complex floats
-        def nanconvolve2d_gaussian_dask(data, weight, **kwargs):
-            import dask.array as da
-            # ensure both dask arrays have the same chunk structure
-            # use map_overlap with the custom function to handle both arrays
-            return da.map_overlap(
-                nanconvolve2d_gaussian_dask_chunk,
-                *([data, weight] if weight is not None else [data]),
-                depth={0: depth[0], 1: depth[1]},
-                boundary='none',
-                dtype=data.dtype,
-                meta=data._meta,
-                **kwargs
-            )
-
-        return xr.DataArray(nanconvolve2d_gaussian_dask(data.data,
-                                     weight.data if weight is not None else None,
-                                     threshold=threshold,
-                                     sigma=sigma,
-                                     mode=mode,
-                                     truncate=truncate),
-                            coords=data.coords,
-                            name=data.name)
-
     #decimator = lambda da: da.coarsen({'y': 2, 'x': 2}, boundary='trim').mean()
-    def decimator(self, grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
+    def get_decimator(self, grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
         """
         Return function for pixel decimation to the specified output resolution.
 
@@ -217,52 +58,43 @@ class Stack_multilooking(Stack_phasediff):
         if debug:
             print (f"DEBUG: decimator = lambda da: da.coarsen({{'y': {yscale}, 'x': {xscale}}}, boundary='trim').{func}()")
 
-        # decimate function
-        def decimator(da):
-            import warnings
-            # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-            warnings.filterwarnings('ignore')
-            warnings.filterwarnings('ignore', module='dask')
-            warnings.filterwarnings('ignore', module='dask.core')
-            # unstack data if needed
-            if 'stack' in da.dims:
-                # .unstack() is too slow on lazy grids in some of Xarray/Dask versions
-                da = da.compute().unstack('stack')
-            # workaround for Google Colab when we cannot save grids with x,y coordinate names
-            # also supports geographic coordinates
-            yname = [varname for varname in ['y', 'lat', 'a'] if varname in da.dims][0]
-            xname = [varname for varname in ['x', 'lon', 'r'] if varname in da.dims][0]
-            coarsen_args = {yname: yscale, xname: xscale}
-            # calculate coordinate offsets to align coarsened grids
-            y0 = self.coarsen_start(da, yname, yscale)
-            x0 = self.coarsen_start(da, xname, xscale)
-            # avoid creating the large chunks
-            with dask.config.set(**{'array.slicing.split_large_chunks': True}):
-                #if func not in ['mean', 'min', 'max', 'count', 'sum']:
-                #    raise ValueError(f"Unsupported function {func}. Should be 'mean','min','max','count', or 'sum'")
-                # return getattr(da.coarsen(coarsen_args, boundary='trim'), func)()\
-                #        .chunk({yname: self.chunksize, xname: self.chunksize})
+        # decimator function
+        def decimator(datas):
+            def decimator_dataset(ds):
+                coarsen_args = {'y': yscale, 'x': xscale}
+                # calculate coordinate offsets to align coarsened grids
+                y0 = self._coarsen_start(ds, 'y', yscale)
+                x0 = self._coarsen_start(ds, 'x', xscale)
+                ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})
                 if wrap:
-
-                    # complex_das = [np.exp(1j * da) for da in das]
-                    # da_complex = xr.concat(xr.align(*complex_das, join='outer'), dim='stack_dim').mean('stack_dim')
-                    # da = np.arctan2(da_complex.imag, da_complex.real)
-                    da_complex = np.exp(1j * da.isel({yname: slice(y0, None), xname: slice(x0, None)}))
+                    da_complex = np.exp(1j * ds)
                     da_complex_agg = getattr(da_complex\
                            .coarsen(coarsen_args, boundary='trim'), func)()\
-                           .chunk({yname: self.chunksize, xname: self.chunksize})
+                           .chunk({'y': self.chunksize, 'x': self.chunksize})
                     da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real)
                     del da_complex, da_complex_agg
                     return da_decimated
                 else:
-                    return getattr(da.isel({yname: slice(y0, None), xname: slice(x0, None)})\
+                    return getattr(ds\
                            .coarsen(coarsen_args, boundary='trim'), func)()\
-                           .chunk({yname: self.chunksize, xname: self.chunksize})
+                           .chunk({'y': self.chunksize, 'x': self.chunksize})
+            # avoid creating the large chunks
+            #with dask.config.set(**{'array.slicing.split_large_chunks': True}):
+            if isinstance(datas, dict):
+                return {k:decimator_dataset(v) for k,v in datas.items()}
+            else:
+                return decimator_dataset(datas)
 
         # return callback function and set common chunk size
-        return lambda da: decimator(da)
+        return lambda datas: decimator(datas)
 
-    def multilooking(self, data, weight=None, wavelength=None, coarsen=None, gaussian_threshold=0.5, debug=False):
+    def get_decimator_interferogram(self, grid, coarsen=None, resolution=60, func='mean', debug=False):
+        return self.get_decimator(grid, coarsen, resolution, func, wrap=True, debug=debug)
+
+    def get_decimator_correlation(self, grid, coarsen=None, resolution=60, func='mean', debug=False):
+        return self.get_decimator(grid, coarsen, resolution, func, wrap=False, debug=debug)
+
+    def _multilooking(self, data, weight=None, wavelength=None, coarsen=None, gaussian_threshold=0.5, debug=False):
         import xarray as xr
         import numpy as np
         import dask
@@ -277,10 +109,11 @@ class Stack_multilooking(Stack_phasediff):
         if wavelength is None and coarsen is None:
             return data
     
+        # TODO: create function get_sigma(data, wavelength=None, coarsen=None)
         # calculate sigmas based on wavelength or coarsen
         if wavelength is not None:
             dy, dx = self.get_spacing(data)
-            sigmas = [wavelength / cutoff / dy, wavelength / cutoff / dx]
+            sigmas = [wavelength / dy / cutoff, wavelength / dx / cutoff]
             if debug:
                 print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), wavelength {wavelength:.1f}')
         else:
@@ -327,7 +160,7 @@ class Stack_multilooking(Stack_phasediff):
 
         # process a slice of dataarray
         def process_slice(slice_data):
-            conv = self.nanconvolve2d_gaussian(slice_data, weight, sigmas, threshold=gaussian_threshold)
+            conv = self._nanconvolve2d_gaussian(slice_data, weight, sigmas, threshold=gaussian_threshold)
             return xr.DataArray(conv, dims=slice_data.dims, name=slice_data.name)
 
         # process stack of dataarray slices
@@ -348,8 +181,8 @@ class Stack_multilooking(Stack_phasediff):
 
         if coarsen:
             # calculate coordinate offsets to align coarsened grids
-            y0 = self.coarsen_start(ds, 'y', coarsen[0])
-            x0 = self.coarsen_start(ds, 'x', coarsen[1])
+            y0 = self._coarsen_start(ds, 'y', coarsen[0])
+            x0 = self._coarsen_start(ds, 'x', coarsen[1])
             ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})\
                      .coarsen({'y': coarsen[0], 'x': coarsen[1]}, boundary='trim')\
                      .mean()

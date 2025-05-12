@@ -185,7 +185,7 @@ class Tiles(datagrid, progressbar_joblib):
             print ('NOTE: Target file exists, return it. Use "skip_exist=False" or omit the filename to allow new downloading.')
             return xr.open_dataarray(filename, engine=self.netcdf_engine_read, chunks=self.chunksize)
 
-        bounds = self.get_bounds(geometry)
+        bounds = self._get_bounds(geometry)
 
         # it produces 4 tiles for cases like (39.5, 39.5, 40.0, 40.0)
         #left, right = int(np.floor(lon_start)), int(np.floor(lon_end))
@@ -230,7 +230,7 @@ class Tiles(datagrid, progressbar_joblib):
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
-            encoding = {'z': self.get_encoding_netcdf(da.shape)}
+            encoding = {'z': self._get_encoding_netcdf(da.shape)}
             da.rename('z').to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da
 

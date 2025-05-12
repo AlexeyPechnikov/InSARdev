@@ -451,7 +451,7 @@ class Stack_detrend(Stack_unwrap):
             if 'stack' in weight.dims and isinstance(weight.coords['stack'].to_index(), pd.MultiIndex):
                 raise ValueError('ERROR: "weight", if provided, must be stacked consistently with "data".')
 
-        pairs, dates = self.get_pairs(data, dates=True)
+        pairs, dates = self._get_pairs(data, dates=True)
 
         models = []
         if wrap:
@@ -547,7 +547,7 @@ class Stack_detrend(Stack_unwrap):
 #         import pandas as pd
 #         import numpy as np
 # 
-#         pairs, dates = self.get_pairs(data, dates=True)
+#         pairs, dates = self._get_pairs(data, dates=True)
 #         if variable is not None:
 #             pairs['variable'] = variable.values if isinstance(variable, pd.Series) else variable
 # 
@@ -908,7 +908,7 @@ class Stack_detrend(Stack_unwrap):
 #         for stackval in grid[stackvar].values if len(grid.dims) == 3 else [None]:
 #             block = grid.sel({stackvar: stackval}) if stackval is not None else grid
 #             block_dec = self.antialiasing_downscale(block, wavelength=resolution, coarsen=(yscale,xscale), debug=debug)
-#             gaussian_dec = self.nanconvolve2d_gaussian(block_dec, (sigma_y,sigma_x), truncate=truncate)
+#             gaussian_dec = self._nanconvolve2d_gaussian(block_dec, (sigma_y,sigma_x), truncate=truncate)
 #             # interpolate decimated filtered grid to original resolution
 #             gaussian = gaussian_dec.interp_like(block, method='nearest')
 #             # revert the original chunks
@@ -930,7 +930,7 @@ class Stack_detrend(Stack_unwrap):
 #         return out
 
 #     def turbulence(self, phase, date_crop=0, symmetrical=False):
-#         pairs, dates = self.get_pairs(phase, dates=True)
+#         pairs, dates = self._get_pairs(phase, dates=True)
 #     
 #         turbos = []
 #         for date in dates:
@@ -999,7 +999,7 @@ class Stack_detrend(Stack_unwrap):
 #         import xarray as xr
 #         import pandas as pd
 # 
-#         pairs, dates = self.get_pairs(phase, dates=True)
+#         pairs, dates = self._get_pairs(phase, dates=True)
 # 
 #         turbos = []
 #         for date in dates:
@@ -1049,7 +1049,7 @@ class Stack_detrend(Stack_unwrap):
 
         print ('NOTE: this function is deprecated, use instead Stack.polyfit()')
 
-        pairs, dates = self.get_pairs(phase, dates=True)
+        pairs, dates = self._get_pairs(phase, dates=True)
 
         turbos = []
         for date in dates:

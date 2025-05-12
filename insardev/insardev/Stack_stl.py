@@ -13,7 +13,7 @@ from .Stack_lstsq import Stack_lstsq
 class Stack_stl(Stack_lstsq):
 
     @staticmethod
-    def stl1d(ts, dt, dt_periodic, periods=52, robust=False):
+    def _stl1d(ts, dt, dt_periodic, periods=52, robust=False):
         """
         Perform Seasonal-Trend decomposition using LOESS (STL) on the input time series data.
 
@@ -68,7 +68,7 @@ class Stack_stl(Stack_lstsq):
         return res.trend, res.seasonal, res.resid
 
     @staticmethod
-    def stl_periodic(dates, freq='W'):
+    def _stl_periodic(dates, freq='W'):
         import pandas as pd
         import xarray as xr
         import numpy as np
@@ -85,7 +85,7 @@ class Stack_stl(Stack_lstsq):
 
     # Aggregate data for varying frequencies (e.g., 12+ days for 6 days S1AB images interval)
     # Use frequency strings like '1W' for 1 week, '2W' for 2 weeks, '10d' for 10 days, '1M' for 1 month, etc.
-    def stl(self, data, freq='W', periods=52, robust=False):
+    def _stl(self, data, freq='W', periods=52, robust=False):
         """
         Perform Seasonal-Trend decomposition using LOESS (STL) on the input time series data in parallel.
 
@@ -156,7 +156,7 @@ class Stack_stl(Stack_lstsq):
         else:
             raise Exception('Invalid input: The "data" parameter should be of type xarray.DataArray.')
 
-        dt, dt_periodic = self.stl_periodic(data.date, freq)
+        dt, dt_periodic = self._stl_periodic(data.date, freq)
 
         def stl_block(ys, xs, stacks=None):
             # use external variables dt, dt_periodic, periods, robust
@@ -167,8 +167,8 @@ class Stack_stl(Stack_lstsq):
                 # 2D array
                 data_block = data.isel(stack=stacks).chunk(-1).compute(n_workers=1).values.transpose(1,0)
             # Vectorize vec_lstsq
-            #vec_stl = np.vectorize(lambda data: self.stl(data, dt, dt_periodic, periods, robust), signature='(n)->(3,m)')
-            vec_stl = np.vectorize(lambda data: self.stl1d(data, dt, dt_periodic, periods, robust), signature='(n)->(m),(m),(m)')
+            #vec_stl = np.vectorize(lambda data: self._stl(data, dt, dt_periodic, periods, robust), signature='(n)->(3,m)')
+            vec_stl = np.vectorize(lambda data: self._stl1d(data, dt, dt_periodic, periods, robust), signature='(n)->(m),(m),(m)')
             # Apply vec_lstsq to data_block and revert the original dimensions order
             block = np.asarray(vec_stl(data_block))
             del vec_stl, data_block

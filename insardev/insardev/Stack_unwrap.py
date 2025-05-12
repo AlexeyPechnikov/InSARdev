@@ -406,15 +406,15 @@ class Stack_unwrap(Stack_unwrap_snaphu):
             -1 indicating the end date, 0 if the date is covered by the corresponding
             interferogram timeline, and NaN otherwise.
         """
-        #return self.get_pairs_matrix(pairs)
+        #return self._get_pairs_matrix(pairs)
         # revert temporally for backward compatibility
-        return (self.get_pairs_matrix(pairs)>=0).astype(int)
+        return (self._get_pairs_matrix(pairs)>=0).astype(int)
 
     def unwrap1d(self, data, weight=None, tolerance=np.pi/2):
         import xarray as xr
         import numpy as np
 
-        pairs = self.get_pairs(data)
+        pairs = self._get_pairs(data)
         matrix = self.unwrap_matrix(pairs)
     
         if not 'stack' in data.dims:

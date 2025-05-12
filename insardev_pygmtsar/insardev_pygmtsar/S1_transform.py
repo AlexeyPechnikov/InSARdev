@@ -79,13 +79,10 @@ class S1_transform(S1_topo):
         -----
         The processing is parallelized internally using Dask. GMTSAR files are saved in the temp directory.
         """
-        import dask
         from tqdm.auto import tqdm
         import joblib
         import os
         import tempfile
-        from distributed import get_client
-        import gc
         import shutil
 
         if self.DEM is None:
@@ -195,18 +192,12 @@ class S1_transform(S1_topo):
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         
-        # restart Dask cluster to avoid issues with the previous workers
-        client = get_client()
-        client.restart(wait_for_workers=True, timeout=60)
-        gc.collect()
-        for refrep in tqdm(refreps, desc='Transforming SLC'):
-            # single worker is used to avoid Dask issues
+        for refrep in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+            # single worker is used to help Dask cleanup memory
             joblib.Parallel(n_jobs=1, backend='threading')(
                 [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
             )
-            # cleanup workers and the main process
-            client.run(lambda: __import__('gc').collect())
-            gc.collect()
+
         # consolidate zarr metadata for the resolution directory
         self.consolidate_metadata(target, resolution=resolution)
 
@@ -237,7 +228,6 @@ class S1_transform(S1_topo):
         import pandas as pd
         import numpy as np
         import xarray as xr
-        import dask
         import os
         #print(f'transform_slc {burst} {date}')
         # get record
@@ -312,7 +302,7 @@ class S1_transform(S1_topo):
             data_proj[varname].attrs['add_offset'] = 0
             data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
         
-        encoding_vars = {var: self.get_encoding_zarr(chunks=(data_proj.x.size,),
+        encoding_vars = {var: self._get_encoding_zarr(chunks=(data_proj.x.size,),
                                                      dtype=data_proj[var].dtype,
                                                      shuffle='noshuffle'
                                                      ) for var in data_proj.data_vars}

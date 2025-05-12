@@ -42,7 +42,7 @@ class S1_dem(S1_tidal):
         with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
             geoid = xr.open_dataarray(geoid_filename, engine=self.netcdf_engine_read, chunks=self.netcdf_chunksize).rename({'y': 'lat', 'x': 'lon'})
         if grid is not None:
-            return self.interp2d_like(geoid, grid)
+            return self._interp2d_like(geoid, grid)
         return geoid
 
     # buffer required to get correct (binary) results from SAT_llt2rat tool
@@ -120,7 +120,7 @@ class S1_dem(S1_tidal):
         assert len(duplicates) == 0, 'ERROR: DEM grid includes duplicated coordinates, possibly on merged tiles edges'
 
         # crop to the geometry extent
-        bounds = self.get_bounds(geometry.buffer(buffer_degrees))
+        bounds = self._get_bounds(geometry.buffer(buffer_degrees))
         ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
 
         # heights correction

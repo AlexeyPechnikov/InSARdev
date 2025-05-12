@@ -13,6 +13,9 @@ from insardev_toolkit import datagrid
 class S1_base(progressbar_joblib, datagrid):
     import pandas as pd
 
+    # redefine output chunksize for zarr exported datasets
+    zarr_chunksize: int = {'y': 2*1280, 'x': 8*1280}
+
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
 

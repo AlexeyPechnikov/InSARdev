@@ -37,8 +37,7 @@ class datagrid:
 
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
     # processing chunksize
-    chunksize: int = 4*1280
-    chunksize1d: int = 128*1280
+    chunksize: int = 2*1280
 
     netcdf_engine_read: str = 'h5netcdf'
     netcdf_engine_write: str = 'netcdf4'
@@ -49,7 +48,7 @@ class datagrid:
     netcdf_shuffle: bool = True
 
     # output chunksize for zarr exported datasets
-    zarr_chunksize: int = {'y': 2*1280, 'x': 8*1280}
+    zarr_chunksize: int = 4*1280
     # ['lz4', 'lz4hc', 'blosclz', 'zstd', 'zlib']
     zarr_compression_algorithm: str = 'zstd'
     zarr_clevel: int = 6
@@ -57,7 +56,7 @@ class datagrid:
     zarr_blocksize: int = 0
 
     # define lost class variables due to joblib via arguments
-    def get_encoding_zarr(self, chunks=None, dtype=None, shuffle=None, fill_value=None, compression=True):
+    def _get_encoding_zarr(self, chunks=None, dtype=None, shuffle=None, fill_value=None, compression=True):
         import numpy as np
         from zarr.codecs import BloscCodec
 
@@ -88,7 +87,7 @@ class datagrid:
         return opts
 
     # define lost class variables due to joblib via arguments
-    def get_encoding_netcdf(self, shape=None, chunksize=None):
+    def _get_encoding_netcdf(self, shape=None, chunksize=None):
         """
         Return the compression options for a data grid.
 
@@ -156,7 +155,9 @@ class datagrid:
     @staticmethod
     def get_spacing(data, coarsen=None):
         import numpy as np
-        if isinstance(data, (list, tuple)):
+        if isinstance(data, (dict)):
+            da = next(iter(data.values()))
+        elif isinstance(data, (list, tuple)):
             da = data[0]
         else:
             da = data
@@ -285,6 +286,8 @@ class datagrid:
         
         if isinstance(target, (list, tuple)):
             target = target[0]
+        elif isinstance(target, dict):
+            target = next(iter(target.values()))
 
         # extract EPSG from target xarray object or use provided EPSG
         if isinstance(target, (xr.DataArray, xr.Dataset)):
@@ -422,7 +425,7 @@ class datagrid:
 #         return matrix2d
 
     @staticmethod
-    def get_bounds(geometry, epsg=4326):
+    def _get_bounds(geometry, epsg=4326):
         import geopandas as gpd
         import xarray as xr
         from shapely.geometry import Polygon
@@ -478,7 +481,7 @@ class datagrid:
     # Xarray's interpolation can be inefficient for large grids;
     # this custom function handles the task more effectively.
     @staticmethod
-    def interp2d_like(data, grid, method='cubic', **kwargs):
+    def _interp2d_like(data, grid, method='cubic', **kwargs):
         """
         Efficiently interpolate a 2D array using OpenCV interpolation methods.
         
@@ -637,3 +640,162 @@ class datagrid:
 #         del dask_out
 #         # append all the input coordinates
 #         return da_out.assign_coords({k: v for k, v in data.coords.items() if k not in coords})
+
+    @staticmethod
+    def _coarsen_start(da, name, spacing, grid_factor=1):
+        """
+        Calculate start coordinate to align coarsened grids.
+        
+        Parameters
+        ----------
+        da : xarray.DataArray
+            Input data array
+        name : str
+            Coordinate name to align
+        spacing : int
+            Coarsening spacing
+        grid_factor : int, optional
+            Grid factor for alignment, default is 1
+            
+        Returns
+        -------
+        int or None
+            Start index for optimal alignment, or None if no good alignment found
+        """
+        import numpy as np
+        
+        # get coordinate values
+        coords = da[name].values
+        if len(coords) < spacing:
+            print(f'_coarsen_start: Not enough points for spacing {spacing}')
+            return None
+            
+        # calculate coordinate differences
+        diffs = np.diff(coords)
+        if not np.allclose(diffs, diffs[0], rtol=1e-5):
+            print(f'_coarsen_start: Non-uniform spacing detected for {name}')
+            return None
+            
+        # calculate target spacing
+        target_spacing = diffs[0] * spacing * grid_factor
+        
+        # find best alignment point
+        best_offset = None
+        min_error = float('inf')
+        
+        for i in range(spacing):
+            # get coarsened coordinates
+            coarse_coords = coords[i::spacing]
+            if len(coarse_coords) < 2:
+                continue
+                
+            # calculate alignment error
+            error = np.abs(coarse_coords[0] % target_spacing)
+            if error < min_error:
+                min_error = error
+                best_offset = i
+                
+        if best_offset is not None:
+            #print(f'_coarsen_start: {name} spacing={spacing} grid_factor={grid_factor} => {best_offset} (error={min_error:.2e})')
+            return best_offset
+            
+        print(f'_coarsen_start: No good alignment found for {name}')
+        return None
+
+    @staticmethod
+    def _nanconvolve2d_gaussian(data,
+                        weight=None,
+                        sigma=None,
+                        mode='reflect',
+                        truncate=4.0,
+                        threshold=0.5):
+        """
+        Convolve a data array with a Gaussian kernel.
+
+        Parameters
+        ----------
+        data : xarray.DataArray
+            The data array to convolve.
+        weight : xarray.DataArray, optional
+            The weight array to use for the convolution.
+        sigma : float or tuple of floats, optional
+            The standard deviation of the Gaussian kernel.
+        mode : str, optional
+            The mode to use for the convolution.
+        truncate : float, optional
+            The truncation factor for the Gaussian kernel.
+        threshold : float, optional
+            The threshold for the convolution.
+
+        We use a threshold defined as a fraction of the weight as an indicator that the Gaussian window
+        covers enough valid (non-NaN) pixels. When the accumulated weight is below this threshold, we replace
+        the output with NaN, since the result is unreliable due to insufficient data within the window.
+        This is a simple way to prevent border effects when most of the filter window is empty.
+        """
+        import numpy as np
+        import xarray as xr
+    
+        if sigma is None:
+            return data
+    
+        if not isinstance(sigma, (list, tuple, np.ndarray)):
+            sigma = (sigma, sigma)
+        depth = [np.ceil(_sigma * truncate).astype(int) for _sigma in sigma]
+        #print ('sigma', sigma, 'depth', depth)
+    
+        # weighted Gaussian filtering for real floats with NaNs
+        def nanconvolve2d_gaussian_floating_dask_chunk(data, weight=None, **kwargs):
+            import numpy as np
+            from scipy.ndimage import gaussian_filter
+            assert not np.issubdtype(data.dtype, np.complexfloating)
+            assert np.issubdtype(data.dtype, np.floating)
+            if weight is not None:
+                assert not np.issubdtype(weight.dtype, np.complexfloating)
+                assert np.issubdtype(weight.dtype, np.floating)
+            # all other arguments are passed to gaussian_filter
+            threshold = kwargs.pop('threshold')
+            # replace nan + 1j to to 0.+0.j
+            data_complex  = (1j + data) * (weight if weight is not None else 1)
+            conv_complex = gaussian_filter(np.nan_to_num(data_complex, 0), **kwargs)
+            #conv = conv_complex.real/conv_complex.imag
+            # to prevent "RuntimeWarning: invalid value encountered in divide" even when warning filter is defined
+            conv = np.where(conv_complex.imag <= threshold*(weight if weight is not None else 1), np.nan, conv_complex.real/(conv_complex.imag + 1e-17))
+            del data_complex, conv_complex
+            return conv
+    
+        def nanconvolve2d_gaussian_dask_chunk(data, weight=None, **kwargs):
+            import numpy as np
+            if np.issubdtype(data.dtype, np.complexfloating):
+                #print ('complexfloating')
+                real = nanconvolve2d_gaussian_floating_dask_chunk(data.real, weight, **kwargs)
+                imag = nanconvolve2d_gaussian_floating_dask_chunk(data.imag, weight, **kwargs)
+                conv = real + 1j*imag
+                del real, imag
+            else:
+                #print ('floating')
+                conv = nanconvolve2d_gaussian_floating_dask_chunk(data.real, weight, **kwargs)
+            return conv
+    
+        # weighted Gaussian filtering for real or complex floats
+        def nanconvolve2d_gaussian_dask(data, weight, **kwargs):
+            import dask.array as da
+            # ensure both dask arrays have the same chunk structure
+            # use map_overlap with the custom function to handle both arrays
+            return da.map_overlap(
+                nanconvolve2d_gaussian_dask_chunk,
+                *([data, weight] if weight is not None else [data]),
+                depth={0: depth[0], 1: depth[1]},
+                boundary='none',
+                dtype=data.dtype,
+                meta=data._meta,
+                **kwargs
+            )
+
+        return xr.DataArray(nanconvolve2d_gaussian_dask(data.data,
+                                     weight.data if weight is not None else None,
+                                     threshold=threshold,
+                                     sigma=sigma,
+                                     mode=mode,
+                                     truncate=truncate),
+                            coords=data.coords,
+                            name=data.name)

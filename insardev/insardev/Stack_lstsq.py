@@ -13,7 +13,7 @@ from .Stack_incidence import Stack_incidence
 class Stack_lstsq(Stack_incidence):
 
     @staticmethod
-    def lstsq1d(x, w, matrix, cumsum=True):
+    def _lstsq1d(x, w, matrix, cumsum=True):
         """
         Compute the least squares solution (or weighted least squares if weights are provided) for a given matrix.
 
@@ -84,7 +84,7 @@ class Stack_lstsq(Stack_incidence):
         # mask produced cumsum zeroes by NaNs where model[0] is the timeseries values
         return np.where(~np.isnan(model[0]), np.nancumsum(model[0], axis=0), np.nan)
 
-    def lstsq_matrix(self, pairs):
+    def _lstsq_matrix(self, pairs):
         """
         Create a matrix for use in the least squares computation based on interferogram date pairs.
 
@@ -101,9 +101,9 @@ class Stack_lstsq(Stack_incidence):
             is between the corresponding interferogram's reference and repeat dates, and
             0 otherwise.
         """
-        return (self.get_pairs_matrix(pairs)>=0).astype(int)
+        return (self._get_pairs_matrix(pairs)>=0).astype(int)
 
-    def lstsq_matrix_edge(self, pairs):
+    def _lstsq_matrix_edge(self, pairs):
         """
         Create an edge matrix for use in the least squares computation based on interferogram date pairs.
 
@@ -121,9 +121,9 @@ class Stack_lstsq(Stack_incidence):
         """
         print ('NOTE: this function is not used in the code and created for test purposes only.')
         import numpy as np
-        return np.nan_to_num(self.get_pairs_matrix(pairs)).astype(int)
+        return np.nan_to_num(self._get_pairs_matrix(pairs)).astype(int)
 
-    def lstsq(self, data, weight=None, matrix='auto', cumsum=True, debug=False):
+    def _lstsq(self, data, weight=None, matrix='auto', cumsum=True, debug=False):
         """
         Perform least squares (weighted or unweighted) computation on the input phase data in parallel.
 
@@ -211,14 +211,14 @@ class Stack_lstsq(Stack_incidence):
 
         # also define image capture dates from interferogram date pairs 
         # convert pairs (list, array, dataframe) to 2D numpy array
-        pairs, dates = self.get_pairs(data, dates=True)
+        pairs, dates = self._get_pairs(data, dates=True)
         pairs = pairs[['ref', 'rep']].astype(str).values
         
         # define pairs and dates matrix for LSQ calculation
         if isinstance(matrix, str) and matrix == 'auto':
             if debug:
                 print ('DEBUG: Generate default matrix')
-            matrix = self.lstsq_matrix(pairs)
+            matrix = self._lstsq_matrix(pairs)
         else:
             if debug:
                 print ('DEBUG: Use user-supplied matrix')
@@ -247,7 +247,7 @@ class Stack_lstsq(Stack_incidence):
                 # weight=1 is not allowed for the used weighted least squares calculation function 
                 weight_block = np.where(weight_block>=1, 1, weight_block)
                 # Vectorize vec_lstsq
-                vec_lstsq = np.vectorize(lambda x, w: self.lstsq1d(x, w, matrix, cumsum), signature='(n),(n)->(m)')
+                vec_lstsq = np.vectorize(lambda x, w: self._lstsq1d(x, w, matrix, cumsum), signature='(n),(n)->(m)')
                 # Apply vec_lstsq to data_block and weight_block and revert the original dimensions order
                 if stacks is None:
                     block = vec_lstsq(data_block, weight_block).transpose(2,0,1)
@@ -256,7 +256,7 @@ class Stack_lstsq(Stack_incidence):
                 del weight_block, vec_lstsq
             else:
                 # Vectorize vec_lstsq
-                vec_lstsq = np.vectorize(lambda x: self.lstsq1d(x, weight, matrix, cumsum), signature='(n)->(m)')
+                vec_lstsq = np.vectorize(lambda x: self._lstsq1d(x, weight, matrix, cumsum), signature='(n)->(m)')
                 # Apply vec_lstsq to data_block and weight_block and revert the original dimensions order
                 if stacks is None:
                     block = vec_lstsq(data_block).transpose(2,0,1)
@@ -307,7 +307,7 @@ class Stack_lstsq(Stack_incidence):
 
         return model
 
-    def rmse(self, data, solution, weight=None):
+    def _rmse(self, data, solution, weight=None):
         """
         Calculate difference between pairs and dates
     
@@ -338,7 +338,7 @@ class Stack_lstsq(Stack_incidence):
                 assert not 'stack' in weight.dims, 'ERROR: "weight" must be stacked consistently with "data".'
         
         # extract pairs
-        pairs = self.get_pairs(data)
+        pairs = self._get_pairs(data)
         # unify data and solution
         pairs = pairs[pairs.ref.isin(solution.date.values)&pairs.rep.isin(solution.date.values)]
         # calculate differences between end and start dates for all the pairs

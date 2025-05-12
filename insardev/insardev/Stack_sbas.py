@@ -13,12 +13,12 @@ import numpy as np
 
 class Stack_sbas(Stack_detrend):
 
-    def baseline_pairs(self, days=100, meters=None, invert=False, **kwargs):
-        print('Note: function baseline_pairs() renamed to sbas_pairs(). Use separate filtering functions when needed.')
-        return self.sbas_pairs(days=days, meters=meters, invert=invert)
+#    def baseline_pairs(self, days=100, meters=None, invert=False, **kwargs):
+#        print('Note: function baseline_pairs() renamed to sbas_pairs(). Use separate filtering functions when needed.')
+#        return self.sbas_pairs(days=days, meters=meters, invert=invert)
     
-    def sbas_pairs_filter_dates(self, pairs, dates):
-        return pairs[(~pairs['ref'].isin(dates))&(~pairs['rep'].isin(dates))]
+#    def sbas_pairs_filter_dates(self, pairs, dates):
+#        return pairs[(~pairs['ref'].isin(dates))&(~pairs['rep'].isin(dates))]
 
     def sbas_pairs_limit(self, pairs, limit=2, iterations=1):
         """
@@ -259,11 +259,11 @@ class Stack_sbas(Stack_detrend):
         import pandas as pd
         import numpy as np
 
-        pairs = self.get_pairs(data)
+        pairs = self._get_pairs(data)
     
         matrix = self.lstsq_matrix(pairs).max(axis=0)
         #print ('matrix', matrix)
-        dates = self.get_pairs(pairs, dates=True)[1]
+        dates = self._get_pairs(pairs, dates=True)[1]
         #print ('dates', dates)
         # ignore the first date
         pairs_new = []
@@ -340,7 +340,7 @@ class Stack_sbas(Stack_detrend):
             plt.plot([row['ref'], row['rep']], [row['ref_baseline'], row['rep_baseline']],
                      c='#30a2da' if pd.isnull(row['rel']) else '#2dda30', lw=0.5)
         # highlight the longest pair
-        # for _, row in self.get_pairs(pairs).sort_values('duration', ascending=False).head(1).iterrows():
+        # for _, row in self._get_pairs(pairs).sort_values('duration', ascending=False).head(1).iterrows():
         #     plt.plot([row['ref'], row['rep']], [row['ref_baseline'], row['rep_baseline']], c='red', lw=1)
     
         # Create annotations with adjust_text
@@ -500,7 +500,7 @@ class Stack_sbas(Stack_detrend):
     
         df = phase.to_dataframe()
         df['corr'] = corr.values if corr is not None else 1
-        pairs, dates = self.get_pairs(phase, dates=True)
+        pairs, dates = self._get_pairs(phase, dates=True)
         dates = pd.DatetimeIndex(dates)
         lstsq_matrix = self.lstsq_matrix(pairs)
         unwrap_matrix = self.unwrap_matrix(pairs)
