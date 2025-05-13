@@ -196,6 +196,10 @@ class Stack(Stack_plot):
 
         if datas is None:
             return self.dss
+        elif isinstance(datas, xr.Dataset):
+            return {'default': datas}
+        elif isinstance(datas, xr.DataArray):
+            return {'default': datas.to_dataset()}
         elif isinstance(datas, pd.DataFrame):
             dss = {}
             # iterate all burst groups

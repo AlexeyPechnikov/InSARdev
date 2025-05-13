@@ -67,16 +67,18 @@ class Stack_multilooking(Stack_phasediff):
                 x0 = self._coarsen_start(ds, 'x', xscale)
                 ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})
                 if wrap:
-                    da_complex = np.exp(1j * ds)
+                    da_complex = np.exp(1j * ds.astype(np.float32))
                     da_complex_agg = getattr(da_complex\
                            .coarsen(coarsen_args, boundary='trim'), func)()\
+                           .astype(np.complex64)\
                            .chunk({'y': self.chunksize, 'x': self.chunksize})
-                    da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real)
+                    da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real).astype(np.float32)
                     del da_complex, da_complex_agg
                     return da_decimated
                 else:
                     return getattr(ds\
                            .coarsen(coarsen_args, boundary='trim'), func)()\
+                           .astype(np.float32)\
                            .chunk({'y': self.chunksize, 'x': self.chunksize})
             # avoid creating the large chunks
             #with dask.config.set(**{'array.slicing.split_large_chunks': True}):

@@ -19,36 +19,34 @@ class Stack_phasediff(Stack_base):
     # internal method to compute interferogram on single polarization data array(s)
     def _interferogram(self,
                        pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
-                       datas:dict[str,xr.DataArray],
-                       polarization: str,
+                       data:xr.DataArray,
                        weight:xr.DataArray|None=None,
                        phase:xr.DataArray|None=None,
                        wavelength:float|None=None,
                        gaussian_threshold:float=0.5,
                        multilook:bool=False,
                        goldstein_window:int|list[int,int]|None=None,
-                       compute:bool=False,
                        debug:bool=False
-                       ):
+                       ) -> tuple[xr.DataArray,xr.DataArray]:
         import xarray as xr
         import numpy as np
         import dask
         import warnings
         # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
         warnings.filterwarnings(
-            "ignore",
+            'ignore',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
         # …and just in case you want to match by message too:
         warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
+            'ignore',
+            message='invalid value encountered in divide',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
 
-        assert isinstance(datas, (list, tuple, xr.DataArray)), 'ERROR: datas should be a list or tuple or DataArray'
+        assert isinstance(data, xr.DataArray), 'ERROR: data should be a DataArray'
 
         # wrap simplified single pair argument in a list
         pairs = pairs if isinstance(pairs[0], (list, tuple)) else [pairs]
@@ -56,143 +54,116 @@ class Stack_phasediff(Stack_base):
         if weight is not None:
            # convert to lazy data
            weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
-    
-        # decimate multilooking grids to specified resolution
-        #if resolution is not None:
-        #    decimator_intf = self.decimator_interferogram(resolution=resolution, grid=datas, coarsen=coarsen, debug=debug)
-        #    decimator_corr = self.decimator_correlation(resolution=resolution, grid=datas, coarsen=coarsen, debug=debug)
         
-        intfs = []
-        corrs = []
-        for data in (datas if isinstance(datas, (list, tuple)) else [datas]):
-            #data_vars = data.drop(['VV','VH','HH','HV'], errors='ignore').data_vars
-            #data_attrs = data.attrs
-            #print (data_vars)
+        # convert numeric pairs to date pairs
+        _pairs = [pair if isinstance(pair[0], str) else (data.date.isel(date=pair[0]).item(), data.date.isel(date=pair[1]).item()) for pair in pairs]
+        
+        # data = data[polarization]
+
+        if weight is not None:
+            # unify shape of data and weight
+            data = data.reindex_like(weight, fill_value=np.nan)
+        intensity = np.square(np.abs(data))
+        # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
+        intensity_look = self._multilooking(intensity, weight=weight,
+                                            wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
+        del intensity
+        # calculate phase difference with topography correction
+        phasediff = self._phasediff(_pairs, data, debug=debug)
+        if phase is not None:
+            phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
+        # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
+        phasediff_look = self._multilooking(phasediff, weight=weight,
+                                            wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
+        # correlation requires multilooking to detect influence between pixels
+        # hint: use multilook=False argument to keep phase difference without multilooking
+        corr_look = self._correlation(phasediff_look, intensity_look, debug=debug)
+        if not multilook:
+            # keep phase difference without multilooking
+            phasediff_look = phasediff
+        del phasediff
+        del intensity_look
+        if goldstein_window is not None:
+            # Goldstein filter in "psize" patch size, pixels
+            phasediff_look = self._goldstein(phasediff_look, corr_look, psize=goldstein_window, debug=debug)
+
+        # filter out not valid pixels
+        if weight is not None:
+            # apply coarsening to weight to match the phase difference grid
+            # no multilooking for weight because wavelength=None
+            weight_coarsen = self._multilooking(weight, wavelength=None, debug=debug)
+            phasediff_look = phasediff_look.where(np.isfinite(weight_coarsen))
+            corr_look = corr_look.where(np.isfinite(weight_coarsen))
+            del weight_coarsen
             
-            # convert numeric pairs to date pairs
-            _pairs = [pair if isinstance(pair[0], str) else (data.date.isel(date=pair[0]).item(), data.date.isel(date=pair[1]).item()) for pair in pairs]
-            
-            data = data[polarization]
+        # convert complex phase difference to interferogram
+        intf_look = self._phase2interferogram(phasediff_look, debug=debug)
+        del phasediff_look
 
-            if weight is not None:
-                # unify shape of data and weight
-                data = data.reindex_like(weight, fill_value=np.nan)
-            intensity = np.square(np.abs(data))
-            # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
-            intensity_look = self._multilooking(intensity, weight=weight,
-                                               wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
-            del intensity
-            # calculate phase difference with topography correction
-            phasediff = self._phasediff(_pairs, data, debug=debug)
-            if phase is not None:
-                phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
-            # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
-            phasediff_look = self._multilooking(phasediff, weight=weight,
-                                               wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
-            # correlation requires multilooking to detect influence between pixels
-            # hint: use multilook=False argument to keep phase difference without multilooking
-            corr_look = self._correlation(phasediff_look, intensity_look, debug=debug)
-            if not multilook:
-                # keep phase difference without multilooking
-                phasediff_look = phasediff
-            del phasediff
-            del intensity_look
-            if goldstein_window is not None:
-                # Goldstein filter in "psize" patch size, pixels
-                phasediff_look = self._goldstein(phasediff_look, corr_look, psize=goldstein_window, debug=debug)
+        intf = intf_look.assign_attrs(data.attrs)
+        corr = corr_look.assign_attrs(data.attrs)
+        del corr_look, intf_look
 
-            # filter out not valid pixels
-            if weight is not None:
-                # apply coarsening to weight to match the phase difference grid
-                # no multilooking for weight because wavelength=None
-                weight_coarsen = self._multilooking(weight, wavelength=None, debug=debug)
-                phasediff_look = phasediff_look.where(np.isfinite(weight_coarsen))
-                corr_look = corr_look.where(np.isfinite(weight_coarsen))
-                del weight_coarsen
-                
-            # convert complex phase difference to interferogram
-            intf_look = self._phase2interferogram(phasediff_look, debug=debug)
-            del phasediff_look
-    
-            intfs.append(intf_look.assign_attrs(data.attrs))
-            corrs.append(corr_look.assign_attrs(data.attrs))
-            del corr_look, intf_look
+        return (intf, corr)
 
-        if compute:
-            progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
-            del intfs, corrs
-            return result
-        return (intfs, corrs)
+        # if compute:
+        #     progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
+        #     del intfs, corrs
+        #     return result
+        # return (intfs, corrs)
 
     def interferogram(self,
                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
-                      datas:dict[str,xr.DataArray],
-                      weight:dict[str,xr.DataArray]|None=None,
-                      phase:dict[str,xr.DataArray]|None=None,
+                      datas:dict[str,xr.Dataset],
+                      weights:dict[str,xr.DataArray]|None=None,
+                      phases:dict[str,xr.DataArray]|None=None,
                       wavelength:float|None=None,
                       gaussian_threshold:float=0.5,
                       multilook:bool=False,
                       goldstein_window:int|list[int,int]|None=None,
                       compute:bool=False,
                       debug:bool=False
-                      ):
+                      ) -> dict[str,xr.Dataset]:
         import xarray as xr
         import numpy as np
         import dask
 
         assert isinstance(datas, dict), 'ERROR: datas should be a dict of xarray.Dataset'
+        assert isinstance(weights, dict) or weights is None, 'ERROR: weights should be a dict of xarray.DataArray'
+        assert isinstance(phases, dict) or phases is None, 'ERROR: phases should be a dict of xarray.DataArray'
         # workaround for previous code
-        datas = list(datas.values())
 
-        if not isinstance(datas, (list, tuple)):
-            if isinstance(datas, xr.Dataset):
-                datas = [datas]
-            elif isinstance(datas, xr.DataArray):
-                datas = [datas.to_dataset()]
-            else:
-                raise ValueError(f'ERROR: datas is not a Dataset and DataArray or list or tuple of them: {type(datas)}')
-        else:
-            if isinstance(datas[0], xr.DataArray):
-                datas = [ds.to_dataset() for ds in datas]
-        
-        # copy id from the data to the result
-        #ids = [ds.attrs.get('id', None) for ds in datas]
-
-        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
+        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in next(iter(datas.values())).data_vars]
         #print ('polarizations', polarizations)
-        
-        intfs_pols = []
-        corrs_pols = []
-        for pol in polarizations:
-            intfs, corrs = self._interferogram(pairs,
-                                               datas=datas,
-                                               polarization=pol,
-                                               weight=weight,
-                                               phase=phase,
-                                               wavelength=wavelength,
-                                               gaussian_threshold=gaussian_threshold,
-                                               multilook=multilook,
-                                               goldstein_window=goldstein_window,
-                                               compute=compute,
-                                               debug=debug
-                                               )
-            intfs_pols.append(intfs)
-            corrs_pols.append(corrs)
-            del intfs, corrs
 
-        intfs_pols = [xr.merge([das[idx] for das in intfs_pols]) for idx in range(len(intfs_pols[0]))]
-        corrs_pols = [xr.merge([das[idx] for das in corrs_pols]) for idx in range(len(corrs_pols[0]))]
-        dss = (intfs_pols, corrs_pols)
-        # workaround for previous code, use attributes from the original data for keys to build a dict
-        return self.to_dict(dss[0]), self.to_dict(dss[1])
+        results = []
+        for polarization in polarizations:
+            results_pol = [self._interferogram(pairs,
+                                       data=datas[k][polarization],
+                                       weight=weights[k] if weights is not None else None,
+                                       phase=phases[k] if phases is not None else None,
+                                       wavelength=wavelength,
+                                       gaussian_threshold=gaussian_threshold,
+                                       multilook=multilook,
+                                       goldstein_window=goldstein_window,
+                                       debug=debug) for k in datas.keys()]
+            if compute:
+                progressbar(results_pol := dask.persist(*results_pol), desc=f'Computing {polarization} Intfs...'.ljust(25))
+            results.append(results_pol)
+            del results_pol
+
+        # unpack the results
+        intfs = {k:xr.merge([results[pidx][idx][0] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
+        corrs = {k:xr.merge([results[pidx][idx][1] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
+        return intfs, corrs
 
     # single-look interferogram processing has a limited set of arguments
     # resolution and coarsen are not applicable here
     def interferogram_singlelook(self,
                                 pairs,
                                 datas=None,
-                                weight=None,
-                                phase=None,
+                                weights=None,
+                                phases=None,
                                 wavelength=None,
                                 gaussian_threshold=0.5,
                                 goldstein_window=None,
@@ -200,8 +171,8 @@ class Stack_phasediff(Stack_base):
                                 debug=False):
         return self.interferogram(pairs,
                                 datas=datas,
-                                weight=weight,
-                                phase=phase,
+                                weights=weights,
+                                phases=phases,
                                 wavelength=wavelength,
                                 gaussian_threshold=gaussian_threshold,
                                 multilook=False,
@@ -214,8 +185,8 @@ class Stack_phasediff(Stack_base):
     def interferogram_multilook(self,
                               pairs,
                               datas=None,
-                              weight=None,
-                              phase=None,
+                              weights=None,
+                              phases=None,
                               wavelength=None,
                               gaussian_threshold=0.5,
                               goldstein_window=None,
@@ -223,8 +194,8 @@ class Stack_phasediff(Stack_base):
                               debug=False):
         return self.interferogram(pairs,
                                 datas=datas,
-                                weight=weight,
-                                phase=phase,
+                                weights=weights,
+                                phases=phases,
                                 wavelength=wavelength,
                                 gaussian_threshold=gaussian_threshold,
                                 multilook=True,
@@ -261,16 +232,16 @@ class Stack_phasediff(Stack_base):
         import warnings
         # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
         warnings.filterwarnings(
-            "ignore",
+            'ignore',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
         # …and just in case you want to match by message too:
         warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
+            'ignore',
+            message='invalid value encountered in divide',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
 
         # check correctness for user-defined data arguments
@@ -303,16 +274,16 @@ class Stack_phasediff(Stack_base):
         import warnings
         # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
         warnings.filterwarnings(
-            "ignore",
+            'ignore',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
         # …and just in case you want to match by message too:
         warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
+            'ignore',
+            message='invalid value encountered in divide',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
 
         if debug:
@@ -342,16 +313,16 @@ class Stack_phasediff(Stack_base):
         import warnings
         # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
         warnings.filterwarnings(
-            "ignore",
+            'ignore',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
         # …and just in case you want to match by message too:
         warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
+            'ignore',
+            message='invalid value encountered in divide',
             category=RuntimeWarning,
-            module=r"dask\._task_spec"
+            module=r'dask\._task_spec'
         )
 
         if debug:

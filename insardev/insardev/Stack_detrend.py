@@ -11,142 +11,9 @@
 from .Stack_unwrap import Stack_unwrap
 
 class Stack_detrend(Stack_unwrap):
-# 
-#     @staticmethod
-#     def regression_linear(data, grid, fit_intercept=True):
-#         import numpy as np
-#         import xarray as xr
-#         import dask
-# 
-#         # define topography on the same grid and fill NaNs
-#         grid = grid.reindex_like(data, method='nearest').fillna(0)
-# 
-#         # find stack dim
-#         stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
-#         #print ('stackvar', stackvar)
-#         shape2d = data.shape[1:] if len(data.dims) == 3 else data.shape
-#         #print ('shape2d', shape2d)
-# 
-#         @dask.delayed
-#         def regression_block(stackval, fit_intercept):
-#             from sklearn.linear_model import LinearRegression
-#             from sklearn.pipeline import make_pipeline
-#             from sklearn.preprocessing import StandardScaler
-# 
-#             # use outer variable
-#             data_block = (data.sel({stackvar: stackval}) if stackval is not None else data).compute(n_workers=1)
-# 
-#             grid_values = grid.values.ravel()
-#             data_values = data_block.values.ravel()
-#             nanmask = np.isnan(grid_values) | np.isnan(data_values)
-#         
-#             # build prediction model with or without plane removal (fit_intercept)
-#             regr = make_pipeline(StandardScaler(), LinearRegression(fit_intercept=fit_intercept))
-#             # fit 1D non-NaNs phase and topography and predict on the non-NaNs 2D topography grid
-#             data_grid = regr.fit(np.column_stack([grid_values [~nanmask]]),
-#                                  np.column_stack([data_values[~nanmask]]))\
-#                         .predict(np.column_stack([grid_values])).reshape(data_block.shape)
-#             # cleanup
-#             del grid_values, data_values, nanmask, data_block
-#             return data_grid
-#         
-#         stack = []
-#         for stackval in data[stackvar].values if len(data.dims) == 3 else [None]:
-#             #print ('stackval', stackval)
-#             block = dask.array.from_delayed(regression_block(stackval, fit_intercept=fit_intercept),
-#                                             shape=shape2d, dtype=np.float32)
-#             stack.append(block)
-#             del block
-# 
-#         return xr.DataArray(dask.array.stack(stack) if len(data.dims) == 3 else stack[0],
-#                             coords=data.coords)\
-#                .rename(data.name)
-
-#     @staticmethod
-#     def regression_linear(data, variables, weight=None, valid_pixels_threshold=10000, fit_intercept=True):
-#         """
-#         topo = sbas.get_topo().coarsen({'x': 4}, boundary='trim').mean()
-#         yy, xx = xr.broadcast(topo.y, topo.x)
-#         strat_sbas = sbas.regression_linear(unwrap_sbas.phase,
-#                 [topo,    topo*yy,    topo*xx,    topo*yy*xx,
-#                  topo**2, topo**2*yy, topo**2*xx, topo**2*yy*xx,
-#                  topo**3, topo**3*yy, topo**3*xx, topo**3*yy*xx,
-#                  yy, xx,
-#                  yy**2, xx**2, yy*xx,
-#                  yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
-#         """
-#         import numpy as np
-#         import xarray as xr
-#         import dask
-#         from sklearn.linear_model import LinearRegression
-#         from sklearn.pipeline import make_pipeline
-#         from sklearn.preprocessing import StandardScaler
-# 
-#         if weight is not None and len(weight.dims) == 3 and weight.shape != data.shape:
-#             raise Exception(f'Argument "weight" 3D shape {weight.shape} should be equal to "data" 3D shape {data.shape}')
-#         if weight is not None and len(weight.dims) == 2 and weight.shape != data.shape[1:]:
-#             raise Exception(f'Argument "weight" 2D shape {weight.shape} should be equal to "data" 2D shape {data.shape[1:]}')
-# 
-#         # find stack dim
-#         stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
-#         #print ('stackvar', stackvar)
-#         shape2d = data.shape[1:] if len(data.dims) == 3 else data.shape
-#         #print ('shape2d', shape2d)
-#         chunk2d = data.chunks[1:] if len(data.dims) == 3 else data.chunks
-#         #print ('chunk2d', chunk2d)
-#     
-#         if isinstance(variables, (list, tuple)):
-#             variables = xr.concat(variables, dim='stack')
-#         elif not isinstance(variables, xr.DataArray) or len(variables.dims) not in (2, 3):
-#             raise Exception('Argument "variables" should be 2D or 3D Xarray dataarray of list of 2D Xarray dataarrays')
-#         elif len(variables.dims) == 2:
-#             variables = variables.expand_dims('stack')
-#         elif len(variables.dims) == 3 and not variables.dims[0] == 'stack':
-#             raise Exception('Argument "variables" 3D Xarray dataarray needs the first dimension name "stack"')
-#         #print ('variables', variables)
-# 
-#         def regression_block(data, variables, weight, valid_pixels_threshold, fit_intercept):
-#             data_values  = data.ravel()
-#             variables_values = variables.reshape(-1, variables.shape[-1]).T
-#             #assert 0, f'TEST: {data_values.shape}, {variables_values.shape}, {weight.shape}'
-#             if weight.size > 1:
-#                 weight_values = weight.ravel()
-#                 nanmask = np.isnan(data_values) | np.isnan(weight_values) | np.any(np.isnan(variables_values), axis=0)
-#             else:
-#                 weight_values = None
-#                 nanmask = np.isnan(data_values) | np.any(np.isnan(variables_values), axis=0)
-# 
-#             # regression requires enough amount of valid pixels
-#             if data_values.size - np.sum(nanmask) < valid_pixels_threshold:
-#                 del data_values, variables_values, weight_values, nanmask
-#                 return np.nan * np.zeros(data.shape)
-# 
-#             # build prediction model with or without plane removal (fit_intercept)
-#             regr = make_pipeline(StandardScaler(), LinearRegression(fit_intercept=fit_intercept, copy_X=False, n_jobs=1))
-#             fit_params = {'linearregression__sample_weight': weight_values[~nanmask]} if weight.size > 1 else {}
-#             regr.fit(variables_values[:, ~nanmask].T, data_values[~nanmask], **fit_params)
-#             del weight_values, data_values
-#             model = np.full_like(data, np.nan).ravel()
-#             model[~nanmask] = regr.predict(variables_values[:, ~nanmask].T)
-#             del variables_values, regr
-#             return model.reshape(data.shape)
-# 
-#         # xarray wrapper
-#         model = xr.apply_ufunc(
-#             regression_block,
-#             data,
-#             variables.chunk(dict(stack=-1, y=chunk2d[0], x=chunk2d[1])),
-#             weight.chunk(dict(y=chunk2d[0], x=chunk2d[1])) if weight is not None else weight,
-#             dask='parallelized',
-#             vectorize=False,
-#             output_dtypes=[np.float32],
-#             input_core_dims=[[], ['stack'], []],
-#             dask_gufunc_kwargs={'valid_pixels_threshold': valid_pixels_threshold, 'fit_intercept': fit_intercept},
-#         )
-#         return model
 
     @staticmethod
-    def regression(data, variables, weight=None, algorithm='linear', degree=1, wrap=False, valid_pixels_threshold=1000, **kwargs):
+    def regression2d(data, variables, weight=None, algorithm='linear', degree=1, wrap=False, valid_pixels_threshold=1000, **kwargs):
         """
         topo = sbas.get_topo().coarsen({'x': 4}, boundary='trim').mean()
         yy, xx = xr.broadcast(topo.y, topo.x)
@@ -301,7 +168,7 @@ class Stack_detrend(Stack_unwrap):
 
         return model
 
-    def regression_linear(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000, fit_intercept=True):
+    def regression2d_linear(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000, fit_intercept=True):
         """   
         topo = sbas.get_topo().coarsen({'x': 4}, boundary='trim').mean()
         yy, xx = xr.broadcast(topo.y, topo.x)
@@ -313,7 +180,7 @@ class Stack_detrend(Stack_unwrap):
                  yy**2, xx**2, yy*xx,
                  yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
         """
-        return self.regression(
+        return self.regression2d(
             data,
             variables,
             weight=weight,
@@ -324,7 +191,7 @@ class Stack_detrend(Stack_unwrap):
             fit_intercept=fit_intercept
         )
 
-    def regression_sgd(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000,
+    def regression2d_sgd(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000,
                       penalty='elasticnet', max_iter=1000, tol=1e-3, alpha=0.0001, l1_ratio=0.15):
         """
         Perform regression on a dataset using the SGDRegressor model from scikit-learn.
@@ -349,7 +216,7 @@ class Stack_detrend(Stack_unwrap):
         - SGDRegressor is well-suited for large datasets due to its efficiency in handling large-scale and high-dimensional data.
         - Proper tuning of parameters (max_iter, tol, alpha, l1_ratio) is crucial for optimal performance and prevention of overfitting.
 
-        Example:  
+        Example:
         decimator = sbas.decimator(resolution=15, grid=(1,1))
         topo = decimator(sbas.get_topo())
         inc = decimator(sbas.incidence_angle())
@@ -363,7 +230,7 @@ class Stack_detrend(Stack_unwrap):
                  yy**2, xx**2, yy*xx,
                  yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
         """
-        return self.regression(
+        return self.regression2d(
             data,
             variables,
             weight=weight,
@@ -378,7 +245,7 @@ class Stack_detrend(Stack_unwrap):
             l1_ratio=l1_ratio
         )
 
-    def regression_xgboost(self, data, variables, weight=None, wrap=False, valid_pixels_threshold=1000,
+    def regression2d_xgboost(self, data, variables, weight=None, wrap=False, valid_pixels_threshold=1000,
                            n_estimators=100, learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=1, **kwargs):
         """
         Perform regression on a dataset using XGBoost (XGBRegressor).
@@ -409,7 +276,7 @@ class Stack_detrend(Stack_unwrap):
         xarray.DataArray
             The predicted values as an xarray DataArray, fitted by XGBRegressor.
         """
-        return self.regression(
+        return self.regression2d(
             data,
             variables,
             weight=weight,
@@ -542,52 +409,6 @@ class Stack_detrend(Stack_unwrap):
             return out.assign_coords(stack=multi_index)
         return out
 
-#     def polyfit(self, data, weight=None, degree=0, variable=None, count=None):
-#         import xarray as xr
-#         import pandas as pd
-#         import numpy as np
-# 
-#         pairs, dates = self._get_pairs(data, dates=True)
-#         if variable is not None:
-#             pairs['variable'] = variable.values if isinstance(variable, pd.Series) else variable
-# 
-#         models = []
-#         for date in dates:
-#             data_pairs = pairs[(pairs.ref==date)|(pairs.rep==date)].pair.values
-#             #print (data_pairs)
-#             stack = data.sel(pair=data_pairs)
-#             if weight is None:
-#                 stack = data.sel(pair=data_pairs)
-#             else:
-#                 stack = data.sel(pair=data_pairs) * np.sqrt(weight.sel(pair=data_pairs))
-#             # days, positive and negative
-#             days = xr.where(stack.ref < pd.Timestamp(date),
-#                            (stack.ref - stack.rep).dt.days,
-#                            (stack.rep - stack.ref).dt.days)
-#             # select smallest intervals
-#             days_selected = days[np.argsort(np.abs(days.values))][:count]
-#             if variable is not None:
-#                 data_variables = xr.DataArray(pairs[pairs.pair.isin(data_pairs)]['variable'].values, coords=days.coords)
-#             else:
-#                 data_variables = days
-#             #print (days, days_selected, data_variables)
-#             #.sortby(['ref', 'rep'])
-#             linear_fit = (np.sign(days)*stack)\
-#                 .assign_coords(time=data_variables)[stack.pair.isin(days_selected.pair)]\
-#                 .swap_dims({'pair': 'variable'})\
-#                 .polyfit(dim='variable', deg=degree)
-#             model = linear_fit.polyfit_coefficients.sel(degree=degree)
-#             models.append(model.assign_coords(date=pd.to_datetime(date)))
-#             del data_pairs, stack, days, days_selected, data_variables, linear_fit, model
-#         model = xr.concat(models, dim='date')
-#         del models
-# 
-#         out = xr.concat([(model.sel(date=ref).drop('date') - model.sel(date=rep).drop('date'))\
-#                                  .assign_coords(pair=str(ref.date()) + ' ' + str(rep.date()), ref=ref, rep=rep) \
-#                           for ref, rep in zip(pairs['ref'], pairs['rep'])], dim='pair')
-# 
-#         return out.rename(data.name)
-
     def gaussian(self, data, wavelength, truncate=3.0, resolution=60, debug=False):
         """
         Apply a lazy Gaussian filter to an input 2D or 3D data array.
@@ -693,356 +514,6 @@ class Stack_detrend(Stack_unwrap):
 
         return out
 
-#     def detrend(self, dataarray, fit_intercept=True, fit_dem=True, fit_coords=True,
-#                 resolution=90, debug=False):
-#         """
-#         Detrend and return output for a single unwrapped interferogram combining optional topography and linear components removal.
-# 
-#         Parameters
-#         ----------
-#         dataarray : xarray.DataArray
-#             The input data array to detrend.
-#         fit_intercept : bool, optional
-#             Whether to remove the mean value (plane) from the data. Default is True.
-#         fit_dem : bool, optional
-#             Whether to detrend the topography. Default is True.
-#         fit_coords : bool, optional
-#             Whether to detrend the linear coordinate components. Default is True.
-#         resolution : int, optional
-#             The processing resolution to prevent overfitting and reduce grid size. Default is 90.
-#         debug : bool, optional
-#             Whether to print debug information. Default is False.
-# 
-#         Returns
-#         -------
-#         xarray.DataArray
-#             The detrended 2D data array.
-# 
-#         Examples
-#         --------
-#         Simplest detrending:
-#         unwrap_detrended = stack.detrend(pair.values[0] if isinstance(pairs, pd.DataFrame) else pair[0])
-# 
-#         Detrend unwrapped interferogram in radar coordinates, see for details:
-#         - [GitHub Issue 98](https://github.com/gmtsar/gmtsar/issues/98)
-#         - [GitHub Issue 411](https://github.com/gmtsar/gmtsar/issues/411)
-#         """
-#         import xarray as xr
-#         import numpy as np
-#         import dask
-#         from sklearn.linear_model import LinearRegression
-#         from sklearn.pipeline import make_pipeline
-#         from sklearn.preprocessing import StandardScaler
-# 
-#         def postprocessing(out):
-#             return out.astype(np.float32).rename('detrend')
-# 
-#         # check the simplest case
-#         if not fit_intercept and not fit_dem and not fit_coords:
-#             print ('NOTE: All the detrending options disable, function does nothing')
-#             return dataarray
-# 
-#         # check simple case
-#         if fit_intercept and not fit_dem and not fit_coords:
-#             if debug:
-#                 print ('DEBUG: Remove mean value only')
-#             return postprocessing(dataarray - dataarray.mean())
-# 
-#         # input grid can be too large
-#         decimator = self.pixel_decimator(resolution=resolution, grid=dataarray, debug=debug)
-#         # decimate
-#         dataarray_dec = decimator(dataarray)
-#         if debug:
-#             print ('DEBUG: Decimated data array', dataarray_dec.shape)
-# 
-#         # topography grid required to fit_dem option only
-#         if fit_dem:
-#             if debug:
-#                 print ('DEBUG: Interpolate topography on the data grid')
-#             topo = self.get_topo()
-#             #topo = topo.reindex_like(unwraps[0], method='nearest')
-#             # use xr.zeros_like to prevent the target grid coordinates modifying
-#             topo = topo.reindex_like(dataarray, method='nearest')
-#             # check chunks
-#             if debug:
-#                 print ('DEBUG: regrid to resolution in meters', resolution)
-#             # decimate
-#             topo_dec  = decimator(topo)
-#             if debug:
-#                 print ('DEBUG: Decimated topography array', topo_dec.shape)
-#         else:
-#             topo = topo_dec = None
-# 
-#         # lazy calculations are useless below
-#         def data2fit(data, elev, yy, xx):
-#             y = data.values.reshape(-1) if isinstance(data, xr.DataArray) else data.reshape(-1)
-#             nanmask = np.isnan(y)
-#             # prepare regression variable
-#             Y = y[~nanmask]
-# 
-#             if fit_coords or fit_dem:
-#                 # prepare coordinates for X regression variable
-#                 ys = (yy.values.reshape(-1) if isinstance(yy, xr.DataArray) else yy.reshape(-1))[~nanmask]
-#                 xs = (xx.values.reshape(-1) if isinstance(xx, xr.DataArray) else xx.reshape(-1))[~nanmask]
-# 
-#             if fit_dem:
-#                 # prepare topography for X regression variable
-#                 zs = (elev.values.reshape(-1) if isinstance(elev, xr.DataArray) else elev.reshape(-1))[~nanmask]
-#                 zys = zs*ys
-#                 zxs = zs*xs
-# 
-#             if fit_dem and fit_coords:
-#                 X = np.column_stack([zys, zxs, ys, xs, zs])
-#             elif fit_dem:
-#                 X = np.column_stack([zys, zxs, zs])
-#             elif fit_coords:
-#                 X = np.column_stack([ys, xs])
-#             return Y, X, nanmask
-# 
-#         if debug:
-#             print ('DEBUG: linear regression calculation')
-# 
-#         def regr_fit():
-#             # build prediction model with or without plane removal (fit_intercept)
-#             regr = make_pipeline(StandardScaler(), LinearRegression(fit_intercept=fit_intercept))
-#             yy, xx = xr.broadcast(dataarray_dec.y, dataarray_dec.x)
-#             Y, X, _ = data2fit(dataarray_dec, topo_dec, yy, xx)
-# 
-#             return regr.fit(X, Y)
-# 
-#         # calculate for chunks
-#         def predict(data, elev, yy, xx, regr):
-#             Y, X, nanmask = data2fit(data, elev, yy, xx)
-#             # the chunk is NaN-filled, prediction impossible
-#             if nanmask.all():
-#                 return data
-#             # predict when some values are not NaNs
-#             model = np.nan * np.zeros(data.shape)
-#             model.reshape(-1)[~nanmask] = regr.predict(X)
-#             # return data without the trend
-#             return data - model
-# 
-#         def regr_predict(regr):
-#             yy = xr.DataArray(dataarray.y).chunk(-1)
-#             xx = xr.DataArray(dataarray.x).chunk(-1)
-#             yy, xx = xr.broadcast(yy, xx)
-# 
-#             # xarray wrapper
-#             return xr.apply_ufunc(
-#                 predict,
-#                 dataarray,
-#                 topo.chunk(dataarray.chunks) if topo is not None else None,
-#                 yy.chunk(dataarray.chunks),
-#                 xx.chunk(dataarray.chunks),
-#                 dask='parallelized',
-#                 vectorize=False,
-#                 output_dtypes=[np.float32],
-#                 dask_gufunc_kwargs={'regr': regr},
-#             )
-# 
-#         # build the model and return the input data without the detected trend
-#         return postprocessing(regr_predict(regr_fit()))
-
-#     def gaussian(self, grid, wavelength, truncate=3.0, resolution=90, debug=False):
-#         """
-#         Apply a lazy Gaussian filter to an input 2D or 3D data array.
-# 
-#         Parameters
-#         ----------
-#         dataarray : xarray.DataArray
-#             The input data array with NaN values allowed.
-#         wavelength : float
-#             The cut-off wavelength for the Gaussian filter in meters.
-#         truncate : float, optional
-#             Size of the Gaussian kernel, defined in terms of standard deviation, or 'sigma'. 
-#             It is the number of sigmas at which the window (filter) is truncated. 
-#             For example, if truncate = 3.0, the window will cut off at 3 sigma. Default is 3.0.
-#         resolution : float, optional
-#             The processing resolution for the Gaussian filter in meters.
-#         debug : bool, optional
-#             Whether to print debug information.
-# 
-#         Returns
-#         -------
-#         xarray.DataArray
-#             The filtered data array with the same coordinates as the input.
-# 
-#         Examples
-#         --------
-#         Detrend ionospheric effects and solid Earth's tides on a large area and save to disk:
-#         stack.stack_gaussian2d(slcs, wavelength=400)
-#         For band-pass filtering apply the function twice and save to disk:
-#         model = stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
-#             - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True)
-#         stack.save_cube(model, caption='Gaussian Band-Pass filtering')
-# 
-#         Detrend and return lazy xarray dataarray:
-#         stack.stack_gaussian2d(slcs, wavelength=400, interactive=True)
-#         For band-pass filtering apply the function twice:
-#         stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
-#             - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True) 
-# 
-#         """
-#         import xarray as xr
-#         import numpy as np
-# 
-#         assert wavelength is not None, 'ERROR: Gaussian filter cut-off wavelength is not defined'
-# 
-#         # ground pixel size
-#         dy, dx = self.get_spacing(grid)
-#         # reduction
-#         yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
-#         # gaussian kernel
-#         sigma_y = np.round(wavelength / dy / yscale)
-#         sigma_x = np.round(wavelength / dx / xscale)
-#         if debug:
-#             print (f'DEBUG: average ground pixel size in meters: y={dy}, x={dx}')
-#             print (f'DEBUG: yscale {yscale}, xscale {xscale} to resolution {resolution} m')
-#             print ('DEBUG: Gaussian filtering using resolution, sigma_y, sigma_x', resolution, sigma_y, sigma_x)
-# 
-#         # find stack dim
-#         stackvar = grid.dims[0] if len(grid.dims) == 3 else 'stack'
-#         #print ('stackvar', stackvar)
-#     
-#         stack = []
-#         for stackval in grid[stackvar].values if len(grid.dims) == 3 else [None]:
-#             block = grid.sel({stackvar: stackval}) if stackval is not None else grid
-#             block_dec = self.antialiasing_downscale(block, wavelength=resolution, coarsen=(yscale,xscale), debug=debug)
-#             gaussian_dec = self._nanconvolve2d_gaussian(block_dec, (sigma_y,sigma_x), truncate=truncate)
-#             # interpolate decimated filtered grid to original resolution
-#             gaussian = gaussian_dec.interp_like(block, method='nearest')
-#             # revert the original chunks
-#             gaussian = xr.unify_chunks(block, gaussian)[1]
-#             stack.append(gaussian.astype(np.float32).rename('gaussian'))
-# 
-#         # wrap lazy Dask array to Xarray dataarray
-#         if len(grid.dims) == 2:
-#             out = stack[0]
-#         else:
-#             out = xr.concat(stack, dim=stackvar)
-#         del stack
-# 
-#         # append source grid coordinates excluding removed y, x ones
-#         for (k,v) in grid.coords.items():
-#             if k not in ['y','x']:
-#                 out[k] = v
-#     
-#         return out
-
-#     def turbulence(self, phase, date_crop=0, symmetrical=False):
-#         pairs, dates = self._get_pairs(phase, dates=True)
-#     
-#         turbos = []
-#         for date in dates:
-#             ref = pairs[pairs.ref==date]
-#             rep = pairs[pairs.rep==date]
-#             # calculate left and right pairs
-#             if symmetrical:
-#                 count = min(len(ref), len(rep))
-#             else:
-#                 count = None
-#             #print (date, len(ref), len(rep), '=>', count)
-#             if len(ref) < 1 or len(rep) < 1:
-#                 # correction calculation is not possible
-#                 #turbo = xr.zeros_like((detrend - phase_topo).isel(pair=0)).drop(['pair','ref','rep'])
-#                 continue
-#             else:
-#                 ref_data = phase.sel(pair=ref.pair.values).isel(pair=slice(None,count))
-#                 #ref_weight = 1/corr60m.sel(pair=ref_data.pair)
-#                 #print (ref_data)
-#                 rep_data = phase.sel(pair=rep.pair.values ).isel(pair=slice(None,count))
-#                 #rep_weight = 1/corr60m.sel(pair=rep_data.pair)
-#                 #print (rep_data)
-#                 #mask = (ref_weight.sum('pair') + rep_weight.sum('pair'))/2/count
-#                 turbo = (ref_data.mean('pair') - rep_data.mean('pair')) / 2
-#                 #turbo = ((ref_data*ref_weight).mean('pair')/ref_weight.sum('pair') -\
-#                 #         (rep_data*rep_weight).mean('pair')/rep_weight.sum('pair')) / 2
-#                 #.where(mask>MASK)
-#             turbos.append(turbo.assign_coords(date=pd.to_datetime(date)))
-#             del turbo
-#         turbo = xr.concat(turbos, dim='date')
-#         del turbos
-#     
-#         # convert dates to pairs
-#         #pairs = pairs[pairs.ref.isin(turbo.date.values)&pairs.rep.isin(turbo.date.values)]
-#         fake = xr.zeros_like(phase.isel(pair=0))
-# 
-#     #     return [(
-#     #         (turbo.sel(date=ref).drop('date') if ref in turbo.date else fake) - \
-#     #         (turbo.sel(date=rep).drop('date') if rep in turbo.date else fake)
-#     #     ).assign_coords(pair=str(ref.date()) + ' ' + str(rep.date()), ref=ref, rep=rep) \
-#     #     for ref, rep in zip(pairs['ref'], pairs['rep'])]
-#     
-#     
-#         dates_crop = dates[date_crop:None if date_crop is None or date_crop==0 else -date_crop]
-#         pairs_crop = pairs[pairs.ref.isin(dates_crop)&pairs.rep.isin(dates_crop)]
-#     
-#     #     refs = [ref for ref in pairs['ref'] if str(ref.date()) in dates]
-#     #     reps = [rep for rep in pairs['rep'] if str(rep.date()) in dates]
-#     
-#         phase_turbo = xr.concat([(
-#             (turbo.sel(date=ref).drop('date') if ref in turbo.date else fake) - \
-#             (turbo.sel(date=rep).drop('date') if rep in turbo.date else fake)
-#         ).assign_coords(pair=str(ref.date()) + ' ' + str(rep.date()), ref=ref, rep=rep) \
-#         for ref, rep in zip(pairs_crop['ref'], pairs_crop['rep'])], dim='pair')
-#     
-#     #     phase_turbo = xr.concat([(turbo.sel(date=ref) - turbo.sel(date=rep))\
-#     #                              .assign_coords(pair=str(ref.date()) + ' ' + str(rep.date()), ref=ref, rep=rep) \
-#     #                              for ref, rep in \
-#     #                              zip(pairs['ref'], pairs['rep'])],
-#     #                        dim='pair')
-#         #phase_turbo['ref'].values = pd.to_datetime(phase_turbo['ref'])
-#         #phase_turbo['rep'].values = pd.to_datetime(phase_turbo['rep'])
-#         return phase_turbo
-
-#     def turbulence(self, phase, weight=None, date_crop=1, symmetrical=False):
-#         import xarray as xr
-#         import pandas as pd
-# 
-#         pairs, dates = self._get_pairs(phase, dates=True)
-# 
-#         turbos = []
-#         for date in dates:
-#             ref = pairs[pairs.ref==date]
-#             rep = pairs[pairs.rep==date]
-#             # calculate left and right pairs
-#             count = min(len(ref), len(rep)) if symmetrical else None
-#             #print (date, len(ref), len(rep), '=>', count)
-#             if len(ref) < 1 or len(rep) < 1:
-#                 # correction calculation is not possible
-#                 continue
-#             ref_data = phase.sel(pair=ref.pair.values).isel(pair=slice(None,count))
-#             #print (ref_data)
-#             rep_data = phase.sel(pair=rep.pair.values ).isel(pair=slice(None,count))
-#             #print (rep_data)
-#             if weight is not None:
-#                 ref_weight = weight.sel(pair=ref_data.pair)
-#                 rep_weight = weight.sel(pair=rep_data.pair)
-#                 turbo = ((ref_data*ref_weight).mean('pair')/ref_weight.sum('pair') -\
-#                          (rep_data*rep_weight).mean('pair')/rep_weight.sum('pair')) / 2
-#                 del ref_weight, rep_weight
-#             else:
-#                 turbo = (ref_data.mean('pair') - rep_data.mean('pair')) / 2
-#             del ref_data, rep_data
-#             turbos.append(turbo.assign_coords(date=pd.to_datetime(date)))
-#             del turbo
-#         turbo = xr.concat(turbos, dim='date')
-#         del turbos
-# 
-#         # empty grid
-#         empty = xr.zeros_like(phase.isel(pair=0))
-#         # convert dates to pairs
-#         dates_crop = dates[date_crop:None if date_crop is None or date_crop==0 else -date_crop]
-#         pairs_crop = pairs[pairs.ref.isin(dates_crop) & pairs.rep.isin(dates_crop)]  
-#         phase_turbo = xr.concat([(
-#             (turbo.sel(date=ref).drop('date') if ref in turbo.date else empty) - \
-#             (turbo.sel(date=rep).drop('date') if rep in turbo.date else empty)
-#         ).assign_coords(pair=str(ref.date()) + ' ' + str(rep.date()), ref=ref, rep=rep) \
-#         for ref, rep in zip(pairs_crop['ref'], pairs_crop['rep'])], dim='pair')
-#         del empty, dates_crop, pairs_crop
-# 
-#         return phase_turbo.rename('turbulence')
-
     def turbulence(self, phase, weight=None):
         import xarray as xr
         import pandas as pd
@@ -1098,15 +569,6 @@ class Stack_detrend(Stack_unwrap):
         if multi_index is not None:
             return velocity.assign_coords(stack=multi_index)
         return velocity
-
-#     def trend(self, data, deg=1):
-#         import xarray as xr
-#         if 'date' in data.dims:
-#             return xr.polyval(data.date, data.polyfit('date', deg).polyfit_coefficients).rename('trend')
-#         elif 'pair' in data.dims:
-#             return xr.polyval(data.pair, data.polyfit('pair', deg).polyfit_coefficients).rename('trend')
-#         raise ValueError("The 'data' argument must include a 'date' or 'pair' dimension to detect trends.")
-#     
 
     def plot_velocity(self, data, caption='Velocity, [rad/year]',
                       quantile=None, vmin=None, vmax=None, symmetrical=False, aspect=None, alpha=1, **kwargs):
