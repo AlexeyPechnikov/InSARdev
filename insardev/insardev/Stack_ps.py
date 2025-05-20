@@ -38,7 +38,7 @@ class Stack_ps(Stack_stl):
             data = np.square(np.abs(self.open_data(dates=dates)))
 
         if geometry is not None:
-            bounds = self._get_bounds(geometry)
+            bounds = self.get_bounds(geometry)
             data = data.sel(y=slice(bounds[1], bounds[3]), x=slice(bounds[0], bounds[2]))
             if isinstance(geometry, xr.DataArray):
                 data = data.where(geometry).where(np.isfinite(geometry))

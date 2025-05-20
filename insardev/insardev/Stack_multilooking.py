@@ -9,92 +9,10 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_phasediff import Stack_phasediff
-from .utils import utils
+from .utils_gaussian import nanconvolve2d_gaussian
+from .utils_xarray import coarsen_start, get_spacing
 
 class Stack_multilooking(Stack_phasediff):
-
-    #decimator = lambda da: da.coarsen({'y': 2, 'x': 2}, boundary='trim').mean()
-    def get_decimator(self, grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
-        """
-        Return function for pixel decimation to the specified output resolution.
-
-        Parameters
-        ----------
-        grid : xarray object
-            Grid to define the spacing.
-        resolution : int, optional
-            DEM grid resolution in meters. The same grid is used for geocoded results output.
-        debug : bool, optional
-            Boolean flag to print debug information.
-
-        Returns
-        -------
-        callable
-            Post-processing lambda function.
-
-        Examples
-        --------
-        Decimate computed interferograms to default DEM resolution 60 meters:
-        decimator = stack.decimator()
-        stack.intf(pairs, func=decimator)
-        """
-        import numpy as np
-        import dask
-        import warnings
-        # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings('ignore')
-        warnings.filterwarnings('ignore', module='dask')
-        warnings.filterwarnings('ignore', module='dask.core')
-
-        dy, dx = self.get_spacing(grid, coarsen)
-        yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
-        if debug:
-            print (f'DEBUG: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
-        if yscale <= 1 and xscale <= 1:
-            # decimation impossible
-            if debug:
-                print (f'DEBUG: decimator = lambda da: da')
-            return lambda da: da
-        if debug:
-            print (f"DEBUG: decimator = lambda da: da.coarsen({{'y': {yscale}, 'x': {xscale}}}, boundary='trim').{func}()")
-
-        # decimator function
-        def decimator(datas):
-            def decimator_dataset(ds):
-                coarsen_args = {'y': yscale, 'x': xscale}
-                # calculate coordinate offsets to align coarsened grids
-                y0 = self._coarsen_start(ds, 'y', yscale)
-                x0 = self._coarsen_start(ds, 'x', xscale)
-                ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})
-                if wrap:
-                    da_complex = np.exp(1j * ds.astype(np.float32))
-                    da_complex_agg = getattr(da_complex\
-                           .coarsen(coarsen_args, boundary='trim'), func)()\
-                           .astype(np.complex64)\
-                           .chunk({'y': self.chunksize, 'x': self.chunksize})
-                    da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real).astype(np.float32)
-                    del da_complex, da_complex_agg
-                    return da_decimated
-                else:
-                    return getattr(ds\
-                           .coarsen(coarsen_args, boundary='trim'), func)()\
-                           .astype(np.float32)\
-                           .chunk({'y': self.chunksize, 'x': self.chunksize})
-            # avoid creating the large chunks
-            #with dask.config.set(**{'array.slicing.split_large_chunks': True}):
-            if isinstance(datas, dict):
-                return {k:decimator_dataset(v) for k,v in datas.items()}
-            else:
-                return decimator_dataset(datas)
-
-        # return callback function and set common chunk size
-        return lambda datas: decimator(datas)
-
-    def get_decimator_interferogram(self, grid, coarsen=None, resolution=60, func='mean', debug=False):
-        return self.get_decimator(grid, coarsen, resolution, func, wrap=True, debug=debug)
-
-    def get_decimator_correlation(self, grid, coarsen=None, resolution=60, func='mean', debug=False):
-        return self.get_decimator(grid, coarsen, resolution, func, wrap=False, debug=debug)
 
     def _multilooking(self, data, weight=None, wavelength=None, coarsen=None, gaussian_threshold=0.5, debug=False):
         import xarray as xr
@@ -114,7 +32,7 @@ class Stack_multilooking(Stack_phasediff):
         # TODO: create function get_sigma(data, wavelength=None, coarsen=None)
         # calculate sigmas based on wavelength or coarsen
         if wavelength is not None:
-            dy, dx = self.get_spacing(data)
+            dy, dx = get_spacing(data)
             sigmas = [wavelength / dy / cutoff, wavelength / dx / cutoff]
             if debug:
                 print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), wavelength {wavelength:.1f}')
@@ -162,7 +80,7 @@ class Stack_multilooking(Stack_phasediff):
 
         # process a slice of dataarray
         def process_slice(slice_data):
-            conv = self._nanconvolve2d_gaussian(slice_data, weight, sigmas, threshold=gaussian_threshold)
+            conv = nanconvolve2d_gaussian(slice_data, weight, sigmas, threshold=gaussian_threshold)
             return xr.DataArray(conv, dims=slice_data.dims, name=slice_data.name)
 
         # process stack of dataarray slices
@@ -179,14 +97,17 @@ class Stack_multilooking(Stack_phasediff):
             ds = process_slice_var(data)
     
         # Set chunk size
-        chunksizes = {'y': self.chunksize, 'x': self.chunksize}
+        #chunksizes = {'y': self.chunksize, 'x': self.chunksize}
+        y_chunksize = data.chunks[-2][0]
+        x_chunksize = data.chunks[-1][0]
+        #print ('data.chunks', y_chunksize, x_chunksize)
 
         if coarsen:
             # calculate coordinate offsets to align coarsened grids
-            y0 = self._coarsen_start(ds, 'y', coarsen[0])
-            x0 = self._coarsen_start(ds, 'x', coarsen[1])
+            y0 = coarsen_start(ds, 'y', coarsen[0])
+            x0 = coarsen_start(ds, 'x', coarsen[1])
             ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})\
                      .coarsen({'y': coarsen[0], 'x': coarsen[1]}, boundary='trim')\
                      .mean()
 
-        return ds.chunk(chunksizes)
+        return ds.chunk({'y': y_chunksize, 'x': x_chunksize})

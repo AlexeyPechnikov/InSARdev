@@ -10,8 +10,11 @@
 # ----------------------------------------------------------------------------
 from .Stack_plot import Stack_plot
 from insardev_toolkit import progressbar
+from .Batch import Batch
+from collections.abc import Mapping
+from . import utils_io
 
-class Stack(Stack_plot):
+class Stack(Stack_plot, Mapping):
     import rasterio as rio
     import pandas as pd
     import xarray as xr
@@ -19,6 +22,34 @@ class Stack(Stack_plot):
     from zarr.storage._fsspec import FsspecStore
     import zarr
 
+    def snapshot_interleave(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
+                        compat: bool = True, n_jobs: int = -1, debug=False):
+        return utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
+
+    def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
+                compat: bool = True, interleave: bool = False, n_jobs: int = -1, debug=False):
+        return utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=interleave, n_jobs=n_jobs, debug=debug)
+
+    def save_interleave(self, *args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
+            caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
+        return utils_io.save(*args, store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=True,
+                             caption=caption, n_jobs=n_jobs, debug=debug)
+    
+    def save(self, *args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
+            caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
+        return utils_io.save(*args, store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=interleave,
+                             caption=caption, n_jobs=n_jobs, debug=debug)
+    
+    def open_interleave(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
+            n_jobs: int = -1, debug=False):
+        return utils_io.open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=True,
+                             n_jobs=n_jobs, debug=debug)
+    
+    def open(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
+            n_jobs: int = -1, debug=False):
+        return utils_io.open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=interleave,
+                             n_jobs=n_jobs, debug=debug)
+    
     @staticmethod
     def restore(store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1) -> "Stack":
         """
@@ -63,8 +94,32 @@ class Stack(Stack_plot):
     #     self.dss = datas
     #     return self
 
+    # def __repr__(self):
+    #     return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(next(iter(self.dss.values())).date)} dates"
     def __repr__(self):
-        return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(next(iter(self.dss.values())).date)} dates"
+        if not getattr(self, 'dss', {}):
+            return f"{self.__class__.__name__}(empty)"
+        n = len(self)
+        if n <= 1:
+            # delegate to the underlying dict repr
+            return dict.__repr__(self.dss)
+        sample = next(iter(self.dss.values()))
+        keys = list(self.dss.keys())
+        return f'{self.__class__.__name__} object containing {len(self.dss)} items for {len(sample.date)} date ({keys[0]} ... {keys[-1]})' 
+
+    def __len__(self):
+        return len(getattr(self, 'dss', {}))
+
+    def __getitem__(self, key):
+        # so stack[key] → self.dss[key]
+        return self.dss[key]
+
+    def __iter__(self):
+        # iteration yields the same keys as the Batch
+        return iter(self.dss)
+
+    def __bool__(self):
+        return bool(self.__len__())
 
     def __add__(self, other):
         """
@@ -93,6 +148,22 @@ class Stack(Stack_plot):
         self.dss.update(other.dss)
         return self
 
+    def sel(self, *args, **kwargs) -> 'Stack':
+        # call through to the Batch.sel
+        dss = self.dss.sel(*args, **kwargs)
+        # build a fresh Stack without re-running __init__
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new.dss = dss
+        return new
+
+    def isel(self, *args, **kwargs) -> 'Stack':
+        dss = self.dss.isel(*args, **kwargs)
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new.dss = dss
+        return new
+        
     def PRM(self, key:str) -> str|float|int:
         """
         Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
@@ -195,7 +266,7 @@ class Stack(Stack_plot):
         import numpy as np
 
         if datas is None:
-            return self.dss
+            return None
         elif isinstance(datas, xr.Dataset):
             return {'default': datas}
         elif isinstance(datas, xr.DataArray):
@@ -253,7 +324,11 @@ class Stack(Stack_plot):
     #     if len(dss) > 1:
     #         return self.to_datasets(records)[0]
 
-    def __init__(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
+    def __init__(self, dss:dict[str, xr.Dataset]|None = None):
+        import xarray as xr
+        self.dss = Batch(dss)
+
+    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -421,8 +496,8 @@ class Stack(Stack_plot):
             with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset', total=len(list(root.group_keys())))) as progress_bar:
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
-            self.dss = dict(dss)
-            del dss
+            # list of key - dataset converted to dict and appended to the existing dict
+            self.dss.update(dss)
         # elif isinstance(urls, FsspecStore):
         #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
         #     dss = []
@@ -475,8 +550,7 @@ class Stack(Stack_plot):
                 del ds, bursts, transform
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
-            self.dss = dss
-            del dss
+            self.dss.update(dss)
 
     # def baseline_table(self):
     #     import xarray as xr
@@ -525,14 +599,37 @@ class Stack(Stack_plot):
                          baseline=df.rep_baseline - df.ref_baseline,
                          duration=(df['rep'] - df['ref']).dt.days,
                          rel=np.datetime64('nat'))
+    
+    def to_dataset_interferogram(self,
+              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
+              compute: bool = False):
+        return self.to_dataset(datas, wrap=True, compute=compute)
+
+    def to_dataset_correlation(self,
+              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
+              compute: bool = False):
+        return self.to_dataset(datas, wrap=False, compute=compute)
 
     def to_dataset(self,
               datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
+              wrap:bool|None=None,
               compute: bool = False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
         xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
         #xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
+
+        Parameters
+        ----------
+        datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None
+            The datasets to concatenate.
+        wrap: bool | None
+            There are three options:
+            - None: return the topmost burst in chronological order for overlapping areas
+            - True: compute the circular mean
+            - False: compute the arithmetic mean
+        compute: bool
+            Whether to compute the result.
         """
         import xarray as xr
         import numpy as np
@@ -572,7 +669,7 @@ class Stack(Stack_plot):
             for pol in polarizations:
                 # TODO: workaround to preserve crs for variables
                 #das = self.to_dataset([ds[pol].rio.set_crs(datas[0].rio.crs) for ds in datas])
-                das = self.to_dataset([ds[pol] for ds in datas])
+                das = self.to_dataset([ds[pol] for ds in datas], wrap=wrap)
                 das_total.append(das)
                 del das
             das_total = xr.merge(das_total)
@@ -607,7 +704,7 @@ class Stack(Stack_plot):
         extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
         
         # use outer variable datas
-        def block_dask(stack, y_chunk, x_chunk):
+        def block_dask(stack, y_chunk, x_chunk, wrap):
             #print ('pair', pair)
             #print ('concat: block_dask', stackvar, stack)
             # extract extent of the current chunk once
@@ -631,22 +728,30 @@ class Stack(Stack_plot):
                 # return single block as is
                 return das_block[0].values
 
-            das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
-            # ffill does not work correct on complex data and per-component ffill is faster
-            # the magic trick is to use sorting to ensure burst overpapping order
-            # bursts ends should be overlapped by bursts starts
-            if np.issubdtype(das_block_concat.dtype, np.complexfloating):
-                return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
-                        + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
+            if wrap is None:
+                #print ('wrap None')
+                # ffill does not work correct on complex data and per-component ffill is faster
+                # the magic trick is to use sorting to ensure burst overpapping order
+                # bursts ends should be overlapped by bursts starts
+                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+                if np.issubdtype(das_block_concat.dtype, np.complexfloating):
+                    return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
+                            + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
+                else:
+                    return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
+            elif wrap == True:
+                #print ('wrap True')
+                # calculate circular mean for interferogram data
+                das_block_concat = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim')
+                block_complex = das_block_concat.mean('stack_dim', skipna=True).values
+                return np.arctan2(block_complex.imag, block_complex.real)
+            elif wrap == False:
+                #print ('wrap False')
+                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+                # calculate arithmetic mean for phase and correlation data
+                return das_block_concat.mean('stack_dim', skipna=True).values
             else:
-                return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
-            # if not wrap:
-            #     # calculate arithmetic mean for phase and correlation data
-            #     return xr.concat(das_block, dim='stack_dim', join='inner').mean('stack_dim', skipna=True).values
-            # else:
-            #     # calculate circular mean for interferogram data
-            #     block_complex = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim').mean('stack_dim').values
-            #     return np.arctan2(block_complex.imag, block_complex.real)
+                raise ValueError(f'ERROR: wrap is not a boolean or None: {wrap}')
 
         # prevent warnings 'PerformanceWarning: Increasing number of chunks by factor of ...'
         import warnings
@@ -660,7 +765,8 @@ class Stack(Stack_plot):
                 stackidx.chunk(1), 'z',
                 ys.chunk({'y': self.chunksize}), 'y',
                 xs.chunk({'x': self.chunksize}), 'x',
-                meta = np.empty((0, 0, 0), dtype=datas[0].dtype)
+                meta = np.empty((0, 0, 0), dtype=datas[0].dtype),
+                wrap=wrap
             )
         da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
             .rename(datas[0].name)\

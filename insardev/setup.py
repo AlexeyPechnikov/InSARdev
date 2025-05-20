@@ -52,7 +52,6 @@ setup(
                       'dask[complete]',
                       'zarr',
                       'scipy',
-                      'xgboost',
                       'cffi',
                       'scikit-learn',
                       'statsmodels>=0.14.0',

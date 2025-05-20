@@ -149,7 +149,7 @@ class XYZTiles(datagrid, progressbar_joblib):
 #             lon_start, lat_start, lon_end, lat_end = geometry.bounds
 #         lat_start, lat_end = lat_end, lat_start
 
-        bounds = self._get_bounds(geometry)
+        bounds = self.get_bounds(geometry)
         lon_start, lat_start, lon_end, lat_end = bounds
         # latitudes inverted
         lat_start, lat_end = lat_end, lat_start
@@ -228,6 +228,6 @@ class XYZTiles(datagrid, progressbar_joblib):
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
-            encoding = {'colors': self._get_encoding_netcdf(da.shape)}
+            encoding = {'colors': self.get_encoding_netcdf(da.shape)}
             da.to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da

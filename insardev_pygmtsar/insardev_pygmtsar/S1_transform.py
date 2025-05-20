@@ -302,7 +302,7 @@ class S1_transform(S1_topo):
             data_proj[varname].attrs['add_offset'] = 0
             data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
         
-        encoding_vars = {var: self._get_encoding_zarr(chunks=(data_proj.x.size,),
+        encoding_vars = {var: self.get_encoding_zarr(chunks=(data_proj.x.size,),
                                                      dtype=data_proj[var].dtype,
                                                      shuffle='noshuffle'
                                                      ) for var in data_proj.data_vars}

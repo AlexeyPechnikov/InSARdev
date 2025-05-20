@@ -391,9 +391,9 @@ class S1_geocode(S1_align):
         trans.attrs['spatial_ref'] = trans.spatial_ref.attrs['spatial_ref']
         trans = trans.drop_vars('spatial_ref')
 
-        encoding_vars = {var: self._get_encoding_zarr(dtype=trans[var].dtype) for var in trans.data_vars}
+        encoding_vars = {var: self.get_encoding_zarr(dtype=trans[var].dtype) for var in trans.data_vars}
         #print ('encoding_vars', encoding_vars)
-        encoding_coords = {coord: self._get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
+        encoding_coords = {coord: self.get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
         #print ('encoding_coords', encoding_coords)
         trans.chunk(self.zarr_chunksize).to_zarr(
             store=os.path.join(outdir, 'transform'),

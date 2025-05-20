@@ -9,294 +9,36 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_unwrap import Stack_unwrap
+from .utils_regression2d import regression2d
 
 class Stack_detrend(Stack_unwrap):
+    import numpy as np
+    import xarray as xr
 
-    @staticmethod
-    def regression2d(data, variables, weight=None, algorithm='linear', degree=1, wrap=False, valid_pixels_threshold=1000, **kwargs):
-        """
-        topo = sbas.get_topo().coarsen({'x': 4}, boundary='trim').mean()
-        yy, xx = xr.broadcast(topo.y, topo.x)
-        strat_sbas = sbas.regression(unwrap_sbas.phase,
-                [topo,    topo*yy,    topo*xx,    topo*yy*xx,
-                 topo**2, topo**2*yy, topo**2*xx, topo**2*yy*xx,
-                 topo**3, topo**3*yy, topo**3*xx, topo**3*yy*xx,
-                 yy, xx,
-                 yy**2, xx**2, yy*xx,
-                 yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
-    
-    
-        topo = sbas.interferogram(topophase)
-        inc = decimator(sbas.incidence_angle())
-        yy, xx = xr.broadcast(topo.y, topo.x)
-        variables = [topo,  topo*yy,  topo*xx, topo*yy*xx]
-        trend_sbas = sbas.regression(intf_sbas, variables, corr_sbas)
-        """
-        import numpy as np
-        import xarray as xr
-        import dask
-        from sklearn.linear_model import LinearRegression
-        from sklearn.linear_model import SGDRegressor
-        from xgboost import XGBRegressor
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+    def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
+        return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
 
-        if wrap and algorithm in ('sgd'):
-            raise ValueError(f"Unsupported option wrap={wrap} for algorithm {algorithm}.")
-        if degree is not None and algorithm in ('xgb'):
-            raise ValueError(f"Unsupported option degree={degree} for algorithm {algorithm}.")
+    def trend2d(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
+        def _regression2d(data, weight, **kwarg):
+            #print ('kwarg', kwarg)
+            key = kwarg.pop('key')
+            variables = kwarg.pop('variables')
+            #transform = self.dss[key].interp_like(data, method='linear')
+            transform = self.dss[key].reindex_like(data, method='nearest')
+            trend = regression2d(data.chunk({'y':-1, 'x':-1}),
+                                        variables=[transform[v] for v in variables],
+                                        weight=weight,
+                                        **kwarg)
+            #print ('trend', trend)
+            return trend.chunk(data.chunks)
+        return self.apply_pol(datas, weights, func=_regression2d, add_key=True, compute=compute, variables=variables, **kwarg)
 
-        # find stack dim
-        stackvar = data.dims[0] if len(data.dims) >= 3 else 'stack'
-        #print ('stackvar', stackvar)
-        shape2d = data.shape[1:] if len(data.dims) == 3 else data.shape
-        #print ('shape2d', shape2d)
-        chunk2d = data.chunks[1:] if len(data.dims) == 3 else data.chunks
-        #print ('chunk2d', chunk2d)
-    
-        def regression_block(data, weight, *args, **kwargs):
-            data_values  = data.ravel()
-            # manage variable number of variables
-            variables_stack = np.stack([arg[0] if arg.ndim==3 else arg for arg in args])
-            #variables_values = variables_stack.reshape(-1, variables_stack.shape[0]).T
-            variables_values = variables_stack.reshape(variables_stack.shape[0], -1)
-            del variables_stack
-            #assert 0, f'TEST: {data_values.shape}, {variables_values.shape}'
-    
-            nanmask_data = ~np.isfinite(data_values)
-            nanmask_values = np.any(~np.isfinite(variables_values), axis=0)
-            if weight.size > 1:
-                weight_values = weight.ravel().astype(np.float64)
-                nanmask_weight = ~np.isfinite(weight_values)
-                nanmask = nanmask_data | nanmask_values | nanmask_weight
-                #assert 0, f'TEST weight: {data_values.shape}, {variables_values.shape}, {weight_values.shape}'
-            else:
-                weight_values = None
-                nanmask_weight = None
-                nanmask = nanmask_data | nanmask_values
-            del nanmask_data, nanmask_weight
-    
-            # regression requires enough amount of valid pixels
-            if data_values.size - np.sum(nanmask) < valid_pixels_threshold:
-                del data_values, variables_values, weight_values, nanmask
-                return np.nan * np.zeros(data.shape)
 
-            # prepare target Y for regression
-            if wrap:
-                # convert angles to sine and cosine as (N,2) -> (sin, cos) matrix
-                Y = np.column_stack([np.sin(data_values), np.cos(data_values)]).astype(np.float64)
-            else:
-                # just use data values as (N) matrix
-                Y = data_values.reshape(-1).astype(np.float64)
-            del data_values
-
-            # build prediction model
-            if algorithm == 'linear':
-                #regr = make_pipeline(StandardScaler(), LinearRegression(copy_X=False, n_jobs=1, **kwargs))
-                regr = make_pipeline(
-                    PolynomialFeatures(degree=degree, include_bias=False),
-                    StandardScaler(),
-                    LinearRegression(copy_X=False, n_jobs=1, **kwargs)
-                )
-                fit_params = {'linearregression__sample_weight': weight_values[~nanmask]} if weight_values is not None else {}
-            elif algorithm == 'sgd':
-                #regr = make_pipeline(StandardScaler(), SGDRegressor(**kwargs))
-                regr = make_pipeline(
-                    PolynomialFeatures(degree=degree, include_bias=False),
-                    StandardScaler(),
-                    SGDRegressor(**kwargs)
-                )
-                fit_params = {'sgdregressor__sample_weight': weight_values[~nanmask]} if weight_values is not None else {}
-            elif algorithm == 'xgb':
-                regr = make_pipeline(StandardScaler(), XGBRegressor(n_jobs=1, **kwargs))
-                fit_params = {'xgbregressor__sample_weight': weight_values[~nanmask]} if weight_values is not None else {}
-            else:
-                raise ValueError(f"Unsupported algorithm {algorithm}. Should be 'linear', 'sgd', or 'xgb'.")
-            del weight_values
-
-            regr.fit(variables_values[:, ~nanmask].T, Y[~nanmask], **fit_params)
-            del Y, nanmask
-
-            # Predict for all valid pixels
-            model_pred = regr.predict(variables_values[:, ~nanmask_values].T)
-            del regr, variables_values
-
-            model = np.full_like(data, np.nan).ravel()
-            if wrap:
-                # (N,2) -> (sin, cos)
-                model[~nanmask_values] = np.arctan2(model_pred[:, 0], model_pred[:, 1])
-            else:
-                # (N,1), just flatten
-                model[~nanmask_values] = model_pred.ravel()
-            del model_pred, nanmask_values
-            
-            return model.reshape(data.shape).astype(np.float32)
-
-        dshape = data[0].shape if data.ndim==3 else data.shape
-        if isinstance(variables, (list, tuple)):
-            vshapes = [v[0].shape if v.ndim==3 else v.shape for v in variables]
-            equals = np.all([vshape == dshape for vshape in vshapes])
-            if not equals:
-                print (f'NOTE: shapes of variables slices {vshapes} and data slice {dshape} differ.')
-            #assert equals, f'{dshape} {vshapes}, {equals}'
-            variables_stack = [v.reindex_like(data).chunk(dict(y=chunk2d[0], x=chunk2d[1]))  for v in variables]
-        else:
-            vshape = variables[0].shape if variables.ndim==3 else variables.shape
-            if not {vshape} == {dshape}:
-                print (f'NOTE: shapes of variables slice {vshape} and data slice {dshape} differ.')
-            variables_stack = [variables.reindex_like(data).chunk(dict(y=chunk2d[0], x=chunk2d[1]))]
-
-        if weight is not None:
-            if not weight.shape == data.shape:
-                print (f'NOTE: shapes of weight {weight.shape} and data {data.shape} differ.')
-            weight_stack = weight.reindex_like(data).chunk(dict(y=chunk2d[0], x=chunk2d[1]))
-        else:
-            weight_stack = None
-
-        # xarray wrapper
-        model = xr.apply_ufunc(
-            regression_block,
-            data,
-            weight_stack,
-            *variables_stack,
-            dask='parallelized',
-            vectorize=False,
-            output_dtypes=[np.float32],
-            dask_gufunc_kwargs={**kwargs},
-        )
-        del variables_stack
-
-        return model
-
-    def regression2d_linear(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000, fit_intercept=True):
-        """   
-        topo = sbas.get_topo().coarsen({'x': 4}, boundary='trim').mean()
-        yy, xx = xr.broadcast(topo.y, topo.x)
-        strat_sbas = sbas.regression_linear(unwrap_sbas.phase,
-                [topo,    topo*yy,    topo*xx,    topo*yy*xx,
-                 topo**2, topo**2*yy, topo**2*xx, topo**2*yy*xx,
-                 topo**3, topo**3*yy, topo**3*xx, topo**3*yy*xx,
-                 yy, xx,
-                 yy**2, xx**2, yy*xx,
-                 yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
-        """
-        return self.regression2d(
-            data,
-            variables,
-            weight=weight,
-            wrap=wrap,
-            valid_pixels_threshold=valid_pixels_threshold,
-            algorithm='linear',
-            degree=degree,
-            fit_intercept=fit_intercept
-        )
-
-    def regression2d_sgd(self, data, variables, weight=None, degree=1, wrap=False, valid_pixels_threshold=1000,
-                      penalty='elasticnet', max_iter=1000, tol=1e-3, alpha=0.0001, l1_ratio=0.15):
-        """
-        Perform regression on a dataset using the SGDRegressor model from scikit-learn.
-
-        This function applies Stochastic Gradient Descent (SGD) regression to fit the given 'data' against a set of 'variables'.
-        It's suitable for large datasets and handles high-dimensional features efficiently.
-
-        Parameters:
-        data (xarray.DataArray): The target data array to fit.
-        variables (xarray.DataArray or list of xarray.DataArray): Predictor variables. It can be a single 3D DataArray or a list of 2D DataArrays.
-        weight (xarray.DataArray, optional): Weights for each data point. Useful if certain data points are more important. Defaults to None.
-        valid_pixels_threshold (int, optional): Minimum number of valid pixels required for the regression to be performed. Defaults to 10000.
-        max_iter (int, optional): Maximum number of passes over the training data (epochs). Defaults to 1000.
-        tol (float, optional): Stopping criterion. If not None, iterations will stop when (loss > best_loss - tol) for n_iter_no_change consecutive epochs. Defaults to 1e-3.
-        alpha (float, optional): Constant that multiplies the regularization term. Higher values mean stronger regularization. Defaults to 0.0001.
-        l1_ratio (float, optional): The Elastic Net mixing parameter, with 0 <= l1_ratio <= 1. l1_ratio=0 corresponds to L2 penalty, l1_ratio=1 to L1. Defaults to 0.15.
-
-        Returns:
-        xarray.DataArray: The predicted values as an xarray DataArray, fitted by the SGDRegressor model.
-
-        Notes:
-        - SGDRegressor is well-suited for large datasets due to its efficiency in handling large-scale and high-dimensional data.
-        - Proper tuning of parameters (max_iter, tol, alpha, l1_ratio) is crucial for optimal performance and prevention of overfitting.
-
-        Example:
-        decimator = sbas.decimator(resolution=15, grid=(1,1))
-        topo = decimator(sbas.get_topo())
-        inc = decimator(sbas.incidence_angle())
-        yy, xx = xr.broadcast(topo.y, topo.x)
-        trend_sbas = sbas.regression(unwrap_sbas.phase,
-                [topo,    topo*yy,    topo*xx,    topo*yy*xx,
-                 topo**2, topo**2*yy, topo**2*xx, topo**2*yy*xx,
-                 topo**3, topo**3*yy, topo**3*xx, topo**3*yy*xx,
-                 inc,     inc**yy,    inc*xx,     inc*yy*xx,
-                 yy, xx,
-                 yy**2, xx**2, yy*xx,
-                 yy**3, xx**3, yy**2*xx, xx**2*yy], corr_sbas)
-        """
-        return self.regression2d(
-            data,
-            variables,
-            weight=weight,
-            wrap=wrap,
-            valid_pixels_threshold=valid_pixels_threshold,
-            algorithm='sgd',
-            degree=degree,
-            penalty=penalty,
-            max_iter=max_iter,
-            tol=tol,
-            alpha=alpha,
-            l1_ratio=l1_ratio
-        )
-
-    def regression2d_xgboost(self, data, variables, weight=None, wrap=False, valid_pixels_threshold=1000,
-                           n_estimators=100, learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=1, **kwargs):
-        """
-        Perform regression on a dataset using XGBoost (XGBRegressor).
-        https://xgboost.readthedocs.io/en/stable/python/python_api.html#module-xgboost.sklearn
-        https://xgboost.readthedocs.io/en/stable/parameter.html
-
-        Parameters:
-        -----------
-        data : xarray.DataArray
-            The target data array to fit.
-        variables : list[xarray.DataArray] or xarray.DataArray
-            Predictor variables.
-        weight : xarray.DataArray, optional
-            Sample weights per data point. Defaults to None.
-        valid_pixels_threshold : int, optional
-            Minimum valid pixels required for the regression to run. Defaults to 1000.
-        n_estimators : int, optional
-            Number of boosting rounds. Defaults to 100.
-        learning_rate : float, optional
-            Step size shrinkage used in update to prevents overfitting. Defaults to 0.05.
-        max_depth : int, optional
-            Maximum depth of a tree. Defaults to 6.
-        kwargs :
-            Additional keyword arguments passed to XGBRegressor.
-
-        Returns:
-        --------
-        xarray.DataArray
-            The predicted values as an xarray DataArray, fitted by XGBRegressor.
-        """
-        return self.regression2d(
-            data,
-            variables,
-            weight=weight,
-            wrap=wrap,
-            valid_pixels_threshold=valid_pixels_threshold,
-            algorithm='xgb',
-            degree=None,
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            max_depth=max_depth,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
-            **kwargs
-        )
-
-    def polyfit(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
+    def _polyfit(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
         print ('NOTE: Function is deprecated. Use Stack.regression_pairs() instead.')
         return self.regression_pairs(data=data, weight=weight, degree=degree, days=days, count=count, wrap=wrap)
 
-    def regression_pairs(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
+    def _regression_pairs(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
         import xarray as xr
         import pandas as pd
         import numpy as np
@@ -409,112 +151,7 @@ class Stack_detrend(Stack_unwrap):
             return out.assign_coords(stack=multi_index)
         return out
 
-    def gaussian(self, data, wavelength, truncate=3.0, resolution=60, debug=False):
-        """
-        Apply a lazy Gaussian filter to an input 2D or 3D data array.
-
-        Parameters
-        ----------
-        data : xarray.DataArray
-            The input data array with NaN values allowed.
-        wavelength : float
-            The cut-off wavelength for the Gaussian filter in meters.
-        truncate : float, optional
-            Size of the Gaussian kernel, defined in terms of standard deviation, or 'sigma'. 
-            It is the number of sigmas at which the window (filter) is truncated. 
-            For example, if truncate = 3.0, the window will cut off at 3 sigma. Default is 3.0.
-        resolution : float, optional
-            The processing resolution for the Gaussian filter in meters.
-        debug : bool, optional
-            Whether to print debug information.
-
-        Returns
-        -------
-        xarray.DataArray
-            The filtered data array with the same coordinates as the input.
-
-        Examples
-        --------
-        Detrend ionospheric effects and solid Earth's tides on a large area and save to disk:
-        stack.stack_gaussian2d(slcs, wavelength=400)
-        For band-pass filtering apply the function twice and save to disk:
-        model = stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
-            - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True)
-        stack.save_cube(model, caption='Gaussian Band-Pass filtering')
-
-        Detrend and return lazy xarray dataarray:
-        stack.stack_gaussian2d(slcs, wavelength=400, interactive=True)
-        For band-pass filtering apply the function twice:
-        stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
-            - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True) 
-
-        """
-        import xarray as xr
-        import numpy as np
-#         import warnings
-#         # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-#         warnings.filterwarnings('ignore')
-#         warnings.filterwarnings('ignore', module='dask')
-#         warnings.filterwarnings('ignore', module='dask.core')
-
-        assert np.issubdtype(data.dtype, np.floating), 'ERROR: expected float datatype input data'
-        assert wavelength is not None, 'ERROR: Gaussian filter cut-off wavelength is not defined'
-
-        # ground pixel size
-        dy, dx = self.get_spacing(data)
-        # downscaling
-        yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
-        # gaussian kernel
-        #sigma_y = np.round(wavelength / dy / yscale, 1)
-        #sigma_x = np.round(wavelength / dx / xscale, 1)
-        if debug:
-            print (f'DEBUG: gaussian: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
-        if (xscale <=1 and yscale <=1) or (wavelength/resolution <= 3):
-            # decimation is useless
-            return self.multilooking(data, wavelength=wavelength, coarsen=None, debug=debug)
-
-        # define filter on decimated grid, the correction value is typically small
-        wavelength_dec = np.sqrt(wavelength**2 - resolution**2)
-        if debug:
-            print (f'DEBUG: gaussian: downscaling to resolution {resolution}m using yscale {yscale}, xscale {xscale}')
-            #print (f'DEBUG: gaussian: filtering on {resolution}m grid using sigma_y0 {sigma_y}, sigma_x0 {sigma_x}')
-            print (f'DEBUG: gaussian: filtering on {resolution}m grid using wavelength {wavelength_dec:.1f}')
-
-        # find stack dim
-        stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
-        #print ('stackvar', stackvar)
-
-        # split coordinate grid to equal chunks and rest
-        ys_blocks = np.array_split(data.y, np.arange(0, data.y.size, self.chunksize)[1:])
-        xs_blocks = np.array_split(data.x, np.arange(0, data.x.size, self.chunksize)[1:])
-
-        data_dec = self.multilooking(data, wavelength=resolution, coarsen=(yscale,xscale), debug=debug)
-        data_dec_gauss = self.multilooking(data_dec, wavelength=wavelength_dec, debug=debug)
-        del data_dec
-    
-        stack = []
-        for stackval in data[stackvar].values if len(data.dims) == 3 else [None]:
-            data_in = data_dec_gauss.sel({stackvar: stackval}) if stackval is not None else data_dec_gauss
-            data_out = data_in.reindex({'y': data.y, 'x': data.x}, method='nearest').chunk(self.chunksize)
-            del data_in
-            stack.append(data_out)
-            del data_out
-
-        # wrap lazy Dask array to Xarray dataarray
-        if len(data.dims) == 2:
-            out = stack[0]
-        else:
-            out = xr.concat(stack, dim=stackvar)
-        del stack
-
-        # append source data coordinates excluding removed y, x ones
-        for (k,v) in data.coords.items():
-            if k not in ['y','x']:
-                out[k] = v
-
-        return out
-
-    def turbulence(self, phase, weight=None):
+    def _turbulence(self, phase, weight=None):
         import xarray as xr
         import pandas as pd
 
@@ -551,7 +188,7 @@ class Stack_detrend(Stack_unwrap):
 
         return phase_turbo.rename('turbulence')
 
-    def velocity(self, data):
+    def _velocity(self, data):
         import pandas as pd
         import numpy as np
         #years = ((data.date.max() - data.date.min()).dt.days/365.25).item()
@@ -607,71 +244,112 @@ class Stack_detrend(Stack_unwrap):
                            caption=caption, aspect=aspect, alpha=alpha,
                            quantile=quantile, vmin=vmin, vmax=vmax, symmetrical=symmetrical, **kwargs)
 
-    def trend(self, data, dim='auto', degree=1):
+    def _trend(self, data, dim='auto', degree=1):
         print ('NOTE: Function is deprecated. Use Stack.regression1d() instead.')
         return self.regression1d(data=data, dim=dim, degree=degree)
 
-    def regression1d(self, data, dim='auto', degree=1, wrap=False):
+
+    def _gaussian(self, data, wavelength, truncate=3.0, resolution=60, debug=False):
+        """
+        Apply a lazy Gaussian filter to an input 2D or 3D data array.
+
+        Parameters
+        ----------
+        data : xarray.DataArray
+            The input data array with NaN values allowed.
+        wavelength : float
+            The cut-off wavelength for the Gaussian filter in meters.
+        truncate : float, optional
+            Size of the Gaussian kernel, defined in terms of standard deviation, or 'sigma'. 
+            It is the number of sigmas at which the window (filter) is truncated. 
+            For example, if truncate = 3.0, the window will cut off at 3 sigma. Default is 3.0.
+        resolution : float, optional
+            The processing resolution for the Gaussian filter in meters.
+        debug : bool, optional
+            Whether to print debug information.
+
+        Returns
+        -------
+        xarray.DataArray
+            The filtered data array with the same coordinates as the input.
+
+        Examples
+        --------
+        Detrend ionospheric effects and solid Earth's tides on a large area and save to disk:
+        stack.stack_gaussian2d(slcs, wavelength=400)
+        For band-pass filtering apply the function twice and save to disk:
+        model = stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
+            - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True)
+        stack.save_cube(model, caption='Gaussian Band-Pass filtering')
+
+        Detrend and return lazy xarray dataarray:
+        stack.stack_gaussian2d(slcs, wavelength=400, interactive=True)
+        For band-pass filtering apply the function twice:
+        stack.stack_gaussian2d(slcs, wavelength=400, interactive=True) \
+            - stack.stack_gaussian2d(slcs, wavelength=2000, interactive=True) 
+
+        """
         import xarray as xr
-        import pandas as pd
         import numpy as np
+    #         import warnings
+    #         # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
+    #         warnings.filterwarnings('ignore')
+    #         warnings.filterwarnings('ignore', module='dask')
+    #         warnings.filterwarnings('ignore', module='dask.core')
 
-        multi_index = None
-        if 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            multi_index = data['stack']
-            # detect unused coordinates
-            unused_coords = [d for d in multi_index.coords if not d in multi_index.dims and not d in multi_index.indexes]
-            # cleanup multiindex to merge it with the processed dataset later
-            multi_index = multi_index.drop_vars(unused_coords)
-            data = data.reset_index('stack')
+        assert np.issubdtype(data.dtype, np.floating), 'ERROR: expected float datatype input data'
+        assert wavelength is not None, 'ERROR: Gaussian filter cut-off wavelength is not defined'
 
-        stackdim = [_dim for _dim in ['date', 'pair'] if _dim in data.dims]
-        if len(stackdim) != 1:
-            raise ValueError("The 'data' argument must include a 'date' or 'pair' dimension to detect trends.")
-        stackdim = stackdim[0]
-    
-        if isinstance(dim, str) and dim == 'auto':
-            dim = stackdim
+        # ground pixel size
+        dy, dx = self.get_spacing(data)
+        # downscaling
+        yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
+        # gaussian kernel
+        #sigma_y = np.round(wavelength / dy / yscale, 1)
+        #sigma_x = np.round(wavelength / dx / xscale, 1)
+        if debug:
+            print (f'DEBUG: gaussian: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
+        if (xscale <=1 and yscale <=1) or (wavelength/resolution <= 3):
+            # decimation is useless
+            return self.multilooking(data, wavelength=wavelength, coarsen=None, debug=debug)
 
-        # add new coordinate using 'dim' values
-        if not isinstance(dim, str):
-            if isinstance(dim, (xr.DataArray, pd.DataFrame, pd.Series)):
-                dim_da = xr.DataArray(dim.values, dims=[stackdim])
-            else:
-                dim_da = xr.DataArray(dim, dims=[stackdim])
-            data_dim = data.assign_coords(polyfit_coord=dim_da).swap_dims({'pair': 'polyfit_coord'})
-            
-        if wrap:
-            # wrap to prevent outrange
-            data = self.wrap(data)
-            # fit sine/cosine
-            trend_sin = self.regression1d(np.sin(data), dim, degree=degree, wrap=False)
-            trend_cos = self.regression1d(np.cos(data), dim, degree=degree, wrap=False)
-            # define the angle offset at zero baseline
-            trend_sin0 = xr.polyval(xr.DataArray(0, dims=[]), trend_sin.coefficients)
-            trend_cos0 = xr.polyval(xr.DataArray(0, dims=[]), trend_cos.coefficients)
-            fit = np.arctan2(trend_sin, trend_cos) - np.arctan2(trend_sin0, trend_cos0)
-            del trend_sin, trend_cos, trend_sin0, trend_cos0
-            # wrap to prevent outrange
-            return self.wrap(fit)
+        # define filter on decimated grid, the correction value is typically small
+        wavelength_dec = np.sqrt(wavelength**2 - resolution**2)
+        if debug:
+            print (f'DEBUG: gaussian: downscaling to resolution {resolution}m using yscale {yscale}, xscale {xscale}')
+            #print (f'DEBUG: gaussian: filtering on {resolution}m grid using sigma_y0 {sigma_y}, sigma_x0 {sigma_x}')
+            print (f'DEBUG: gaussian: filtering on {resolution}m grid using wavelength {wavelength_dec:.1f}')
 
-        # add new coordinate using 'dim' values
-        if not isinstance(dim, str):
-            # fit the specified values
-            # Polynomial coefficients, highest power first, see numpy.polyfit
-            fit_coeff = data_dim.polyfit('polyfit_coord', degree).polyfit_coefficients.astype(np.float32)
-            fit = xr.polyval(data_dim['polyfit_coord'], fit_coeff)\
-                .swap_dims({'polyfit_coord': stackdim}).drop_vars('polyfit_coord').astype(np.float32).rename('trend')
-            out = xr.merge([fit, fit_coeff]).rename(polyfit_coefficients='coefficients')
-            if multi_index is not None:
-                return out.assign_coords(stack=multi_index)
-            return out
-    
-        # fit existing coordinate values
-        # Polynomial coefficients, highest power first, see numpy.polyfit
-        fit_coeff = data.polyfit(dim, degree).polyfit_coefficients.astype(np.float32)
-        fit = xr.polyval(data[dim], fit_coeff).astype(np.float32).rename('trend')
-        out = xr.merge([fit, fit_coeff]).rename(polyfit_coefficients='coefficients')
-        if multi_index is not None:
-            return out.assign_coords(stack=multi_index)
+        # find stack dim
+        stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
+        #print ('stackvar', stackvar)
+
+        # split coordinate grid to equal chunks and rest
+        ys_blocks = np.array_split(data.y, np.arange(0, data.y.size, self.chunksize)[1:])
+        xs_blocks = np.array_split(data.x, np.arange(0, data.x.size, self.chunksize)[1:])
+
+        data_dec = self.multilooking(data, wavelength=resolution, coarsen=(yscale,xscale), debug=debug)
+        data_dec_gauss = self.multilooking(data_dec, wavelength=wavelength_dec, debug=debug)
+        del data_dec
+
+        stack = []
+        for stackval in data[stackvar].values if len(data.dims) == 3 else [None]:
+            data_in = data_dec_gauss.sel({stackvar: stackval}) if stackval is not None else data_dec_gauss
+            data_out = data_in.reindex({'y': data.y, 'x': data.x}, method='nearest').chunk(self.chunksize)
+            del data_in
+            stack.append(data_out)
+            del data_out
+
+        # wrap lazy Dask array to Xarray dataarray
+        if len(data.dims) == 2:
+            out = stack[0]
+        else:
+            out = xr.concat(stack, dim=stackvar)
+        del stack
+
+        # append source data coordinates excluding removed y, x ones
+        for (k,v) in data.coords.items():
+            if k not in ['y','x']:
+                out[k] = v
+
         return out

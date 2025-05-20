@@ -10,6 +10,8 @@
 # ----------------------------------------------------------------------------
 from .Stack_base import Stack_base
 from insardev_toolkit import progressbar
+from .Batch import BatchInterferogram, BatchCorrelation
+from . import utils_xarray
 
 class Stack_phasediff(Stack_base):
     import xarray as xr
@@ -17,15 +19,16 @@ class Stack_phasediff(Stack_base):
     import pandas as pd
 
     # internal method to compute interferogram on single polarization data array(s)
-    def _interferogram(self,
-                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
-                       data:xr.DataArray,
+    def _phasediff(self,
+                       data:xr.DataArray|None=None,
                        weight:xr.DataArray|None=None,
                        phase:xr.DataArray|None=None,
+                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame|None=None,
                        wavelength:float|None=None,
                        gaussian_threshold:float=0.5,
                        multilook:bool=False,
                        goldstein_window:int|list[int,int]|None=None,
+                       complex:bool=False,
                        debug:bool=False
                        ) -> tuple[xr.DataArray,xr.DataArray]:
         import xarray as xr
@@ -45,6 +48,16 @@ class Stack_phasediff(Stack_base):
             category=RuntimeWarning,
             module=r'dask\._task_spec'
         )
+
+        #print ('data', data)
+        # print ('weight', weight)
+        # print ('phase', phase)
+        # print ('pairs', pairs)
+        # print ('wavelength', wavelength)
+        # print ('gaussian_threshold', gaussian_threshold)
+        # print ('multilook', multilook)
+        # print ('goldstein_window', goldstein_window)
+        # print ('complex', complex)
 
         assert isinstance(data, xr.DataArray), 'ERROR: data should be a DataArray'
 
@@ -69,7 +82,7 @@ class Stack_phasediff(Stack_base):
                                             wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
         del intensity
         # calculate phase difference with topography correction
-        phasediff = self._phasediff(_pairs, data, debug=debug)
+        phasediff = self._conj(_pairs, data, debug=debug)
         if phase is not None:
             phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
         # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
@@ -97,14 +110,13 @@ class Stack_phasediff(Stack_base):
             del weight_coarsen
             
         # convert complex phase difference to interferogram
-        intf_look = self._phase2interferogram(phasediff_look, debug=debug)
+        if not complex:
+            intf_look = self._interferogram(phasediff_look, debug=debug)
+        else:
+            intf_look = phasediff_look
         del phasediff_look
 
-        intf = intf_look.assign_attrs(data.attrs)
-        corr = corr_look.assign_attrs(data.attrs)
-        del corr_look, intf_look
-
-        return (intf, corr)
+        return (intf_look.assign_attrs(data.attrs), corr_look.assign_attrs(data.attrs))
 
         # if compute:
         #     progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
@@ -112,106 +124,123 @@ class Stack_phasediff(Stack_base):
         #     return result
         # return (intfs, corrs)
 
-    def interferogram(self,
-                      pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
-                      datas:dict[str,xr.Dataset],
-                      weights:dict[str,xr.DataArray]|None=None,
-                      phases:dict[str,xr.DataArray]|None=None,
-                      wavelength:float|None=None,
-                      gaussian_threshold:float=0.5,
-                      multilook:bool=False,
-                      goldstein_window:int|list[int,int]|None=None,
-                      compute:bool=False,
-                      debug:bool=False
-                      ) -> dict[str,xr.Dataset]:
-        import xarray as xr
-        import numpy as np
-        import dask
+    def phasediff_singlelook(self, pairs, datas, weights=None, phases=None, compute=False, **kwarg):
+        kwarg['multilook'] = False
+        intfs, corrs = utils_xarray.apply_pol(datas, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        return BatchInterferogram(intfs), BatchCorrelation(corrs)
 
-        assert isinstance(datas, dict), 'ERROR: datas should be a dict of xarray.Dataset'
-        assert isinstance(weights, dict) or weights is None, 'ERROR: weights should be a dict of xarray.DataArray'
-        assert isinstance(phases, dict) or phases is None, 'ERROR: phases should be a dict of xarray.DataArray'
-        # workaround for previous code
+    def phasediff_multilook(self, pairs, datas, weights=None, phases=None, compute=False, **kwarg):
+        kwarg['multilook'] = True
+        intfs, corrs = utils_xarray.apply_pol(datas, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        return BatchInterferogram(intfs), BatchCorrelation(corrs)
 
-        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in next(iter(datas.values())).data_vars]
-        #print ('polarizations', polarizations)
+    # def phasediff(self,
+    #                   pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
+    #                   datas:dict[str,xr.Dataset],
+    #                   weights:dict[str,xr.DataArray]|None=None,
+    #                   phases:dict[str,xr.DataArray]|None=None,
+    #                   wavelength:float|None=None,
+    #                   gaussian_threshold:float=0.5,
+    #                   multilook:bool=False,
+    #                   goldstein_window:int|list[int,int]|None=None,
+    #                   complex:bool=False,
+    #                   compute:bool=False,
+    #                   debug:bool=False
+    #                   ) -> dict[str,xr.Dataset]:
+    #     import xarray as xr
+    #     import numpy as np
+    #     import dask
 
-        results = []
-        for polarization in polarizations:
-            results_pol = [self._interferogram(pairs,
-                                       data=datas[k][polarization],
-                                       weight=weights[k] if weights is not None else None,
-                                       phase=phases[k] if phases is not None else None,
-                                       wavelength=wavelength,
-                                       gaussian_threshold=gaussian_threshold,
-                                       multilook=multilook,
-                                       goldstein_window=goldstein_window,
-                                       debug=debug) for k in datas.keys()]
-            if compute:
-                progressbar(results_pol := dask.persist(*results_pol), desc=f'Computing {polarization} Intfs...'.ljust(25))
-            results.append(results_pol)
-            del results_pol
+    #     assert isinstance(datas, dict), 'ERROR: datas should be a dict of xarray.Dataset'
+    #     assert isinstance(weights, dict) or weights is None, 'ERROR: weights should be a dict of xarray.DataArray'
+    #     assert isinstance(phases, dict) or phases is None, 'ERROR: phases should be a dict of xarray.DataArray'
+    #     # workaround for previous code
 
-        # unpack the results
-        intfs = {k:xr.merge([results[pidx][idx][0] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
-        corrs = {k:xr.merge([results[pidx][idx][1] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
-        return intfs, corrs
+    #     polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in next(iter(datas.values())).data_vars]
+    #     #print ('polarizations', polarizations)
 
-    # single-look interferogram processing has a limited set of arguments
-    # resolution and coarsen are not applicable here
-    def interferogram_singlelook(self,
-                                pairs,
-                                datas=None,
-                                weights=None,
-                                phases=None,
-                                wavelength=None,
-                                gaussian_threshold=0.5,
-                                goldstein_window=None,
-                                compute=False,
-                                debug=False):
-        return self.interferogram(pairs,
-                                datas=datas,
-                                weights=weights,
-                                phases=phases,
-                                wavelength=wavelength,
-                                gaussian_threshold=gaussian_threshold,
-                                multilook=False,
-                                goldstein_window=goldstein_window,
-                                compute=compute,
-                                debug=debug)
+    #     results = []
+    #     for polarization in polarizations:
+    #         results_pol = [self._phasediff(pairs,
+    #                                    data=datas[k][polarization],
+    #                                    weight=weights[k] if weights is not None else None,
+    #                                    phase=phases[k] if phases is not None else None,
+    #                                    wavelength=wavelength,
+    #                                    gaussian_threshold=gaussian_threshold,
+    #                                    multilook=multilook,
+    #                                    goldstein_window=goldstein_window,
+    #                                    complex=complex,
+    #                                    debug=debug) for k in datas.keys()]
+    #         if compute:
+    #             progressbar(results_pol := dask.persist(*results_pol), desc=f'Computing {polarization} Phasediff...'.ljust(25))
+    #         results.append(results_pol)
+    #         del results_pol
 
-    # Goldstein filter requires square grid cells means 1:4 range multilooking.
-    # For multilooking interferogram we can use square grid always using coarsen = (1,4)
-    def interferogram_multilook(self,
-                              pairs,
-                              datas=None,
-                              weights=None,
-                              phases=None,
-                              wavelength=None,
-                              gaussian_threshold=0.5,
-                              goldstein_window=None,
-                              compute=False,
-                              debug=False):
-        return self.interferogram(pairs,
-                                datas=datas,
-                                weights=weights,
-                                phases=phases,
-                                wavelength=wavelength,
-                                gaussian_threshold=gaussian_threshold,
-                                multilook=True,
-                                goldstein_window=goldstein_window,
-                                compute=compute,
-                                debug=debug)
+    #     # unpack the results
+    #     intfs = {k:xr.merge([results[pidx][idx][0] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
+    #     corrs = {k:xr.merge([results[pidx][idx][1] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
+    #     return intfs, corrs
+
+    # # single-look interferogram processing has a limited set of arguments
+    # # resolution and coarsen are not applicable here
+    # def phasediff_singlelook(self,
+    #                             pairs,
+    #                             datas=None,
+    #                             weights=None,
+    #                             phases=None,
+    #                             wavelength=None,
+    #                             gaussian_threshold=0.5,
+    #                             goldstein_window=None,
+    #                             complex=False,
+    #                             compute=False,
+    #                             debug=False):
+    #     return self._phasediff(
+    #                             datas,
+    #                             weights,
+    #                             phases,
+    #                             pairs=pairs,
+    #                             wavelength=wavelength,
+    #                             gaussian_threshold=gaussian_threshold,
+    #                             multilook=False,
+    #                             goldstein_window=goldstein_window,
+    #                             complex=complex,
+    #                             compute=compute,
+    #                             debug=debug)
+
+    # # Goldstein filter requires square grid cells means 1:4 range multilooking.
+    # # For multilooking interferogram we can use square grid always using coarsen = (1,4)
+    # def phasediff_multilook(self,
+    #                           pairs,
+    #                           datas=None,
+    #                           weights=None,
+    #                           phases=None,
+    #                           wavelength=None,
+    #                           gaussian_threshold=0.5,
+    #                           goldstein_window=None,
+    #                           complex=False,
+    #                           compute=False,
+    #                           debug=False):
+    #     return self.phasediff(pairs=pairs,
+    #                             datas=datas,
+    #                             weights=weights,
+    #                             phases=phases,
+    #                             wavelength=wavelength,
+    #                             gaussian_threshold=gaussian_threshold,
+    #                             multilook=True,
+    #                             goldstein_window=goldstein_window,
+    #                             complex=complex,
+    #                             compute=compute,
+                                # debug=debug)
 
     @staticmethod
-    def _phase2interferogram(phase, debug=False):
+    def _interferogram(phase, debug=False):
         import numpy as np
 
         if debug:
             print ('DEBUG: interferogram')
 
         if np.issubdtype(phase.dtype, np.complexfloating):
-            return np.arctan2(phase.imag, phase.real)
+            return np.arctan2(phase.imag, phase.real).astype(np.float32)
         return phase
 
     def _correlation(self, phase, intensity, debug=False):
@@ -266,7 +295,7 @@ class Stack_phasediff(Stack_base):
 
         return xr.concat(stack, dim='pair')
 
-    def _phasediff(self, pairs, data, debug=False):
+    def _conj(self, pairs, data, debug=False):
         import dask.array as da
         import xarray as xr
         import numpy as np
@@ -287,7 +316,7 @@ class Stack_phasediff(Stack_base):
         )
 
         if debug:
-            print ('DEBUG: phasediff')
+            print ('DEBUG: _conj')
 
         # convert pairs (list, array, dataframe) to 2D numpy array
         pairs, dates = self._get_pairs(pairs, dates=True)
