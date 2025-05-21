@@ -14,6 +14,9 @@ from . import utils_xarray
 
 class Batch(dict):
     """
+    This class has 'pair' stack variable for the datasets in the dict and stores real values (correlation and unwrapped phase).
+    
+    Examples:
     intfs60_detrend = Batch(intfs60) - Batch(intfs60_trend)
 
     dss = intfs60_detrend.sel(['106_226487_IW2','106_226488_IW2','106_226489_IW2','106_226490_IW2','106_226491_IW2'])
@@ -23,6 +26,11 @@ class Batch(dict):
     intfs60_detrend.isel([0, 2])
     intfs60_detrend.isel(slice(1, None))
     """
+    @staticmethod
+    def wrap(data):
+        import numpy as np
+        return np.mod(data + np.pi, 2 * np.pi) - np.pi
+
     def __init__(self, mapping:dict|None=None):
         dict.__init__(self, mapping or {})
 
@@ -41,24 +49,24 @@ class Batch(dict):
     def __add__(self, other: 'Batch'):
         keys = self.keys()
         #& other.keys()
-        return Batch({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self.wrap(self[k] + other[k] if k in other else self[k]) for k in keys})
 
     def __sub__(self, other: 'Batch'):
         keys = self.keys()
-        return Batch({k: (self[k] - other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self.wrap(self[k] - other[k] if k in other else self[k]) for k in keys})
 
     def __mul__(self, other: 'Batch'):
         keys = self.keys()
-        return Batch({k: (self[k] * other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self.wrap(self[k] * other[k] if k in other else self[k]) for k in keys})
 
     def __truediv__(self, other: 'Batch'):
         keys = self.keys()
-        return Batch({k: (self[k] / other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self.wrap(self[k] / other[k] if k in other else self[k]) for k in keys})
     
     def sel(self, keys: dict|list|str):
         if isinstance(keys, str):
             keys = [keys]
-        return Batch({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
+        return type(self)({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
 
     def isel(self, indices):
         """Select by integer locations (like xarray .isel)."""
@@ -73,29 +81,80 @@ class Batch(dict):
         else:
             idxs = list(indices)
         selected = {keys[i]: self[keys[i]] for i in idxs }
-        return Batch(selected)
+        return type(self)(selected)
 
     def compute(self):
         import dask
         progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
-        return Batch(result)
+        return type(self)(result)
 
-    def save(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
+    def save(self, store: str, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
                 caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
-        return utils_io.save(dict(self), store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
+        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
 
-    def open(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
-                n_jobs: int = -1, debug=False):
-        data = utils_io.open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
-        self.update(data)
-        return self
+    def open(self, store: str, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto', n_jobs: int = -1, debug=False):
+        data = utils_io.open(store=store, storage_options=storage_options, compat=False, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
+        if not isinstance(data, dict):
+            raise ValueError(f'ERROR: open() returns multiple datasets, you need to use Stack class to open them.')
+        return data
     
-    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                compat: bool = True, n_jobs: int = -1, debug=False):
-        #return utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
-        self.save(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
-        return self.open(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
+    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
+        self.save(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
+        return self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
 
 class BatchWrap(Batch):
+    """
+    This class has 'pair' stack variable for the datasets in the dict and stores wrapped phase (real values).
+    """
     def __init__(self, mapping:dict|None=None):
         dict.__init__(self, mapping or {})
+
+class BatchComplex(Batch):
+    """
+    This class has 'data' stack variable for the datasets in the dict.
+    """
+    def __init__(self, mapping:dict|None=None):
+        dict.__init__(self, mapping or {})
+
+    def sel(self, keys: dict|list|str):
+        import pandas as pd
+        import numpy as np
+
+        if not isinstance(keys, pd.DataFrame):
+            if isinstance(keys, str):
+                keys = [keys]
+            return type(self)({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
+
+        dss = {}
+        # iterate all burst groups
+        for id in keys.index.get_level_values(0).unique():
+            # select all records for the current burst group
+            records = keys[keys.index.get_level_values(0)==id]
+            # filter dates
+            dates = records.startTime.dt.date.values.astype(str)
+            ds = self[id].sel(date=dates)
+            # filter polarizations
+            pols = records.polarization.unique()
+            if len(pols) > 1:
+                raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
+            elif len(pols) == 0:
+                raise ValueError(f'ERROR: No polarizations found for the burst: {id}')
+            pols = pols[0]
+            if ',' in pols:
+                pols = pols.split(',')
+            if isinstance(pols, str):
+                pols = [pols]
+            count = 0
+            if np.unique(pols).size < len(pols):
+                raise ValueError(f'ERROR: defined polarizations {pols} are not unique.')
+            if len([pol for pol in pols if pol in ds.data_vars]) < len(pols):
+                raise ValueError(f'ERROR: defined polarizations {pols} are not available in the dataset: {id}')
+            for pol in [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in ds.data_vars]:
+                if pol not in pols:
+                    ds = ds.drop(pol)
+                else:
+                    count += 1
+            if count == 0:
+                raise ValueError(f'ERROR: No valid polarizations found for the burst: {id}')
+            dss[id] = ds
+        return type(self)(dss)

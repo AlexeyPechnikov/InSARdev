@@ -131,9 +131,10 @@ def downsampler(grid, coarsen=None, resolution=60, func='mean', wrap=False, debu
     # decimator function
     def decimator(datas):
         def decimator_dataset(ds):
-            y_chunksize = ds.chunks[-2][0]
-            x_chunksize = ds.chunks[-1][0]
-            print ('ds.chunks', y_chunksize, x_chunksize)
+            y_chunksize = ds.chunks['y'][0]
+            x_chunksize = ds.chunks['x'][0]
+            #y_chunksize = x_chunksize = 4*1280
+            #print ('ds.chunks', y_chunksize, x_chunksize)
             coarsen_args = {'y': yscale, 'x': xscale}
             # calculate coordinate offsets to align coarsened grids
             y0 = coarsen_start(ds, 'y', yscale)
@@ -143,11 +144,11 @@ def downsampler(grid, coarsen=None, resolution=60, func='mean', wrap=False, debu
                 da_complex = np.exp(1j * ds.astype(np.float32))
                 da_complex_agg = getattr(da_complex\
                         .coarsen(coarsen_args, boundary='trim'), func)()\
-                        .astype(np.complex64)\
-                        .chunk({'y': y_chunksize, 'x': x_chunksize})
+                        .astype(np.complex64)
                 da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real).astype(np.float32)
                 del da_complex, da_complex_agg
-                return da_decimated
+                return da_decimated\
+                        .chunk({'y': y_chunksize, 'x': x_chunksize})
             else:
                 return getattr(ds\
                         .coarsen(coarsen_args, boundary='trim'), func)()\
@@ -162,13 +163,6 @@ def downsampler(grid, coarsen=None, resolution=60, func='mean', wrap=False, debu
 
     # return callback function and set common chunk size
     return lambda datas: decimator(datas)
-
-def downsampler_interferogram(grid, coarsen=None, resolution=60, func='mean', debug=False):
-    return downsampler(grid, coarsen, resolution, func, wrap=True, debug=debug)
-
-def downsampler_correlation(grid, coarsen=None, resolution=60, func='mean', debug=False):
-    return downsampler(grid, coarsen, resolution, func, wrap=False, debug=debug)
-
 
 def to_dict(datas: dict[str, xr.Dataset | xr.DataArray] | None = None):
     """

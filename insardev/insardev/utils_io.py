@@ -25,7 +25,7 @@ from insardev_toolkit import progressbar_joblib
 #     return snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
 
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                compat: bool = True, interleave: bool = False, n_jobs: int = -1, debug=False):
+                compat: bool = True, n_jobs: int = -1, debug=False):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -52,10 +52,10 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
     """
     # call the function without data arguments to only open existing store
     if len(args) > 0:
-        save(*args, store=store, storage_options=storage_options, compat=compat, interleave=interleave, n_jobs=n_jobs, debug=debug)
-    return open(store=store, storage_options=storage_options, compat=compat, interleave=interleave, n_jobs=n_jobs, debug=debug)
+        save(*args, store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
+    return open(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
 
-def save(*args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
+def save(*args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
             caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
     """
     Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
@@ -96,6 +96,8 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
 
     joblib_backend = 'sequential' if debug else 'threading'
 
+    interleave = len(args) > 1
+
     # process all arguments into a single dictionary
     datas = {}
     if interleave:
@@ -120,7 +122,7 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
                 datas.update(arg)
             else:
                 raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
-
+    
     def _save_grp(grp, ds, chunks):
         # silently drop problematic attributes
         ds_clean = ds.copy()
@@ -137,7 +139,12 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
         del ds_clean
 
     # open to drop existing store
-    root_group = zarr.group(store=store, zarr_format=3, overwrite=True)
+    root = zarr.group(store=store, zarr_format=3, overwrite=True)
+    root.attrs['__class__'] = [
+        f'{cls.__module__}.{cls.__qualname__}'
+        for cls in (type(arg) for arg in args)
+    ]
+
     with progressbar_joblib.progressbar_joblib(tqdm(desc='Saving Zarr...'.ljust(25), total=len(datas))) as progress_bar:
         joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_save_grp) (grp, ds, chunks=chunksize) for grp, ds in datas.items())
 
@@ -152,7 +159,7 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
     except ValueError:
         pass
 
-def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
+def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
             n_jobs: int = -1, debug=False):
     """
     Load a Zarr store created by save(...).
@@ -182,10 +189,14 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     import xarray as xr
     import joblib
     from tqdm.auto import tqdm
+    from pydoc import locate
 
     root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
+    classes = [locate(c) for c in root.attrs.get('__class__')]
+    interleave = len(classes) > 1
+    #print('classes', classes)
     groups = list(root.group_keys())
-    print(len(groups))
+    #print(len(groups))
 
     joblib_backend = 'sequential' if debug else 'threading'
 
@@ -205,7 +216,7 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
             return dss['i0_default'], dss['i1_default']
         dss0 = {k[len('i0_'):]: v for k, v in dss.items() if k.startswith('i0_')}
         dss1 = {k[len('i1_'):]: v for k, v in dss.items() if k.startswith('i1_')}
-        return dss0, dss1
+        return classes[0](dss0), classes[1](dss1)
     elif compat and len(dss) == 1 and 'default' in dss:
         # unpack single dataset
         return dss['default']
@@ -213,4 +224,4 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
         # default_0, default_1, etc. means that the datasets were saved as a list, unpack them
         return [dss[f'default_{i}'] for i in range(len(dss))]
 
-    return dss
+    return classes[0](dss)

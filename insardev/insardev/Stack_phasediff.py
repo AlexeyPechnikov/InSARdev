@@ -10,7 +10,7 @@
 # ----------------------------------------------------------------------------
 from .Stack_base import Stack_base
 from insardev_toolkit import progressbar
-from .Batch import BatchInterferogram, BatchCorrelation
+from .Batch import Batch, BatchWrap
 from . import utils_xarray
 
 class Stack_phasediff(Stack_base):
@@ -124,15 +124,15 @@ class Stack_phasediff(Stack_base):
         #     return result
         # return (intfs, corrs)
 
-    def phasediff_singlelook(self, pairs, datas, weights=None, phases=None, compute=False, **kwarg):
+    def phasediff_singlelook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
         kwarg['multilook'] = False
-        intfs, corrs = utils_xarray.apply_pol(datas, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
-        return BatchInterferogram(intfs), BatchCorrelation(corrs)
+        intfs, corrs = utils_xarray.apply_pol(self.dss, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        return BatchWrap(intfs), Batch(corrs)
 
-    def phasediff_multilook(self, pairs, datas, weights=None, phases=None, compute=False, **kwarg):
+    def phasediff_multilook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
         kwarg['multilook'] = True
-        intfs, corrs = utils_xarray.apply_pol(datas, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
-        return BatchInterferogram(intfs), BatchCorrelation(corrs)
+        intfs, corrs = utils_xarray.apply_pol(self.dss, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        return BatchWrap(intfs), Batch(corrs)
 
     # def phasediff(self,
     #                   pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,

@@ -9,46 +9,35 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_plot import Stack_plot
-from insardev_toolkit import progressbar
-from .Batch import Batch
+from .Batch import Batch, BatchWrap, BatchComplex
 from collections.abc import Mapping
 from . import utils_io
+from . import utils_xarray
+from insardev_toolkit import datagrid
 
 class Stack(Stack_plot, Mapping):
     import rasterio as rio
     import pandas as pd
     import xarray as xr
     import geopandas as gpd
-    from zarr.storage._fsspec import FsspecStore
     import zarr
 
-    def snapshot_interleave(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                        compat: bool = True, n_jobs: int = -1, debug=False):
-        return utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
-
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                compat: bool = True, interleave: bool = False, n_jobs: int = -1, debug=False):
-        return utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=interleave, n_jobs=n_jobs, debug=debug)
+                n_jobs: int = -1, debug=False):
+        if len(args) > 2:
+            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch/BatchWrap/dict objects or no arguments.')
+        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, n_jobs=n_jobs, debug=debug)
+        return datas
 
-    def save_interleave(self, *args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
-            caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
-        return utils_io.save(*args, store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=True,
-                             caption=caption, n_jobs=n_jobs, debug=debug)
-    
-    def save(self, *args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
-            caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
-        return utils_io.save(*args, store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=interleave,
-                             caption=caption, n_jobs=n_jobs, debug=debug)
-    
-    def open_interleave(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
-            n_jobs: int = -1, debug=False):
-        return utils_io.open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=True,
-                             n_jobs=n_jobs, debug=debug)
-    
-    def open(self, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto', interleave: bool = False,
-            n_jobs: int = -1, debug=False):
-        return utils_io.open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, interleave=interleave,
-                             n_jobs=n_jobs, debug=debug)
+    def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
+        datas = []
+        for arg in args:
+            wrap = True if isinstance(arg, BatchWrap) else False
+            sample = next(iter(arg.values()))
+            callback = utils_xarray.downsampler(sample, coarsen=coarsen, resolution=resolution, func=func, wrap=wrap, debug=debug)
+            data = callback(arg)
+            datas.append(BatchWrap(data) if wrap else Batch(data))
+        return datas
     
     @staticmethod
     def restore(store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1) -> "Stack":
@@ -256,68 +245,68 @@ class Stack(Stack_plot, Mapping):
         
         return df.to_crs(crs) if crs is not None else df
 
-    def to_dict(self,
-                datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None):
-        """
-        Return the full dictionary of datasets or convert speciied list of datasets or dataarrays to a dictionary.
-        """
-        import pandas as pd
-        import xarray as xr
-        import numpy as np
+    # def to_dict(self,
+    #             datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None):
+    #     """
+    #     Return the full dictionary of datasets or convert speciied list of datasets or dataarrays to a dictionary.
+    #     """
+    #     import pandas as pd
+    #     import xarray as xr
+    #     import numpy as np
 
-        if datas is None:
-            return None
-        elif isinstance(datas, xr.Dataset):
-            return {'default': datas}
-        elif isinstance(datas, xr.DataArray):
-            return {'default': datas.to_dataset()}
-        elif isinstance(datas, pd.DataFrame):
-            dss = {}
-            # iterate all burst groups
-            for id in datas.index.get_level_values(0).unique():
-                # select all records for the current burst group
-                records = datas[datas.index.get_level_values(0)==id]
-                # filter dates
-                dates = records.startTime.dt.date.values.astype(str)
-                ds = self.dss[id].sel(date=dates)
-                # filter polarizations
-                pols = records.polarization.unique()
-                if len(pols) > 1:
-                    raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
-                elif len(pols) == 0:
-                    raise ValueError(f'ERROR: No polarizations found for the burst: {id}')
-                pols = pols[0]
-                if ',' in pols:
-                    pols = pols.split(',')
-                if isinstance(pols, str):
-                    pols = [pols]
-                count = 0
-                if np.unique(pols).size < len(pols):
-                    raise ValueError(f'ERROR: defined polarizations {pols} are not unique.')
-                if len([pol for pol in pols if pol in ds.data_vars]) < len(pols):
-                    raise ValueError(f'ERROR: defined polarizations {pols} are not available in the dataset: {id}')
-                for pol in [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in ds.data_vars]:
-                    if pol not in pols:
-                        ds = ds.drop(pol)
-                    else:
-                        count += 1
-                if count == 0:
-                    raise ValueError(f'ERROR: No valid polarizations found for the burst: {id}')
-                dss[id] = ds
-            return dss
-        elif isinstance(datas, dict):
-            return datas
-        elif isinstance(datas, (list, tuple)):
-            if 'fullBurstID' in datas[0].data_vars:
-                return {ds.fullBurstID.item(0):ds for ds in datas}
-            else:
-                import random, string
-                chars = string.ascii_lowercase
-                random_prefix = ''.join(random.choices(chars, k=8))
-                print (f'NOTE: No fullBurstID variable found in the dataset, using random prefix {random_prefix} with order as the key.')
-                return {f'{random_prefix}_{i+1}':ds for i, ds in enumerate(datas)}
-        else:
-            raise ValueError(f'ERROR: datas is not None or dataframe or a dict, list, or tuple of xr.Dataset or xr.DataArray: {type(datas)}')
+    #     if datas is None:
+    #         return None
+    #     elif isinstance(datas, xr.Dataset):
+    #         return {'default': datas}
+    #     elif isinstance(datas, xr.DataArray):
+    #         return {'default': datas.to_dataset()}
+    #     elif isinstance(datas, pd.DataFrame):
+    #         dss = {}
+    #         # iterate all burst groups
+    #         for id in datas.index.get_level_values(0).unique():
+    #             # select all records for the current burst group
+    #             records = datas[datas.index.get_level_values(0)==id]
+    #             # filter dates
+    #             dates = records.startTime.dt.date.values.astype(str)
+    #             ds = self.dss[id].sel(date=dates)
+    #             # filter polarizations
+    #             pols = records.polarization.unique()
+    #             if len(pols) > 1:
+    #                 raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
+    #             elif len(pols) == 0:
+    #                 raise ValueError(f'ERROR: No polarizations found for the burst: {id}')
+    #             pols = pols[0]
+    #             if ',' in pols:
+    #                 pols = pols.split(',')
+    #             if isinstance(pols, str):
+    #                 pols = [pols]
+    #             count = 0
+    #             if np.unique(pols).size < len(pols):
+    #                 raise ValueError(f'ERROR: defined polarizations {pols} are not unique.')
+    #             if len([pol for pol in pols if pol in ds.data_vars]) < len(pols):
+    #                 raise ValueError(f'ERROR: defined polarizations {pols} are not available in the dataset: {id}')
+    #             for pol in [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in ds.data_vars]:
+    #                 if pol not in pols:
+    #                     ds = ds.drop(pol)
+    #                 else:
+    #                     count += 1
+    #             if count == 0:
+    #                 raise ValueError(f'ERROR: No valid polarizations found for the burst: {id}')
+    #             dss[id] = ds
+    #         return dss
+    #     elif isinstance(datas, dict):
+    #         return datas
+    #     elif isinstance(datas, (list, tuple)):
+    #         if 'fullBurstID' in datas[0].data_vars:
+    #             return {ds.fullBurstID.item(0):ds for ds in datas}
+    #         else:
+    #             import random, string
+    #             chars = string.ascii_lowercase
+    #             random_prefix = ''.join(random.choices(chars, k=8))
+    #             print (f'NOTE: No fullBurstID variable found in the dataset, using random prefix {random_prefix} with order as the key.')
+    #             return {f'{random_prefix}_{i+1}':ds for i, ds in enumerate(datas)}
+    #     else:
+    #         raise ValueError(f'ERROR: datas is not None or dataframe or a dict, list, or tuple of xr.Dataset or xr.DataArray: {type(datas)}')
 
     # def to_dataset(self, records=None):
     #     dss = self.to_datasets(records)
@@ -326,7 +315,7 @@ class Stack(Stack_plot, Mapping):
 
     def __init__(self, dss:dict[str, xr.Dataset]|None = None):
         import xarray as xr
-        self.dss = Batch(dss)
+        self.dss = BatchComplex(dss)
 
     def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
         import numpy as np
@@ -600,19 +589,9 @@ class Stack(Stack_plot, Mapping):
                          duration=(df['rep'] - df['ref']).dt.days,
                          rel=np.datetime64('nat'))
     
-    def to_dataset_interferogram(self,
-              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
-              compute: bool = False):
-        return self.to_dataset(datas, wrap=True, compute=compute)
-
-    def to_dataset_correlation(self,
-              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
-              compute: bool = False):
-        return self.to_dataset(datas, wrap=False, compute=compute)
-
     def to_dataset(self,
               datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
-              wrap:bool|None=None,
+              wrap: bool | None = None,
               compute: bool = False):
         """
         This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
@@ -634,6 +613,15 @@ class Stack(Stack_plot, Mapping):
         import xarray as xr
         import numpy as np
         import dask
+        from insardev_toolkit import progressbar
+
+        # in case of dict wrap is not defined, also it should be preserved for recursive calls
+        dtype = type(datas)
+        if dtype == BatchWrap:
+            wrap = True
+        elif dtype == Batch:
+            wrap = False
+        print ('dtype', dtype, 'wrap', wrap)
 
         #print (type(datas))
         if datas is None:
@@ -681,7 +669,8 @@ class Stack(Stack_plot, Mapping):
             return das_total
 
         # process list of dataarrays with single polarization
-
+        y_chunksize = datas[0].chunks[-2][0]
+        x_chunksize = datas[0].chunks[-1][0]
         # define unified grid
         y_min = min(ds.y.min().item() for ds in datas)
         y_max = max(ds.y.max().item() for ds in datas)
@@ -763,8 +752,8 @@ class Stack(Stack_plot, Mapping):
                 block_dask,
                 'zyx',
                 stackidx.chunk(1), 'z',
-                ys.chunk({'y': self.chunksize}), 'y',
-                xs.chunk({'x': self.chunksize}), 'x',
+                ys.chunk({'y': y_chunksize}), 'y',
+                xs.chunk({'x': x_chunksize}), 'x',
                 meta = np.empty((0, 0, 0), dtype=datas[0].dtype),
                 wrap=wrap
             )
@@ -772,4 +761,4 @@ class Stack(Stack_plot, Mapping):
             .rename(datas[0].name)\
             .assign_attrs(datas[0].attrs)
         del data
-        return self.spatial_ref(da, datas)
+        return datagrid.spatial_ref(da, datas)

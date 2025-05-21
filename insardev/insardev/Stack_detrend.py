@@ -10,13 +10,14 @@
 # ----------------------------------------------------------------------------
 from .Stack_unwrap import Stack_unwrap
 from .utils_regression2d import regression2d
-
+from . import utils_xarray
+from .Batch import Batch, BatchWrap
 class Stack_detrend(Stack_unwrap):
     import numpy as np
     import xarray as xr
 
-    def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
-        return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
+    # def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
+    #     return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
 
     def trend2d(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
         def _regression2d(data, weight, **kwarg):
@@ -31,8 +32,9 @@ class Stack_detrend(Stack_unwrap):
                                         **kwarg)
             #print ('trend', trend)
             return trend.chunk(data.chunks)
-        return self.apply_pol(datas, weights, func=_regression2d, add_key=True, compute=compute, variables=variables, **kwarg)
-
+        wrap = True if isinstance(datas, BatchWrap) else False
+        data = utils_xarray.apply_pol(datas, weights, func=_regression2d, add_key=True, compute=compute, variables=variables, wrap=wrap, **kwarg)
+        return BatchWrap(data) if wrap else Batch(data)
 
     def _polyfit(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
         print ('NOTE: Function is deprecated. Use Stack.regression_pairs() instead.')
