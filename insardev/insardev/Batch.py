@@ -68,6 +68,15 @@ class Batch(dict):
         # otherwise fall back to dictionary lookup: batch['033_069722_IW3']
         return super().__getitem__(key)
 
+    def drop_vars(self, names):
+        """Return a new Batch with those data-vars removed from each dataset."""
+        if isinstance(names, str):
+            names = [names]
+        return type(self)({
+            k: ds.drop_vars(names)
+            for k, ds in self.items()
+        })
+
     def __add__(self, other: 'Batch'):
         keys = self.keys()
         #& other.keys()
