@@ -68,15 +68,6 @@ class Batch(dict):
         # otherwise fall back to dictionary lookup: batch['033_069722_IW3']
         return super().__getitem__(key)
 
-    def drop_vars(self, names):
-        """Return a new Batch with those data-vars removed from each dataset."""
-        if isinstance(names, str):
-            names = [names]
-        return type(self)({
-            k: ds.drop_vars(names)
-            for k, ds in self.items()
-        })
-
     def __add__(self, other: 'Batch'):
         keys = self.keys()
         #& other.keys()
@@ -113,6 +104,89 @@ class Batch(dict):
             idxs = list(indices)
         selected = {keys[i]: self[keys[i]] for i in idxs }
         return type(self)(selected)
+
+    def drop_vars(self, names):
+        """Return a new Batch with those data-vars removed from each dataset."""
+        if isinstance(names, str):
+            names = [names]
+        return type(self)({
+            k: ds.drop_vars(names)
+            for k, ds in self.items()
+        })
+
+    def rename_vars(self, **kw):
+        return type(self)({k: ds.rename_vars(**kw) for k, ds in self.items()})
+
+    def reindex(self, **kw):
+        return type(self)({k: ds.reindex(**kw) for k, ds in self.items()})
+
+    def interp(self, **kw):
+        return type(self)({k: ds.interp(**kw) for k, ds in self.items()})
+
+    def interp_like(self, other: Batch, **interp_kwargs):
+        """Regrid each Dataset onto the coords of the *corresponding* Dataset in `other`."""
+        return type(self)({
+            k: ds.interp_like(other[k], **interp_kwargs)
+            for k, ds in self.items() if k in other
+        })
+
+    def transpose(self, *dims, **kw):
+        return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
+
+    def _agg(self, name: str, dim=None, **kwargs):
+        """
+        Internal helper for aggregation methods.
+        If the target object's .<name>() accepts a `dim=` arg, we pass dim, otherwise we just call it without.
+        """
+        import inspect
+        out = {}
+        for key, obj in self.items():
+            fn = getattr(obj, name)
+            sig = inspect.signature(fn)
+            if "dim" in sig.parameters:
+                out[key] = fn(dim=dim, **kwargs)
+            else:
+                out[key] = fn(**kwargs)
+        return type(self)(out)
+
+    def mean(self, dim=None, **kwargs):
+        return self._agg("mean", dim=dim, **kwargs)
+
+    def sum(self, dim=None, **kwargs):
+        return self._agg("sum", dim=dim, **kwargs)
+
+    def min(self, dim=None, **kwargs):
+        return self._agg("min", dim=dim, **kwargs)
+
+    def max(self, dim=None, **kwargs):
+        return self._agg("max", dim=dim, **kwargs)
+
+    def median(self, dim=None, **kwargs):
+        return self._agg("median", dim=dim, **kwargs)
+
+    def std(self, dim=None, **kwargs):
+        return self._agg("std", dim=dim, **kwargs)
+
+    def var(self, dim=None, **kwargs):
+        return self._agg("var", dim=dim, **kwargs)
+
+    def coarsen(self, window: dict[str,int], **kwargs):
+        """
+        intfs.coarsen({'y':2, 'x':8}, boundary='trim').mean().isel(0)
+        """
+        return type(self)({
+            k: ds.coarsen(window, **kwargs)
+            for k, ds in self.items()
+        })
+
+    def chunk(self, chunks):
+        return type(self)({k: ds.chunk(chunks) for k, ds in self.items()})
+
+    def pipe(self, func, *args, **kwargs):
+        return func(self, *args, **kwargs)
+
+    def map(self, func, *args, **kwargs):
+        return type(self)({k: func(ds, *args, **kwargs) for k, ds in self.items()})
 
     def compute(self):
         import dask
