@@ -19,21 +19,25 @@ class Stack_detrend(Stack_unwrap):
     # def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
     #     return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
 
-    def trend2d(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
-        def _regression2d(data, weight, **kwarg):
+    def trend2d(self, datas, weights, transform, compute=False, **kwarg):
+        def _regression2d(data, weight, transform, **kwarg):
             #print ('kwarg', kwarg)
             key = kwarg.pop('key')
-            variables = kwarg.pop('variables')
-            #transform = self.dss[key].interp_like(data, method='linear')
-            transform = self.dss[key].reindex_like(data, method='nearest')
+            #print ('shapes', data.shape, weight.shape, [transform[v].shape for v in variables])
+            #if transform is None:
+            #    # find nearest transform matrix values on the original grid for potentially multilooked data
+            #    transform = self.dss[key][variables].reindex_like(data, method='nearest')
             trend = regression2d(data.chunk({'y':-1, 'x':-1}),
-                                        variables=[transform[v] for v in variables],
+                                        variables=[transform[v] for v in transform.data_vars],
                                         weight=weight,
                                         **kwarg)
             #print ('trend', trend)
             return trend.chunk(data.chunks)
+        if transform is not None:
+            # unify keys to datas
+            transform = transform.sel(datas)
         wrap = True if isinstance(datas, BatchWrap) else False
-        data = utils_xarray.apply_pol(datas, weights, func=_regression2d, add_key=True, compute=compute, variables=variables, wrap=wrap, **kwarg)
+        data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, compute=compute, wrap=wrap, **kwarg)
         return BatchWrap(data) if wrap else Batch(data)
 
     def _polyfit(self, data, weight=None, degree=0, days=None, count=None, wrap=False):

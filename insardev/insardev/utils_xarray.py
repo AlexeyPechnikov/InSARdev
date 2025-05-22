@@ -281,10 +281,32 @@ def apply_pol(*args, **kwarg):
     keys = list(datas[0].keys())
     dss = []
     for polarization in polarizations:
+        #if add_key:
+        #    dss_pol = {key: func(*(d[key][polarization] if d is not None else None for d in datas), **(kwarg | {'key': key})) for key in keys}
+        #else:
+        #    dss_pol = {key: func(*(d[key][polarization] if d is not None else None for d in datas), **kwarg) for key in keys}
         if add_key:
-            dss_pol = {key: func(*(d[key][polarization] if d is not None else None for d in datas), **(kwarg | {'key': key})) for key in keys}
+            dss_pol = {
+            key: func(
+                *(d[key][polarization]
+                if d is not None and polarization in d[key].data_vars
+                else (d[key] if d is not None else None)
+                for d in datas),
+                **(kwarg | {'key': key})
+            )
+            for key in keys
+            }
         else:
-            dss_pol = {key: func(*(d[key][polarization] if d is not None else None for d in datas), **kwarg) for key in keys}
+            dss_pol = {
+            key: func(
+                *(d[key][polarization]
+                if d is not None and polarization in d[key].data_vars
+                else (d[key] if d is not None else None)
+                for d in datas),
+                **kwarg
+            )
+            for key in keys
+            }
         if compute:
             progressbar(dss_pol := dask.persist(dss_pol)[0], desc=f'Computing {polarization}...'.ljust(25))
         dss.append(dss_pol)

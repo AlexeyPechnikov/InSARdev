@@ -12,6 +12,7 @@ from .Stack_detrend import Stack_detrend
 import numpy as np
 
 class Stack_sbas(Stack_detrend):
+    import pandas as pd
 
 #    def baseline_pairs(self, days=100, meters=None, invert=False, **kwargs):
 #        print('Note: function baseline_pairs() renamed to sbas_pairs(). Use separate filtering functions when needed.')
@@ -19,6 +20,55 @@ class Stack_sbas(Stack_detrend):
     
 #    def sbas_pairs_filter_dates(self, pairs, dates):
 #        return pairs[(~pairs['ref'].isin(dates))&(~pairs['rep'].isin(dates))]
+
+
+    # def baseline_table(self):
+    #     import xarray as xr
+    #     return xr.concat([ds.BPR for ds in self.ds], dim='burst').mean('burst').to_dataframe()[['BPR']]
+
+    def baseline_pairs(self, days:int|None=None, meters:int|None=None, invert:bool=False) -> pd.DataFrame:
+        """
+        Generates a sorted list of baseline pairs.
+        Returns
+        -------
+        pandas.DataFrame
+            A DataFrame containing the sorted list of baseline pairs with reference and repeat dates,
+            timelines, and baselines.
+    
+        """
+        import numpy as np
+        import pandas as pd
+        
+        if days is None:
+            # use large number for unlimited time interval in days
+            days = 1e6
+    
+        tbl = self.baseline_table()
+        data = []
+        for line1 in tbl.itertuples():
+            counter = 0
+            for line2 in tbl.itertuples():
+                #print (line1, line2)
+                if not (line1.Index < line2.Index and (line2.Index - line1.Index).days < days + 1):
+                    continue
+                if meters is not None and not (abs(line1.BPR - line2.BPR)< meters + 1):
+                    continue
+    
+                counter += 1
+                if not invert:
+                    data.append({'ref':line1.Index, 'rep': line2.Index,
+                                 'ref_baseline': np.round(line1.BPR, 2),
+                                 'rep_baseline': np.round(line2.BPR, 2)})
+                else:
+                    data.append({'ref':line2.Index, 'rep': line1.Index,
+                                 'ref_baseline': np.round(line2.BPR, 2),
+                                 'rep_baseline': np.round(line1.BPR, 2)})
+    
+        df = pd.DataFrame(data).sort_values(['ref', 'rep'])
+        return df.assign(pair=[f'{ref} {rep}' for ref, rep in zip(df['ref'].dt.date, df['rep'].dt.date)],
+                         baseline=df.rep_baseline - df.ref_baseline,
+                         duration=(df['rep'] - df['ref']).dt.days,
+                         rel=np.datetime64('nat'))
 
     def sbas_pairs_limit(self, pairs, limit=2, iterations=1):
         """

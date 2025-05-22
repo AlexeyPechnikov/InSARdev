@@ -19,72 +19,12 @@ class Stack(Stack_plot, Mapping):
     import rasterio as rio
     import pandas as pd
     import xarray as xr
-    import geopandas as gpd
-    import zarr
+    #import geopandas as gpd
+    #import zarr
 
-    def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                n_jobs: int = -1, debug=False):
-        if len(args) > 2:
-            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch/BatchWrap/dict objects or no arguments.')
-        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, n_jobs=n_jobs, debug=debug)
-        return datas
+    def __init__(self, dss:dict[str, xr.Dataset] | None = None):
+        self.dss = BatchComplex(dss)
 
-    def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
-        datas = []
-        for arg in args:
-            wrap = True if isinstance(arg, BatchWrap) else False
-            sample = next(iter(arg.values()))
-            callback = utils_xarray.downsampler(sample, coarsen=coarsen, resolution=resolution, func=func, wrap=wrap, debug=debug)
-            data = callback(arg)
-            datas.append(BatchWrap(data) if wrap else Batch(data))
-        return datas
-    
-    @staticmethod
-    def restore(store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1) -> "Stack":
-        """
-        Restore a previously saved Stack from a Zarr store.
-        
-        Parameters
-        ----------
-        store : str or zarr.Store
-            Path (e.g. 'intfs.zarr') or any zarr.Store (DirectoryStore, FsspecStore, …).
-        storage_options : dict, optional
-            Passed through to fsspec if you need retries, timeouts, etc.
-        n_jobs : int, optional
-            Number of parallel jobs to use for saving. Default is -1 (use all available cores).
-        
-        Returns
-        -------
-        Stack
-            A Stack whose .dss is populated from the store.
-
-        Example:
-        ```python
-        # open the dataset
-        stack = Stack('s1-myanmar_2025-earthquake-10x2.5-062')
-        # save the dataset
-        stack.save(stack.dss, store='dump.zarr')
-        # restore the dataset to a new stack
-        stack = Stack.restore('dump.zarr')
-        ``` 
-        """
-        
-        # a new Stack without calling __init__
-        self = Stack.__new__(Stack)
-        # open the data
-        self.dss = self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, compat=False)
-        return self
-
-    # @staticmethod
-    # def set(datas: dict[str, xr.Dataset] ) -> "Stack":
-    #     # a new Stack without calling __init__
-    #     self = Stack.__new__(Stack)
-    #     # set the data
-    #     self.dss = datas
-    #     return self
-
-    # def __repr__(self):
-    #     return f"Object {self.__class__.__name__} with {len(self.dss)} bursts for {len(next(iter(self.dss.values())).date)} dates"
     def __repr__(self):
         if not getattr(self, 'dss', {}):
             return f"{self.__class__.__name__}(empty)"
@@ -164,6 +104,28 @@ class Stack(Stack_plot, Mapping):
 
     def epsg(self) -> int:
         return next(iter(self.dss.values())).rio.crs.to_epsg()
+
+    def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
+                caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
+        if len(args) > 2:
+            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch/BatchWrap/dict objects or no arguments.')
+        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
+        return datas
+
+    def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
+        datas = []
+        for arg in args:
+            print ('type(arg)', type(arg))
+            if isinstance(arg, (Stack, BatchComplex)):
+                arg = Batch(arg)
+                print (arg.isel(0)['033_069722_IW3'].data_vars)
+            wrap = True if isinstance(arg, BatchWrap) else False
+            print ('\ttype(arg)', type(arg), 'wrap', wrap)
+            sample = next(iter(arg.values()))
+            callback = utils_xarray.downsampler(sample, coarsen=coarsen, resolution=resolution, func=func, wrap=wrap, debug=debug)
+            data = callback(arg)
+            datas.append(BatchWrap(data) if wrap else Batch(data))
+        return datas
 
     def to_dataframe(self,
                      datas: dict[str, xr.Dataset | xr.DataArray] | None = None,
@@ -245,79 +207,7 @@ class Stack(Stack_plot, Mapping):
         
         return df.to_crs(crs) if crs is not None else df
 
-    # def to_dict(self,
-    #             datas: dict[str, xr.Dataset | xr.DataArray] | list[xr.Dataset | xr.DataArray] | pd.DataFrame | None = None):
-    #     """
-    #     Return the full dictionary of datasets or convert speciied list of datasets or dataarrays to a dictionary.
-    #     """
-    #     import pandas as pd
-    #     import xarray as xr
-    #     import numpy as np
-
-    #     if datas is None:
-    #         return None
-    #     elif isinstance(datas, xr.Dataset):
-    #         return {'default': datas}
-    #     elif isinstance(datas, xr.DataArray):
-    #         return {'default': datas.to_dataset()}
-    #     elif isinstance(datas, pd.DataFrame):
-    #         dss = {}
-    #         # iterate all burst groups
-    #         for id in datas.index.get_level_values(0).unique():
-    #             # select all records for the current burst group
-    #             records = datas[datas.index.get_level_values(0)==id]
-    #             # filter dates
-    #             dates = records.startTime.dt.date.values.astype(str)
-    #             ds = self.dss[id].sel(date=dates)
-    #             # filter polarizations
-    #             pols = records.polarization.unique()
-    #             if len(pols) > 1:
-    #                 raise ValueError(f'ERROR: Inconsistent polarizations found for the same burst: {id}')
-    #             elif len(pols) == 0:
-    #                 raise ValueError(f'ERROR: No polarizations found for the burst: {id}')
-    #             pols = pols[0]
-    #             if ',' in pols:
-    #                 pols = pols.split(',')
-    #             if isinstance(pols, str):
-    #                 pols = [pols]
-    #             count = 0
-    #             if np.unique(pols).size < len(pols):
-    #                 raise ValueError(f'ERROR: defined polarizations {pols} are not unique.')
-    #             if len([pol for pol in pols if pol in ds.data_vars]) < len(pols):
-    #                 raise ValueError(f'ERROR: defined polarizations {pols} are not available in the dataset: {id}')
-    #             for pol in [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in ds.data_vars]:
-    #                 if pol not in pols:
-    #                     ds = ds.drop(pol)
-    #                 else:
-    #                     count += 1
-    #             if count == 0:
-    #                 raise ValueError(f'ERROR: No valid polarizations found for the burst: {id}')
-    #             dss[id] = ds
-    #         return dss
-    #     elif isinstance(datas, dict):
-    #         return datas
-    #     elif isinstance(datas, (list, tuple)):
-    #         if 'fullBurstID' in datas[0].data_vars:
-    #             return {ds.fullBurstID.item(0):ds for ds in datas}
-    #         else:
-    #             import random, string
-    #             chars = string.ascii_lowercase
-    #             random_prefix = ''.join(random.choices(chars, k=8))
-    #             print (f'NOTE: No fullBurstID variable found in the dataset, using random prefix {random_prefix} with order as the key.')
-    #             return {f'{random_prefix}_{i+1}':ds for i, ds in enumerate(datas)}
-    #     else:
-    #         raise ValueError(f'ERROR: datas is not None or dataframe or a dict, list, or tuple of xr.Dataset or xr.DataArray: {type(datas)}')
-
-    # def to_dataset(self, records=None):
-    #     dss = self.to_datasets(records)
-    #     if len(dss) > 1:
-    #         return self.to_datasets(records)[0]
-
-    def __init__(self, dss:dict[str, xr.Dataset]|None = None):
-        import xarray as xr
-        self.dss = BatchComplex(dss)
-
-    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
+    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, chunksize: int|str = 'auto', attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -376,7 +266,7 @@ class Stack(Stack_plot, Mapping):
             date = pd.to_datetime(ds['startTime'].item())
             return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
 
-        def _bursts_transform_preprocess(bursts, transform):
+        def _bursts_transform_preprocess(bursts, transform, chunksize):
             import xarray as xr
             import numpy as np
 
@@ -392,7 +282,7 @@ class Stack(Stack_plot, Mapping):
                         v.replace(polarization, 'XX') for v in data.burst.values
                     ]
                     del data['polarization']
-                    datas.append(data)
+                    datas.append(data.chunk(chunksize))
                 ds = xr.merge(datas)
                 del datas
             else:
@@ -400,7 +290,7 @@ class Stack(Stack_plot, Mapping):
 
             for var in transform.data_vars:
                 #if var not in ['re', 'im']:
-                ds[var] = transform[var]
+                ds[var] = transform[var].chunk(chunksize)
 
             ds.rio.write_crs(bursts.attrs['spatial_ref'], inplace=True)
             return ds
@@ -482,7 +372,7 @@ class Stack(Stack_plot, Mapping):
             # note: isinstance(urls, zarr.storage.ZipStore) can be loaded too but it is less efficient
             urls = os.path.expanduser(urls)
             root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
-            with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset', total=len(list(root.group_keys())))) as progress_bar:
+            with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset...'.ljust(25), total=len(list(root.group_keys())))) as progress_bar:
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
             # list of key - dataset converted to dict and appended to the existing dict
@@ -512,7 +402,7 @@ class Stack(Stack_plot, Mapping):
                 raise ValueError(f'ERROR: urls is not a list, or Pandas Dataframe with multiindex: {type(urls)}')
 
             dss = {}
-            for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets'):
+            for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets...'.ljust(25)):
                 #print ('fullBurstID', fullBurstID)
                 df = urls[urls.index.get_level_values(0) == fullBurstID]
                 bases = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
@@ -525,70 +415,21 @@ class Stack(Stack_plot, Mapping):
                     zarr_format=3,
                     consolidated=True,
                     parallel=True,
-                    chunks=self.chunksize,
                     concat_dim='date',
                     combine='nested',
                     preprocess=lambda ds: burst_preprocess(ds, attr_start=attr_start, debug=False),
                     storage_options=storage_options,
                 )
                 # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
-                transform = xr.open_dataset(base, engine='zarr', zarr_format=3, chunks=self.chunksize,consolidated=True, storage_options=storage_options).astype('float32')
+                transform = xr.open_dataset(base, engine='zarr', zarr_format=3, consolidated=True, storage_options=storage_options).astype('float32')
 
-                ds = _bursts_transform_preprocess(bursts, transform)
+                ds = _bursts_transform_preprocess(bursts, transform, chunksize)
                 dss[fullBurstID] = ds
                 del ds, bursts, transform
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.dss.update(dss)
 
-    # def baseline_table(self):
-    #     import xarray as xr
-    #     return xr.concat([ds.BPR for ds in self.ds], dim='burst').mean('burst').to_dataframe()[['BPR']]
-
-    def baseline_pairs(self, days:int|None=None, meters:int|None=None, invert:bool=False) -> pd.DataFrame:
-        """
-        Generates a sorted list of baseline pairs.
-        Returns
-        -------
-        pandas.DataFrame
-            A DataFrame containing the sorted list of baseline pairs with reference and repeat dates,
-            timelines, and baselines.
-    
-        """
-        import numpy as np
-        import pandas as pd
-        
-        if days is None:
-            # use large number for unlimited time interval in days
-            days = 1e6
-    
-        tbl = self.baseline_table()
-        data = []
-        for line1 in tbl.itertuples():
-            counter = 0
-            for line2 in tbl.itertuples():
-                #print (line1, line2)
-                if not (line1.Index < line2.Index and (line2.Index - line1.Index).days < days + 1):
-                    continue
-                if meters is not None and not (abs(line1.BPR - line2.BPR)< meters + 1):
-                    continue
-    
-                counter += 1
-                if not invert:
-                    data.append({'ref':line1.Index, 'rep': line2.Index,
-                                 'ref_baseline': np.round(line1.BPR, 2),
-                                 'rep_baseline': np.round(line2.BPR, 2)})
-                else:
-                    data.append({'ref':line2.Index, 'rep': line1.Index,
-                                 'ref_baseline': np.round(line2.BPR, 2),
-                                 'rep_baseline': np.round(line1.BPR, 2)})
-    
-        df = pd.DataFrame(data).sort_values(['ref', 'rep'])
-        return df.assign(pair=[f'{ref} {rep}' for ref, rep in zip(df['ref'].dt.date, df['rep'].dt.date)],
-                         baseline=df.rep_baseline - df.ref_baseline,
-                         duration=(df['rep'] - df['ref']).dt.days,
-                         rel=np.datetime64('nat'))
-    
     def to_dataset(self,
               datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
               wrap: bool | None = None,

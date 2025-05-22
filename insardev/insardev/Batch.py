@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from insardev_toolkit import datagrid, progressbar
-from . import utils_io
-from . import utils_xarray
+from __future__ import annotations
+from insardev_toolkit import progressbar
+from . import utils_io,  utils_xarray
 
 class Batch(dict):
     """
@@ -26,12 +26,22 @@ class Batch(dict):
     intfs60_detrend.isel([0, 2])
     intfs60_detrend.isel(slice(1, None))
     """
+    import xarray as xr
+
     @staticmethod
     def wrap(data):
         import numpy as np
         return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
-    def __init__(self, mapping:dict|None=None):
+    def __init__(self, mapping: dict[str, xr.Dataset] | Stack | BatchComplex | None = None):
+        from .Stack import Stack
+        if isinstance(mapping, (Stack, BatchComplex)):
+            real_dict = {}
+            for key, ds in mapping.items():
+                # pick only the data_vars whose dtype is not complex
+                real_vars = [v for v in ds.data_vars if ds[v].dtype.kind != 'c' and tuple(ds[v].dims) == ('y', 'x')]
+                real_dict[key] = ds[real_vars]
+            mapping = real_dict
         dict.__init__(self, mapping or {})
 
     def __repr__(self):
@@ -42,9 +52,21 @@ class Batch(dict):
             # delegate to the underlying dict repr
             return dict.__repr__(self)
         sample = next(iter(self.values()))
+        if not 'date' in sample and not 'pair' in sample:
+            return f'{self.__class__.__name__} object containing {len(self)} items'
         sample_len = f'{len(sample.date)} date' if 'date' in sample else f'{len(sample.pair)} pair'
         keys = list(self.keys())
         return f'{self.__class__.__name__} object containing {len(self)} items for {sample_len} ({keys[0]} ... {keys[-1]})'
+
+    def __getitem__(self, key):
+        # like batch[['azi','rng']]
+        if isinstance(key, (list, tuple)):
+            return type(self)({
+                burst_id: ds[key]
+                for burst_id, ds in self.items()
+            })
+        # otherwise fall back to dictionary lookup: batch['033_069722_IW3']
+        return super().__getitem__(key)
 
     def __add__(self, other: 'Batch'):
         keys = self.keys()
@@ -98,15 +120,19 @@ class Batch(dict):
             raise ValueError(f'ERROR: open() returns multiple datasets, you need to use Stack class to open them.')
         return data
     
-    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
-        self.save(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
-        return self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
+    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
+                caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
+        self.save(store=store, storage_options=storage_options, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
+        return self.open(store=store, storage_options=storage_options, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
 
 class BatchWrap(Batch):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores wrapped phase (real values).
     """
     def __init__(self, mapping:dict|None=None):
+        from .Stack import Stack
+        if isinstance(mapping, (Stack, BatchComplex)):
+            raise ValueError(f'ERROR: BatchWrap does not support Stack or BatchComplex objects.')
         dict.__init__(self, mapping or {})
 
 class BatchComplex(Batch):
