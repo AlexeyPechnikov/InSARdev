@@ -13,10 +13,10 @@ from . import utils_io,  utils_xarray
 from typing import TYPE_CHECKING
 import operator
 import numpy as np
+import xarray as xr
 if TYPE_CHECKING:
     from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
     from .Stack import Stack
-    import xarray as xr
     import matplotlib
 
 class BatchCore(dict):
@@ -114,7 +114,23 @@ class BatchCore(dict):
             f"for {count} {axis} "
             f"({keys[0]} … {keys[-1]})"
         )
-    
+
+    @property
+    def data(self) -> xr.Dataset:
+        """
+        Return the single Dataset in this Batch.
+
+        Raises
+        ------
+        ValueError
+            if the Batch has zero or more than one item.
+        """
+        n = len(self)
+        if n != 1:
+            raise ValueError(f'Batch.data is only available for single-item Batches, but this Batch has {n} items')
+        # return the only Dataset
+        return next(iter(self.values()))
+
     def __getitem__(self, key):
         # like batch[['azi','rng']]
         if isinstance(key, (list, tuple)):
@@ -332,10 +348,6 @@ class BatchCore(dict):
         # fallback: single scalar or DataArray broadcast
         # DataArray case seems not usefull because Batch datasets differ in shape
         return self.map_da(lambda da: da.where(cond, other, **kwargs), **kwargs)
-
-    def iexp(self, **kwargs):
-        """np.exp(-1j * intfs)"""
-        return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(1j * da), **kwargs))
 
     def __pow__(self, exponent, **kwargs):
         return self.map_da(lambda da: da**exponent, **kwargs)
@@ -911,3 +923,101 @@ class BatchCore(dict):
             fg = plot_polarization(polarization=pol)
             fgs.append(fg)
         return fgs
+
+    def gaussian(
+        self,
+        weight: BatchUnit | None = None,
+        wavelength: float | None = None,
+        threshold: float = 0.5,
+        debug: bool = False
+    ) -> Batch:
+        """
+        2D (yx) Gaussian kernel smoothing (multilook) on each dataset in this Batch.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            A Batch of 2D DataArrays, one per key, matching this Batch's keys.
+            If None, no weighting is applied.
+        wavelength : float or None
+            Gaussian sigma via 5.3 cutoff formula. Must be positive if provided.
+        threshold : float
+            Drop-off threshold for the kernel.
+        debug : bool
+            Print sigma values if True.
+
+        Returns
+        -------
+        Batch
+            A new Batch with the same keys, each smoothed by its corresponding weight.
+        """
+        import xarray as xr
+        import numpy as np
+        import dask
+        from .utils_gaussian import nanconvolve2d_gaussian
+        from .Batch import BatchUnit
+        # constant 5.3 defines half-gain at filter_wavelength
+        cutoff = 5.3
+
+        # validate weight if provided
+        if weight is not None:
+            if not isinstance(weight, BatchUnit) or set(weight.keys()) != set(self.keys()):
+                raise ValueError('`weight` must be a BatchUnit with the same keys as `self`')
+
+        # validate wavelength if provided
+        if wavelength is not None:
+            if wavelength <= 0:
+                raise ValueError('wavelength must be positive')
+            # precompute dy, dx, σ‐factors
+            dy, dx = self.spacing
+            sig_y = wavelength / (dy * cutoff)
+            sig_x = wavelength / (dx * cutoff)
+            if debug:
+                print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
+            sigmas = (sig_y, sig_x)
+        else:
+            sigmas = None
+
+        out = {}
+        # loop over each key
+        for key, ds in self.items():
+            w = weight[key] if weight is not None else None
+
+            def gaussian_da(da: xr.DataArray, w: xr.DataArray | None = None) -> xr.DataArray:
+                # apply the 2D Gaussian convolver slice‐by‐slice
+                def one_slice(arr):
+                    return nanconvolve2d_gaussian(
+                        arr, w, sigmas, threshold=threshold
+                    )
+
+                # handle an optional first dimension (e.g. 'pair' or 'time')
+                if da.ndim == 3:
+                    dim0 = da.dims[0]
+                    pieces = [
+                        one_slice(da.sel({dim0: v}))
+                        for v in da.coords[dim0].values
+                    ]
+                    out_da = xr.concat(
+                        [xr.DataArray(p, dims=da.dims[1:], coords={d: da.coords[d] for d in da.dims[1:]})
+                         for p in pieces],
+                        dim=dim0
+                    ).assign_coords({dim0: da.coords[dim0]})
+                else:
+                    out_da = xr.DataArray(
+                        one_slice(da),
+                        dims=da.dims,
+                        coords=da.coords
+                    )
+
+                # preserve original chunking
+                return out_da.chunk({d: da.chunks[i][0] for i, d in enumerate(da.dims)})
+
+            # apply to every 2D or 3D (yx) var in the Dataset
+            out[key] = xr.Dataset({
+                var: gaussian_da(ds[var], w[var] if w is not None else None)
+                for var in ds.data_vars
+                if (ds[var].ndim in (2,3) and ds[var].dims[-2:] == ('y','x'))
+            })
+
+        return type(self)(out)
+

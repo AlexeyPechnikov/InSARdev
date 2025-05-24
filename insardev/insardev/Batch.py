@@ -10,13 +10,12 @@
 # ----------------------------------------------------------------------------
 from __future__ import annotations
 from .BatchCore import BatchCore
+import numpy as np
 import xarray as xr
 from . import utils_xarray
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .Stack import Stack
-    import xarray as xr
-    import numpy as np
     import inspect
 
 class Batch(BatchCore):
@@ -88,8 +87,22 @@ class BatchWrap(BatchCore):
             
     #     return type(self)(out)
 
+    def sin(self, **kwargs) -> Batch:
+        """
+        Return a Batch of the sin(theta) DataArrays, preserving attrs if requested.
+        """
+        return Batch(self.map_da(lambda da: xr.ufuncs.sin(da), **kwargs))
 
-
+    def cos(self, **kwargs) -> Batch:
+        """
+        Return a Batch of the cos(theta) DataArrays, preserving attrs if requested.
+        """
+        return Batch(self.map_da(lambda da: xr.ufuncs.cos(da), **kwargs))
+    
+    def iexp(self, **kwargs):
+        """np.exp(-1j * intfs)"""
+        from .Batch import BatchComplex
+        return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(1j * da), **kwargs))
 
     def _agg(self, name: str, dim=None, **kwargs):
         """
@@ -143,72 +156,6 @@ class BatchWrap(BatchCore):
             
         return type(self)(out)
 
-
-
-    # def _agg(self, name: str, dim=None, **kwargs):
-    #     """
-    #     1) If obj has an .obj attribute → it's a Coarsen wrapper on complex data.
-    #        We call obj.mean() to get E[e^{iθ}], then use R=|E| for var/std or arg(E) for mean.
-    #     2) Otherwise we lift θ → e^{iθ}, call the same reduction, then angle().
-    #     """
-    #     import numpy as np
-    #     import xarray as xr
-    #     import inspect
-
-    #     out = {}
-    #     for key, obj in self.items():
-    #         # ───── Are we dealing with a Coarsen wrapper on complex data? ─────
-    #         if hasattr(obj, "obj") and not hasattr(obj, "data_vars"):
-    #             # obj is e.g. ds2.coarsen(window, …)
-    #             # the underlying ds2 holds exp(1j*θ) already.
-    #             co = obj
-
-    #             if name in ("mean", "var", "std"):
-    #                 # E[e^{iθ}] over each block:
-    #                 zbar = co.mean(dim=dim, **kwargs)
-
-    #                 # magnitude & angle:
-    #                 R = np.abs(zbar)
-    #                 if name == "mean":
-    #                     agg = np.angle(zbar).astype(np.float32)
-    #                 elif name == "var":
-    #                     agg = (1 - R).astype(np.float32)
-    #                 else:  # std
-    #                     agg = np.sqrt(-2 * np.log(R)).astype(np.float32)
-
-    #             else:
-    #                 # generic: apply the same reduction on the complex blocks
-    #                 fnc = getattr(co, name)
-    #                 # pass dim if supported
-    #                 sig = inspect.signature(fnc)
-    #                 if "dim" in sig.parameters and dim is not None:
-    #                     zred = fnc(dim=dim, **kwargs)
-    #                 else:
-    #                     zred = fnc(**kwargs)
-
-    #                 agg = np.angle(zred).astype(np.float32)
-
-    #         else:
-    #             # ───── Not a Coarsen wrapper → fall back to lift→reduce→angle ─────
-    #             # obj is a real DataArray or Dataset of θ
-    #             ds = obj
-    #             # map every var into complex
-    #             tmp = {}
-    #             for var, da in ds.data_vars.items():
-    #                 da_c = np.exp(1j * da.astype(np.float32))
-    #                 fnc = getattr(da_c, name)
-    #                 sig = inspect.signature(fnc)
-    #                 if "dim" in sig.parameters and dim is not None:
-    #                     zred = fnc(dim=dim, **kwargs)
-    #                 else:
-    #                     zred = fnc(**kwargs)
-    #                 tmp[var] = np.angle(zred).astype(np.float32)
-    #             agg = xr.Dataset(tmp)
-
-    #         out[key] = agg
-
-    #     return type(self)(out)
-
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """
         Coarsen each DataSet in the batch by integer factors and align the 
@@ -255,6 +202,64 @@ class BatchWrap(BatchCore):
         kwargs["cmap"] = cmap
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
+
+    # def gaussian(self, *args, **kwargs):
+    #     """
+    #     Phase-aware Gaussian smoothing for wrapped phase data.
+    #     """
+    #     return self.iexp().gaussian(*args, **kwargs).angle()
+
+    def gaussian(self, *args, **kwargs):
+        """
+        Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
+        then recombining via atan2.  No complex dtype ever created.
+        """
+        from .Batch import Batch
+        import xarray as xr
+
+        keep_attrs = kwargs.pop('keep_attrs', None)
+        # build two Batches of the real sin and cos components and filter them
+        sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+        cos = self.cos(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+
+        # compute wrapped phase using np.arctan2
+        out = {k: xr.Dataset({
+            var: xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
+            for var in sin[k].data_vars
+        }) for k in self.keys()}
+
+        return BatchWrap(out)
+
+def gaussian(self, *args, **kwargs):
+    """
+    Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
+    then recombining via arctan2.
+    """
+    from .Batch import Batch
+    import xarray as xr
+
+    keep_attrs = kwargs.pop('keep_attrs', False)
+    data_vars = next(iter(self.values())).data_vars
+
+    # build two Batches of the real sin and cos components and filter them
+    sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+    cos = self.cos(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+
+    # compute wrapped phase using arctan2
+    out: dict[str, xr.Dataset] = {}
+    for k in self.keys():
+        phase_vars = {}
+        for var in data_vars:
+            phase = xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
+            if keep_attrs:
+                phase.attrs = self[k][var].attrs.copy()
+            phase_vars[var] = phase
+        ds = xr.Dataset(phase_vars)
+        if keep_attrs:
+            ds.attrs = self[k].attrs.copy()
+        out[k] = ds
+
+    return BatchWrap(out)
 
 class BatchUnit(BatchCore):
     """
@@ -303,6 +308,29 @@ class BatchComplex(BatchCore):
 
         # delegate to your base class for the actual init
         super().__init__(mapping or {})
+
+    def real(self, **kwargs):
+        """
+        Return the real part of each complex data variable,
+        producing a Batch of real-valued Datasets.
+        """
+        out = {}
+        for key, ds in self.items():
+            # ds.map() applies the lambda to each DataArray in the Dataset
+            ds_real = ds.map(lambda da: da.real, **kwargs)
+            out[key] = ds_real
+        return Batch(out)
+
+    def imag(self, **kwargs):
+        """
+        Return the imaginary part of each complex data variable,
+        producing a Batch of real-valued Datasets.
+        """
+        out = {}
+        for key, ds in self.items():
+            ds_imag = ds.map(lambda da: da.imag, **kwargs)
+            out[key] = ds_imag
+        return Batch(out)
 
     def abs(self, **kwargs):
         return Batch(self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs))

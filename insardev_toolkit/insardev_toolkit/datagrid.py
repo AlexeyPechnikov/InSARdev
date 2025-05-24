@@ -292,10 +292,12 @@ class datagrid:
         # extract EPSG from target xarray object or use provided EPSG
         if isinstance(target, (xr.DataArray, xr.Dataset)):
             if target.rio.crs is None:
-                raise ValueError("ERROR: Target xarray object has no CRS defined.")
+                print('WARNING: Target xarray object has no CRS defined.')
+                return da
             epsg = target.rio.crs.to_epsg()
             if epsg is None:
-                raise ValueError("ERROR: Target CRS is not an EPSG code, consider using PROJ string.")
+                print('WARNING: Target CRS is not an EPSG code, consider using PROJ string.')
+                return da
         else:
             epsg = target
         #print ('spatial_ref: target epsg', epsg)

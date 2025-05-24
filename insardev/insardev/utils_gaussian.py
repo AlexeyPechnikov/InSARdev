@@ -96,7 +96,8 @@ def nanconvolve2d_gaussian(data,
             meta=data._meta,
             **kwargs
         )
-
+    #print ('data', data)
+    #print ('weight', weight)
     return xr.DataArray(nanconvolve2d_gaussian_dask(data.data,
                                     weight.data if weight is not None else None,
                                     threshold=threshold,

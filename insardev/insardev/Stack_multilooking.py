@@ -10,36 +10,27 @@
 # ----------------------------------------------------------------------------
 from .Stack_phasediff import Stack_phasediff
 from .utils_gaussian import nanconvolve2d_gaussian
-from .utils_xarray import coarsen_start, get_spacing
+from .utils_xarray import get_spacing
 
 class Stack_multilooking(Stack_phasediff):
 
-    def _multilooking(self, data, weight=None, wavelength=None, coarsen=None, gaussian_threshold=0.5, debug=False):
+    def _multilooking(self, data, weight=None, wavelength=None, gaussian_threshold=0.5, debug=False):
         import xarray as xr
         import numpy as np
         import dask
     
         # GMTSAR constant 5.3 defines half-gain at filter_wavelength
         cutoff = 5.3
-    
-        # Expand simplified definition of coarsen
-        coarsen = (coarsen, coarsen) if coarsen is not None and not isinstance(coarsen, (list, tuple, np.ndarray)) else coarsen
-    
+
         # no-op, processing is needed
-        if wavelength is None and coarsen is None:
+        if wavelength is None:
             return data
     
-        # TODO: create function get_sigma(data, wavelength=None, coarsen=None)
-        # calculate sigmas based on wavelength or coarsen
-        if wavelength is not None:
-            dy, dx = get_spacing(data)
-            sigmas = [wavelength / dy / cutoff, wavelength / dx / cutoff]
-            if debug:
-                print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), wavelength {wavelength:.1f}')
-        else:
-            sigmas = [coarsen[0] / cutoff, coarsen[1] / cutoff]
-            if debug:
-                print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), coarsen {coarsen}')
+        # calculate sigmas based on wavelength
+        dy, dx = get_spacing(data)
+        sigmas = [wavelength / dy / cutoff, wavelength / dx / cutoff]
+        if debug:
+            print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), wavelength {wavelength:.1f}')
 
         if isinstance(data, xr.Dataset):
             dims = data[list(data.data_vars)[0]].dims
@@ -101,13 +92,5 @@ class Stack_multilooking(Stack_phasediff):
         y_chunksize = data.chunks[-2][0]
         x_chunksize = data.chunks[-1][0]
         #print ('data.chunks', y_chunksize, x_chunksize)
-
-        if coarsen:
-            # calculate coordinate offsets to align coarsened grids
-            y0 = coarsen_start(ds, 'y', coarsen[0])
-            x0 = coarsen_start(ds, 'x', coarsen[1])
-            ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})\
-                     .coarsen({'y': coarsen[0], 'x': coarsen[1]}, boundary='trim')\
-                     .mean()
 
         return ds.chunk({'y': y_chunksize, 'x': x_chunksize})
