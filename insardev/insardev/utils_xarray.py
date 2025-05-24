@@ -83,86 +83,92 @@ def coarsen_start(da, name, spacing, grid_factor=1):
     print(f'_coarsen_start: No good alignment found for {name}')
     return None
 
-#decimator = lambda da: da.coarsen({'y': 2, 'x': 2}, boundary='trim').mean()
-def downsampler(grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
-    """
-    Return function for pixel decimation to the specified output resolution.
+# #decimator = lambda da: da.coarsen({'y': 2, 'x': 2}, boundary='trim').mean()
+# def downsampler(grid, coarsen=None, resolution=60, func='mean', wrap=False, debug=False):
+#     """
+#     Return function for pixel decimation to the specified output resolution.
 
-    Parameters
-    ----------
-    grid : xarray object
-        Grid to define the spacing.
-    resolution : int, optional
-        DEM grid resolution in meters. The same grid is used for geocoded results output.
-    debug : bool, optional
-        Boolean flag to print debug information.
+#     Parameters
+#     ----------
+#     grid : xarray object
+#         Grid to define the spacing.
+#     coarsen : tuple, optional
+#         Coarsening factor.
+#     resolution : int, optional
+#         Target resolution in meters.
+#     func : str, optional
+#         Function to apply to the data.
+#     wrap : bool, optional
+#         Boolean flag to wrap the data.
+#     debug : bool, optional
+#         Boolean flag to print debug information.
 
-    Returns
-    -------
-    callable
-        Post-processing lambda function.
+#     Returns
+#     -------
+#     callable
+#         Post-processing lambda function.
 
-    Examples
-    --------
-    Decimate computed interferograms to default DEM resolution 60 meters:
-    decimator = stack.decimator()
-    stack.intf(pairs, func=decimator)
-    """
-    import numpy as np
-    import dask
-    import warnings
-    # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-    warnings.filterwarnings('ignore')
-    warnings.filterwarnings('ignore', module='dask')
-    warnings.filterwarnings('ignore', module='dask.core')
+#     Examples
+#     --------
+#     Decimate computed interferograms to default DEM resolution 60 meters:
+#     decimator = stack.decimator()
+#     stack.intf(pairs, func=decimator)
+#     """
+#     import numpy as np
+#     import dask
+#     import warnings
+#     # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
+#     warnings.filterwarnings('ignore')
+#     warnings.filterwarnings('ignore', module='dask')
+#     warnings.filterwarnings('ignore', module='dask.core')
 
-    dy, dx = get_spacing(grid, coarsen)
-    yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
-    if debug:
-        print (f'DEBUG: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
-    if yscale <= 1 and xscale <= 1:
-        # decimation impossible
-        if debug:
-            print (f'DEBUG: decimator = lambda da: da')
-        return lambda da: da
-    if debug:
-        print (f"DEBUG: decimator = lambda da: da.coarsen({{'y': {yscale}, 'x': {xscale}}}, boundary='trim').{func}()")
+#     dy, dx = get_spacing(grid, coarsen)
+#     yscale, xscale = int(np.round(resolution/dy)), int(np.round(resolution/dx))
+#     if debug:
+#         print (f'DEBUG: ground pixel size in meters: y={dy:.1f}, x={dx:.1f}')
+#     if yscale <= 1 and xscale <= 1:
+#         # decimation impossible
+#         if debug:
+#             print (f'DEBUG: decimator = lambda da: da')
+#         return lambda da: da
+#     if debug:
+#         print (f"DEBUG: decimator = lambda da: da.coarsen({{'y': {yscale}, 'x': {xscale}}}, boundary='trim').{func}()")
 
-    # decimator function
-    def decimator(datas):
-        def decimator_dataset(ds):
-            y_chunksize = ds.chunks['y'][0]
-            x_chunksize = ds.chunks['x'][0]
-            #y_chunksize = x_chunksize = 4*1280
-            #print ('ds.chunks', y_chunksize, x_chunksize)
-            coarsen_args = {'y': yscale, 'x': xscale}
-            # calculate coordinate offsets to align coarsened grids
-            y0 = coarsen_start(ds, 'y', yscale)
-            x0 = coarsen_start(ds, 'x', xscale)
-            ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})
-            if wrap:
-                da_complex = np.exp(1j * ds.astype(np.float32))
-                da_complex_agg = getattr(da_complex\
-                        .coarsen(coarsen_args, boundary='trim'), func)()\
-                        .astype(np.complex64)
-                da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real).astype(np.float32)
-                del da_complex, da_complex_agg
-                return da_decimated\
-                        .chunk({'y': y_chunksize, 'x': x_chunksize})
-            else:
-                return getattr(ds\
-                        .coarsen(coarsen_args, boundary='trim'), func)()\
-                        .astype(np.float32)\
-                        .chunk({'y': y_chunksize, 'x': x_chunksize})
-        # avoid creating the large chunks
-        #with dask.config.set(**{'array.slicing.split_large_chunks': True}):
-        if isinstance(datas, dict):
-            return {k:decimator_dataset(v) for k,v in datas.items()}
-        else:
-            return decimator_dataset(datas)
+#     # decimator function
+#     def decimator(datas):
+#         def decimator_dataset(ds):
+#             y_chunksize = ds.chunks['y'][0]
+#             x_chunksize = ds.chunks['x'][0]
+#             #y_chunksize = x_chunksize = 4*1280
+#             #print ('ds.chunks', y_chunksize, x_chunksize)
+#             coarsen_args = {'y': yscale, 'x': xscale}
+#             # calculate coordinate offsets to align coarsened grids
+#             y0 = coarsen_start(ds, 'y', yscale)
+#             x0 = coarsen_start(ds, 'x', xscale)
+#             ds = ds.isel({'y': slice(y0, None), 'x': slice(x0, None)})
+#             if wrap:
+#                 da_complex = np.exp(1j * ds.astype(np.float32))
+#                 da_complex_agg = getattr(da_complex\
+#                         .coarsen(coarsen_args, boundary='trim'), func)()\
+#                         .astype(np.complex64)
+#                 da_decimated = np.arctan2(da_complex_agg.imag, da_complex_agg.real).astype(np.float32)
+#                 del da_complex, da_complex_agg
+#                 return da_decimated\
+#                         .chunk({'y': y_chunksize, 'x': x_chunksize})
+#             else:
+#                 return getattr(ds\
+#                         .coarsen(coarsen_args, boundary='trim'), func)()\
+#                         .astype(np.float32)\
+#                         .chunk({'y': y_chunksize, 'x': x_chunksize})
+#         # avoid creating the large chunks
+#         #with dask.config.set(**{'array.slicing.split_large_chunks': True}):
+#         if isinstance(datas, dict):
+#             return {k:decimator_dataset(v) for k,v in datas.items()}
+#         else:
+#             return decimator_dataset(datas)
 
-    # return callback function and set common chunk size
-    return lambda datas: decimator(datas)
+#     # return callback function and set common chunk size
+#     return lambda datas: decimator(datas)
 
 def to_dict(datas: dict[str, xr.Dataset | xr.DataArray] | None = None):
     """

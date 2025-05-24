@@ -17,16 +17,13 @@ class Stack_plot(Stack_export):
     import pandas as pd
     import matplotlib
 
-    def plot(self, records:pd.DataFrame|None=None, cmap='turbo', alpha=1):
+    def plot(self, cmap='turbo', alpha=1):
         import pandas as pd
         import matplotlib
         import matplotlib.pyplot as plt
         from matplotlib import patheffects
 
-        if records is None:
-            records = self.to_dataframe()
-
-        df = records.reset_index()
+        df = self.to_dataframe().reset_index()
         df['date'] = df['startTime'].dt.date
 
         df['label'] = df.apply(lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} {rec['date']} [{rec['pathNumber']}]", axis=1)
@@ -36,14 +33,14 @@ class Stack_plot(Stack_export):
         n = len(unique_labels)
         colormap = matplotlib.cm.get_cmap(cmap, n)
         color_map = {label[-4:-1]: colormap(i) for i, label in enumerate(unique_labels)}
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax = plt.subplots()
         for label, group in df.groupby('label'):
             group.plot(ax=ax, edgecolor=color_map[label[-4:-1]], facecolor='none', lw=0.25, label=label)
         handles = [matplotlib.lines.Line2D([0], [0], color=color_map[label[-4:-1]], lw=1, label=label) for label in unique_labels]
         ax.legend(handles=handles, loc='upper right')
 
         col = df.columns[0]
-        for _, row in df.iterrows():
+        for _, row in df.drop_duplicates(subset=[col]).iterrows():
             # compute centroid
             x, y = row.geometry.centroid.coords[0]
             ax.annotate(
@@ -53,123 +50,123 @@ class Stack_plot(Stack_export):
                 textcoords='offset points',
                 ha='center', va='bottom',
                 color=color_map[row['label'][-4:-1]],
-                path_effects=[patheffects.withStroke(linewidth=1.5, foreground='black')],
-                alpha=alpha
+                path_effects=[patheffects.withStroke(linewidth=0.25, foreground='black')],
+                alpha=1
             )
 
         ax.set_title('Sentinel-1 Burst Footprints')
         ax.set_xlabel('easting [m]')
         ax.set_ylabel('northing [m]')
 
-    def plot_dataset(self,
-                     data: xr.Dataset | xr.DataArray,
-                     polarizations: list[str] | tuple[str] | str | None,
-                     cmap: matplotlib.colors.Colormap | str | None,
-                     vmin: float | None,
-                     vmax: float | None,
-                     quantile: float | None,
-                     symmetrical: bool,
-                     caption: str,
-                     cols: int,
-                     rows: int,
-                     size: float,
-                     nbins: int,
-                     aspect: float,
-                     y: float,
-                     wrap: bool,
-                     _size: tuple[int, int] | None,
-                     ):
-        import xarray as xr
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    # def plot_dataset(self,
+    #                  data: xr.Dataset | xr.DataArray,
+    #                  polarizations: list[str] | tuple[str] | str | None,
+    #                  cmap: matplotlib.colors.Colormap | str | None,
+    #                  vmin: float | None,
+    #                  vmax: float | None,
+    #                  quantile: float | None,
+    #                  symmetrical: bool,
+    #                  caption: str,
+    #                  cols: int,
+    #                  rows: int,
+    #                  size: float,
+    #                  nbins: int,
+    #                  aspect: float,
+    #                  y: float,
+    #                  wrap: bool,
+    #                  _size: tuple[int, int] | None,
+    #                  ):
+    #     import xarray as xr
+    #     import numpy as np
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
 
-        # no data means no plot and no error
-        if data is None:
-            return
+    #     # no data means no plot and no error
+    #     if data is None:
+    #         return
 
-        assert isinstance(data, (dict, list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a dict or list or tuple or Dataset or DataArray'
+    #     assert isinstance(data, (dict, list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: data should be a dict or list or tuple or Dataset or DataArray'
 
-        # screen size in pixels (width, height) to estimate reasonable number pixels per plot
-        # this is quite large to prevent aliasing on 600dpi plots without additional processing
-        if _size is None:
-            _size = (8000,4000)
+    #     # screen size in pixels (width, height) to estimate reasonable number pixels per plot
+    #     # this is quite large to prevent aliasing on 600dpi plots without additional processing
+    #     if _size is None:
+    #         _size = (8000,4000)
 
-        def plot_polarization(data, polarization):
+    #     def plot_polarization(data, polarization):
 
-            if isinstance(data, dict):
-                data = list(data.values())
+    #         if isinstance(data, dict):
+    #             data = list(data.values())
 
-            if isinstance(data, xr.Dataset):
-                stackvar = list(data[polarization].dims)[0]
-                da = data[polarization].isel({stackvar: slice(0, rows)})
-            else:
-                stackvar = list(data[0].dims)[0]
-                das = [da[polarization].isel({stackvar: slice(0, rows)}) for da in data]
-                da = self.to_dataset(das)
-                del das
+    #         if isinstance(data, xr.Dataset):
+    #             stackvar = list(data[polarization].dims)[0]
+    #             da = data[polarization].isel({stackvar: slice(0, rows)})
+    #         else:
+    #             stackvar = list(data[0].dims)[0]
+    #             das = [da[polarization].isel({stackvar: slice(0, rows)}) for da in data]
+    #             da = self.to_dataset(das)
+    #             del das
 
-            if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
-                da = da.unstack('stack')
+    #         if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
+    #             da = da.unstack('stack')
             
-            # there is no reason to plot huge arrays much larger than screen size for small plots
-            #print ('screen_size', screen_size)
-            size_y, size_x = da.shape[1:]
-            #print ('size_x, size_y', size_x, size_y)
-            factor_y = int(np.round(size_y / (_size[1] / rows)))
-            factor_x = int(np.round(size_x / (_size[0] / cols)))
-            #print ('factor_x, factor_y', factor_x, factor_y)
-            # decimate for faster plot, do not coarsening without antialiasing
-            # maybe data is already smoothed and maybe not, decimation is the only safe option
-            da = da[:,::max(1, factor_y), ::max(1, factor_x)]
-            # materialize for all the calculations and plotting
-            progressbar(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
+    #         # there is no reason to plot huge arrays much larger than screen size for small plots
+    #         #print ('screen_size', screen_size)
+    #         size_y, size_x = da.shape[1:]
+    #         #print ('size_x, size_y', size_x, size_y)
+    #         factor_y = int(np.round(size_y / (_size[1] / rows)))
+    #         factor_x = int(np.round(size_x / (_size[0] / cols)))
+    #         #print ('factor_x, factor_y', factor_x, factor_y)
+    #         # decimate for faster plot, do not coarsening without antialiasing
+    #         # maybe data is already smoothed and maybe not, decimation is the only safe option
+    #         da = da[:,::max(1, factor_y), ::max(1, factor_x)]
+    #         # materialize for all the calculations and plotting
+    #         progressbar(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
 
-            # calculate min, max when needed
-            if quantile is not None:
-                _vmin, _vmax = np.nanquantile(da, quantile)
-            else:
-                _vmin, _vmax = vmin, vmax
-            # define symmetrical boundaries
-            if symmetrical is True and _vmax > 0:
-                minmax = max(abs(_vmin), _vmax)
-                _vmin = -minmax
-                _vmax =  minmax
+    #         # calculate min, max when needed
+    #         if quantile is not None:
+    #             _vmin, _vmax = np.nanquantile(da, quantile)
+    #         else:
+    #             _vmin, _vmax = vmin, vmax
+    #         # define symmetrical boundaries
+    #         if symmetrical is True and _vmax > 0:
+    #             minmax = max(abs(_vmin), _vmax)
+    #             _vmin = -minmax
+    #             _vmax =  minmax
             
-            # multi-plots ineffective for linked lazy data
-            fg = (self.wrap(da) if wrap else da).rename(caption)\
-                .plot.imshow(
-                col=stackvar,
-                col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
-                vmin=_vmin, vmax=_vmax, cmap=cmap
-            )
-            #fg.set_axis_labels('Range', 'Azimuth')
-            fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-            fg.fig.suptitle(f'{polarization} {caption}', y=y)
-            return fg
+    #         # multi-plots ineffective for linked lazy data
+    #         fg = (self.wrap(da) if wrap else da).rename(caption)\
+    #             .plot.imshow(
+    #             col=stackvar,
+    #             col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
+    #             vmin=_vmin, vmax=_vmax, cmap=cmap
+    #         )
+    #         #fg.set_axis_labels('Range', 'Azimuth')
+    #         fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
+    #         fg.fig.suptitle(f'{polarization} {caption}', y=y)
+    #         return fg
 
-        if quantile is not None:
-            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
+    #     if quantile is not None:
+    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if not isinstance(data, (xr.Dataset, xr.DataArray)):
-            raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray')
+    #     if not isinstance(data, (xr.Dataset, xr.DataArray)):
+    #         raise ValueError(f'ERROR: invalid data type {type(data)}. Should be xr.Dataset or xr.DataArray')
 
-        if isinstance(data, xr.DataArray):
-            # convert DataArray to Dataset to plot a single polarization
-            data = data.to_dataset()
+    #     if isinstance(data, xr.DataArray):
+    #         # convert DataArray to Dataset to plot a single polarization
+    #         data = data.to_dataset()
 
-        if polarizations is None:
-            polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
-        elif isinstance(polarizations, str):
-            polarizations = [polarizations]
-        #print ('polarizations', polarizations)
+    #     if polarizations is None:
+    #         polarizations = list(data.data_vars) if isinstance(data, xr.Dataset) else list(data[0].data_vars)
+    #     elif isinstance(polarizations, str):
+    #         polarizations = [polarizations]
+    #     #print ('polarizations', polarizations)
 
-        # process polarizations one by one
-        fgs = []
-        for pol in polarizations:
-            fg = plot_polarization(data, polarization=pol)
-            fgs.append(fg)
-        return fgs
+    #     # process polarizations one by one
+    #     fgs = []
+    #     for pol in polarizations:
+    #         fg = plot_polarization(data, polarization=pol)
+    #         fgs.append(fg)
+    #     return fgs
 
     def plot_displacement_mm(self, data, polarizations=None,
                    cmap='turbo', vmin=None, vmax=None, quantile=None, symmetrical=False,

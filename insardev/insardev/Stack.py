@@ -8,22 +8,23 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
+from __future__ import annotations
 from .Stack_plot import Stack_plot
-from .Batch import Batch, BatchWrap, BatchComplex
+from .BatchCore import BatchCore
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
 from collections.abc import Mapping
 from . import utils_io
 from . import utils_xarray
-from insardev_toolkit import datagrid
-
-class Stack(Stack_plot, Mapping):
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
     import rasterio as rio
     import pandas as pd
     import xarray as xr
-    #import geopandas as gpd
-    #import zarr
 
+class Stack(Stack_plot, Mapping):
+    
     def __init__(self, dss:dict[str, xr.Dataset] | None = None):
-        self.dss = BatchComplex(dss)
+        self.dss = BatchCore(dss)
 
     def __repr__(self):
         if not getattr(self, 'dss', {}):
@@ -31,10 +32,12 @@ class Stack(Stack_plot, Mapping):
         n = len(self)
         if n <= 1:
             # delegate to the underlying dict repr
-            return dict.__repr__(self.dss)
+            #return dict.__repr__(self.dss)
+            key, ds = next(iter(self.items()))
+            return f"{self.__class__.__name__}['{key}']:\n{ds!r}"
         sample = next(iter(self.dss.values()))
         keys = list(self.dss.keys())
-        return f'{self.__class__.__name__} object containing {len(self.dss)} items for {len(sample.date)} date ({keys[0]} ... {keys[-1]})' 
+        return f'{self.__class__.__name__} containing {len(self.dss)} items for {len(sample.date)} date ({keys[0]} … {keys[-1]})' 
 
     def __len__(self):
         return len(getattr(self, 'dss', {}))
@@ -108,24 +111,24 @@ class Stack(Stack_plot, Mapping):
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
         if len(args) > 2:
-            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch/BatchWrap/dict objects or no arguments.')
+            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch or dict objects or no arguments.')
         datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
         return datas
 
-    def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
-        datas = []
-        for arg in args:
-            print ('type(arg)', type(arg))
-            if isinstance(arg, (Stack, BatchComplex)):
-                arg = Batch(arg)
-                print (arg.isel(0)['033_069722_IW3'].data_vars)
-            wrap = True if isinstance(arg, BatchWrap) else False
-            print ('\ttype(arg)', type(arg), 'wrap', wrap)
-            sample = next(iter(arg.values()))
-            callback = utils_xarray.downsampler(sample, coarsen=coarsen, resolution=resolution, func=func, wrap=wrap, debug=debug)
-            data = callback(arg)
-            datas.append(BatchWrap(data) if wrap else Batch(data))
-        return datas
+    # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
+    #     datas = []
+    #     for arg in args:
+    #         print ('type(arg)', type(arg))
+    #         if isinstance(arg, (Stack, BatchComplex)):
+    #             arg = Batch(arg)
+    #             print (arg.isel(0)['033_069722_IW3'].data_vars)
+    #         wrap = True if isinstance(arg, BatchWrap) else False
+    #         print ('\ttype(arg)', type(arg), 'wrap', wrap)
+    #         sample = next(iter(arg.values()))
+    #         callback = utils_xarray.downsampler(sample, coarsen=coarsen, resolution=resolution, func=func, wrap=wrap, debug=debug)
+    #         data = callback(arg)
+    #         datas.append(BatchWrap(data) if wrap else Batch(data))
+    #     return datas
 
     def to_dataframe(self,
                      datas: dict[str, xr.Dataset | xr.DataArray] | None = None,
@@ -429,177 +432,3 @@ class Stack(Stack_plot, Mapping):
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.dss.update(dss)
-
-    def to_dataset(self,
-              datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None = None,
-              wrap: bool | None = None,
-              compute: bool = False):
-        """
-        This function is a faster implementation for the standalone function combination of xr.concat and xr.align:
-        xr.concat(xr.align(*intfs, join='outer'), dim='stack_dim').ffill('stack_dim').isel(stack_dim=-1).compute()
-        #xr.concat(xr.align(*datas, join='outer'), dim='stack_dim').mean('stack_dim').compute()
-
-        Parameters
-        ----------
-        datas: xr.Dataset | xr.DataArray | dict[str, xr.Dataset | xr.DataArray] | None
-            The datasets to concatenate.
-        wrap: bool | None
-            There are three options:
-            - None: return the topmost burst in chronological order for overlapping areas
-            - True: compute the circular mean
-            - False: compute the arithmetic mean
-        compute: bool
-            Whether to compute the result.
-        """
-        import xarray as xr
-        import numpy as np
-        import dask
-        from insardev_toolkit import progressbar
-
-        # in case of dict wrap is not defined, also it should be preserved for recursive calls
-        dtype = type(datas)
-        if dtype == BatchWrap:
-            wrap = True
-        elif dtype == Batch:
-            wrap = False
-        print ('dtype', dtype, 'wrap', wrap)
-
-        #print (type(datas))
-        if datas is None:
-            datas = self.dss
-        elif isinstance(datas, xr.Dataset):
-            return datas
-        elif isinstance(datas, xr.DataArray):
-            return datas.to_dataset()
-        elif not isinstance(datas, (dict, list, tuple)):
-            raise ValueError(f'ERROR: datas is not a dict, list, or tuple: {type(datas)}')
-
-        # all the grids will be unified to a single grid, we don't need the dict keys
-        if isinstance(datas, dict):
-            datas = list(datas.values())
-        
-        if len(datas) == 0:
-            return None
-
-        if len(datas) == 1:
-            datas = datas[0]
-            if compute:
-                progressbar(result := datas.persist(), desc=f'Compute Dataset'.ljust(25))
-                return result
-            return datas
-
-        # find all variables in the first dataset related to polarizations
-        data_vars = datas[0].data_vars if isinstance(datas[0], xr.Dataset) else datas[0].name
-        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in data_vars]
-
-        # process list of datasets with one or multiple polarizations
-        if isinstance(datas[0], xr.Dataset):
-            das_total = []
-            for pol in polarizations:
-                # TODO: workaround to preserve crs for variables
-                #das = self.to_dataset([ds[pol].rio.set_crs(datas[0].rio.crs) for ds in datas])
-                das = self.to_dataset([ds[pol] for ds in datas], wrap=wrap)
-                das_total.append(das)
-                del das
-            das_total = xr.merge(das_total)
-            
-            if compute:
-                progressbar(result := das_total.persist(), desc=f'Compute Unified Dataset'.ljust(25))
-                del das_total
-                return result
-            return das_total
-
-        # process list of dataarrays with single polarization
-        y_chunksize = datas[0].chunks[-2][0]
-        x_chunksize = datas[0].chunks[-1][0]
-        # define unified grid
-        y_min = min(ds.y.min().item() for ds in datas)
-        y_max = max(ds.y.max().item() for ds in datas)
-        x_min = min(ds.x.min().item() for ds in datas)
-        x_max = max(ds.x.max().item() for ds in datas)
-        #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
-        stackvar = list(datas[0].dims)[0]
-        # workaround for dask.array.blockwise
-        stackval = datas[0][stackvar].astype(str)
-        stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
-        dy = datas[0].y.diff('y').item(0)
-        dx = datas[0].x.diff('x').item(0)
-        #print ('dy, dx', dy, dx)
-        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y'])
-        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x'])
-        #print ('stack', stackvar, stackval)
-        #print ('ys', ys)
-        #print ('xs', xs)
-        # extract extents of all datasets once
-        extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
-        
-        # use outer variable datas
-        def block_dask(stack, y_chunk, x_chunk, wrap):
-            #print ('pair', pair)
-            #print ('concat: block_dask', stackvar, stack)
-            # extract extent of the current chunk once
-            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
-            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
-            # select all datasets overlapping with the current chunk
-            das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute(num_workers=1)
-                         for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
-                         if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
-            #print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
-            
-            fill_dtype = datas[0].dtype
-            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
-            if len(das_slice) == 0:
-                # return empty block
-                return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
-            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
-            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice]
-            del das_slice
-            if len(das_block) == 1:
-                # return single block as is
-                return das_block[0].values
-
-            if wrap is None:
-                #print ('wrap None')
-                # ffill does not work correct on complex data and per-component ffill is faster
-                # the magic trick is to use sorting to ensure burst overpapping order
-                # bursts ends should be overlapped by bursts starts
-                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
-                if np.issubdtype(das_block_concat.dtype, np.complexfloating):
-                    return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
-                            + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
-                else:
-                    return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
-            elif wrap == True:
-                #print ('wrap True')
-                # calculate circular mean for interferogram data
-                das_block_concat = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim')
-                block_complex = das_block_concat.mean('stack_dim', skipna=True).values
-                return np.arctan2(block_complex.imag, block_complex.real)
-            elif wrap == False:
-                #print ('wrap False')
-                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
-                # calculate arithmetic mean for phase and correlation data
-                return das_block_concat.mean('stack_dim', skipna=True).values
-            else:
-                raise ValueError(f'ERROR: wrap is not a boolean or None: {wrap}')
-
-        # prevent warnings 'PerformanceWarning: Increasing number of chunks by factor of ...'
-        import warnings
-        from dask.array.core import PerformanceWarning
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=PerformanceWarning)
-            # rechunk data for expected usage
-            data = dask.array.blockwise(
-                block_dask,
-                'zyx',
-                stackidx.chunk(1), 'z',
-                ys.chunk({'y': y_chunksize}), 'y',
-                xs.chunk({'x': x_chunksize}), 'x',
-                meta = np.empty((0, 0, 0), dtype=datas[0].dtype),
-                wrap=wrap
-            )
-        da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
-            .rename(datas[0].name)\
-            .assign_attrs(datas[0].attrs)
-        del data
-        return datagrid.spatial_ref(da, datas)
