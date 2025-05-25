@@ -25,7 +25,7 @@ from insardev_toolkit import progressbar_joblib
 #     return snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
 
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                compat: bool = True, chunksize: int|str = 'auto', caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
+                compat: bool = True, caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -43,8 +43,6 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
     compat : bool, optional
         If True, automatically pack datasets saved as a single dataset into a dictionary.
         If False, only allow a dictionary of datasets. Default is True.
-    chunksize : int|str, optional
-        Chunksize for the store. Default is 'auto'.
     caption : str, optional
         Caption for the progress bar. Default is 'Snapshotting...'.
     n_jobs : int, optional
@@ -54,10 +52,10 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
     """
     # call the function without data arguments to only open existing store
     if len(args) > 0:
-        save(*args, store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
-    return open(store=store, storage_options=storage_options, compat=compat, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
+        save(*args, store=store, storage_options=storage_options, compat=compat, caption=caption, n_jobs=n_jobs, debug=debug)
+    return open(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
 
-def save(*args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
+def save(*args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True,
             caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
     """
     Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
@@ -125,14 +123,17 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
             else:
                 raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
     
-    def _save_grp(grp, ds, chunks):
+    def _save_grp(grp, ds):
         # silently drop problematic attributes
         ds_clean = ds.copy()
         for v in ds_clean.data_vars:
             ds_clean[v].attrs.pop('grid_mapping', None)
+        # prevent chunks mismatch between variables and coordinates
+        for coord in ds_clean.coords:
+            ds_clean[coord].encoding.pop('chunks', None)
         # save to subdirectory
         #print (ds_clean)
-        ds_clean.chunk(chunks).to_zarr(
+        ds_clean.to_zarr(
             store=f'{store}/{grp}',
             mode='w',
             consolidated=True,
@@ -148,7 +149,7 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
     ]
 
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(datas))) as progress_bar:
-        joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_save_grp) (grp, ds, chunks=chunksize) for grp, ds in datas.items())
+        joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_save_grp) (grp, ds) for grp, ds in datas.items())
 
     # consolidate metadata for the groups in the store
     zarr.consolidate_metadata(store, zarr_format=3)
@@ -161,7 +162,7 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
     except ValueError:
         pass
 
-def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True, chunksize: int|str = 'auto',
+def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True,
             caption: str | None = 'Opening...', n_jobs: int = -1, debug=False):
     """
     Load a Zarr store created by save(...).
@@ -202,12 +203,12 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
 
     joblib_backend = 'sequential' if debug else 'threading'
 
-    def _load_grp(grp, chunks):
+    def _load_grp(grp):
         #ds = xr.open_zarr(store, group=grp, consolidated=True, zarr_format=3)
-        ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3, chunks=chunks)
+        ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
         return grp, ds
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
-        results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp, chunks=chunksize) for grp in groups)
+        results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp) for grp in groups)
     dss = dict(results)
     del results
 

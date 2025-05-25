@@ -108,11 +108,11 @@ class Stack(Stack_plot, Mapping):
     def epsg(self) -> int:
         return next(iter(self.dss.values())).rio.crs.to_epsg()
 
-    def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
+    def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
         if len(args) > 2:
             raise ValueError(f'ERROR: snapshot() accepts only one or two Batch or dict objects or no arguments.')
-        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
+        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, caption=caption, n_jobs=n_jobs, debug=debug)
         return datas
 
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):

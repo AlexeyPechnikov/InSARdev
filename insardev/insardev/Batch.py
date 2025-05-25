@@ -40,11 +40,13 @@ class Batch(BatchCore):
     def plot(
         self,
         cmap = 'turbo',
+        alpha = 0.5,
         caption='Phase, [rad]',
         *args,
         **kwargs
     ):
         kwargs["cmap"] = cmap
+        kwargs["alpha"] = alpha
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
@@ -154,7 +156,8 @@ class BatchWrap(BatchCore):
             # Convert back to wrapped phase
             out[key] = agg_result.astype('float32')
             
-        return type(self)(out)
+        #print ('wrap _agg self.chunks', self.chunks)
+        return type(self)(out).chunk(self.chunks)
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """
@@ -175,18 +178,23 @@ class BatchWrap(BatchCore):
             coarsened by `window`, then reduced by `.mean()` (or whichever
             `func` you chose).
         """
-        print ('wrap coarsen')
-        import numpy as np
+        #print ('wrap coarsen')
+        chunks = self.chunks
+        #print ('self.chunks', chunks)
         out = {}
+        # produce unified grid and chunks for all datasets in the batch
         for key, ds in self.items():
             # convert to complex numbers for proper circular statistics
-            ds2 = xr.ufuncs.exp(1j * ds.astype(np.float32))
+            ds2 = xr.ufuncs.exp(1j * ds.astype('float32'))
             # align each dimension
             for dim, factor in window.items():
                 start = utils_xarray.coarsen_start(ds2, dim, factor)
                 #print ('start', start)
                 if start is not None:
-                    ds2 = ds2.isel({dim: slice(start, None)})
+                    # rechunk to the original chunk sizes
+                    ds2 = ds2.isel({dim: slice(start, None)}).chunk(chunks)
+                    # or allow a bit different chunks for coarsening
+                    #ds2 = ds2.isel({dim: slice(start, None)})
             # coarsen
             out[key] = ds2.coarsen(window, **kwargs)
 
@@ -195,11 +203,13 @@ class BatchWrap(BatchCore):
     def plot(
         self,
         cmap = 'gist_rainbow_r',
+        alpha = 0.5,
         caption='Phase, [rad]',
         *args,
         **kwargs
     ):
         kwargs["cmap"] = cmap
+        kwargs["alpha"] = alpha
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
@@ -209,57 +219,57 @@ class BatchWrap(BatchCore):
     #     """
     #     return self.iexp().gaussian(*args, **kwargs).angle()
 
+    # def gaussian(self, *args, **kwargs):
+    #     """
+    #     Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
+    #     then recombining via atan2.  No complex dtype ever created.
+    #     """
+    #     from .Batch import Batch
+    #     import xarray as xr
+
+    #     keep_attrs = kwargs.pop('keep_attrs', None)
+    #     # build two Batches of the real sin and cos components and filter them
+    #     sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+    #     cos = self.cos(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
+
+    #     # compute wrapped phase using np.arctan2
+    #     out = {k: xr.Dataset({
+    #         var: xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
+    #         for var in sin[k].data_vars
+    #     }) for k in self.keys()}
+
+    #     return BatchWrap(out)
+
     def gaussian(self, *args, **kwargs):
         """
         Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
-        then recombining via atan2.  No complex dtype ever created.
+        then recombining via arctan2.
         """
         from .Batch import Batch
         import xarray as xr
 
-        keep_attrs = kwargs.pop('keep_attrs', None)
+        keep_attrs = kwargs.pop('keep_attrs', False)
+        data_vars = next(iter(self.values())).data_vars
+
         # build two Batches of the real sin and cos components and filter them
         sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
         cos = self.cos(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
 
-        # compute wrapped phase using np.arctan2
-        out = {k: xr.Dataset({
-            var: xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
-            for var in sin[k].data_vars
-        }) for k in self.keys()}
+        # compute wrapped phase using arctan2
+        out: dict[str, xr.Dataset] = {}
+        for k in self.keys():
+            phase_vars = {}
+            for var in data_vars:
+                phase = xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
+                if keep_attrs:
+                    phase.attrs = self[k][var].attrs.copy()
+                phase_vars[var] = phase
+            ds = xr.Dataset(phase_vars)
+            if keep_attrs:
+                ds.attrs = self[k].attrs.copy()
+            out[k] = ds
 
         return BatchWrap(out)
-
-def gaussian(self, *args, **kwargs):
-    """
-    Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
-    then recombining via arctan2.
-    """
-    from .Batch import Batch
-    import xarray as xr
-
-    keep_attrs = kwargs.pop('keep_attrs', False)
-    data_vars = next(iter(self.values())).data_vars
-
-    # build two Batches of the real sin and cos components and filter them
-    sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
-    cos = self.cos(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
-
-    # compute wrapped phase using arctan2
-    out: dict[str, xr.Dataset] = {}
-    for k in self.keys():
-        phase_vars = {}
-        for var in data_vars:
-            phase = xr.ufuncs.arctan2(sin[k][var], cos[k][var]).astype('float32')
-            if keep_attrs:
-                phase.attrs = self[k][var].attrs.copy()
-            phase_vars[var] = phase
-        ds = xr.Dataset(phase_vars)
-        if keep_attrs:
-            ds.attrs = self[k].attrs.copy()
-        out[k] = ds
-
-    return BatchWrap(out)
 
 class BatchUnit(BatchCore):
     """

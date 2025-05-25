@@ -36,6 +36,11 @@ class Stack_detrend(Stack_unwrap):
         if transform is not None:
             # unify keys to datas
             transform = transform.sel(datas)
+
+        # prevent chunking of the stack dimension, it produces performance issues and incorrect results in 2D functions
+        assert datas.chunks['pair']==1, 'ERROR: datas must be chunked as (1, ...)'
+        assert weights is None or weights.chunks['pair']==1, 'ERROR: weights must be chunked as (1, ...)'
+
         wrap = True if isinstance(datas, BatchWrap) else False
         data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, compute=compute, wrap=wrap, **kwarg)
         return BatchWrap(data) if wrap else Batch(data)

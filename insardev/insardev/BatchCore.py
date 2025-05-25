@@ -131,6 +131,42 @@ class BatchCore(dict):
         # return the only Dataset
         return next(iter(self.values()))
 
+    # @property
+    # def chunks(self) -> tuple[int, int, int]:
+    #     sample = next(iter(self.values()))
+    #     # for DatasetCoarsen extract the original Dataset
+    #     if hasattr(sample, 'obj'):
+    #         sample = sample.obj
+    #     data_var = [var for var in sample.data_vars if (sample[var].ndim in (2,3) and sample[var].dims[-2:] == ('y','x'))][0]
+
+    #     if sample[data_var].chunks is None:
+    #         print ('WARNING: Batch.chunks undefined, i.e. the data is not lazy and parallel chunks processing is not possible.')
+    #         return (1, -1, -1)
+    #     else:
+    #         return tuple(chunks[0] for chunks in sample[data_var].chunks)
+
+    @property
+    def chunks(self) -> dict[str, int]:
+        try:
+            sample = next(iter(self.values()))
+        except StopIteration:
+            return {}
+
+        # for DatasetCoarsen extract the original Dataset
+        if hasattr(sample, 'obj'):
+            sample = sample.obj
+        data_var = [var for var in sample.data_vars if (sample[var].ndim in (2,3) and sample[var].dims[-2:] == ('y','x'))][0]
+        
+        chunks = sample[data_var].chunks
+        #print ('chunks', chunks)
+        if chunks is None:
+            print ('WARNING: Batch.chunks undefined, i.e. the data is not lazy and parallel chunks processing is not possible.')
+            # use "common" chunking for 2D and 3D data
+            return -1 if data_var.ndim == 2 else (1, -1, -1)
+
+        # build dict of first‐chunk sizes, one chunk means chunk size 1 or -1
+        return {dim: sizes[0] if len(sizes) > 1 else (1 if sizes[0] == 1 else -1) for dim, sizes in zip(sample[data_var].dims, chunks)}
+
     def __getitem__(self, key):
         # like batch[['azi','rng']]
         if isinstance(key, (list, tuple)):
@@ -563,7 +599,9 @@ class BatchCore(dict):
                 out[key] = fn(dim=dim, **kwargs)
             else:
                 out[key] = fn(**kwargs)
-        return type(self)(out)
+
+        print ('_agg self.chunks', self.chunks)
+        return type(self)(out).chunk(self.chunks)
 
     def mean(self, dim=None, **kwargs):
         return self._agg("mean", dim=dim, **kwargs)
@@ -614,17 +652,21 @@ class BatchCore(dict):
             coarsened by `window`, then reduced by `.mean()` (or whichever
             `func` you chose).
         """
+        chunks = self.chunks
         out = {}
+        # produce unified grid and chunks for all datasets in the batch
         for key, ds in self.items():
-            ds2 = ds
             # align each dimension
             for dim, factor in window.items():
-                start = utils_xarray.coarsen_start(ds2, dim, factor)
+                start = utils_xarray.coarsen_start(ds, dim, factor)
                 #print ('start', start)
                 if start is not None:
-                    ds2 = ds2.isel({dim: slice(start, None)})
-            # coarsen
-            out[key] = ds2.coarsen(window, **kwargs)
+                    # rechunk to the original chunk sizes
+                    ds = ds.isel({dim: slice(start, None)}).chunk(chunks)
+                    # or allow a bit different chunks for coarsening
+                    #ds = ds.isel({dim: slice(start, None)})
+            # coarsen and revert original chunks
+            out[key] = ds.coarsen(window, **kwargs)
 
         return type(self)(out)
 
@@ -663,20 +705,20 @@ class BatchCore(dict):
         print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
         return self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
 
-    def save(self, store: str, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
+    def save(self, store: str, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
-        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
+        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, caption=caption, n_jobs=n_jobs, debug=debug)
 
-    def open(self, store: str, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto', n_jobs: int = -1, debug=False):
-        data = utils_io.open(store=store, storage_options=storage_options, compat=False, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
+    def open(self, store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
+        data = utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
         if not isinstance(data, dict):
             raise ValueError(f'ERROR: open() returns multiple datasets, you need to use Stack class to open them.')
         return data
     
-    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None, chunksize: int|str = 'auto',
+    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
-        self.save(store=store, storage_options=storage_options, chunksize=chunksize, caption=caption, n_jobs=n_jobs, debug=debug)
-        return self.open(store=store, storage_options=storage_options, chunksize=chunksize, n_jobs=n_jobs, debug=debug)
+        self.save(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+        return self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
 
     def to_dataset(self, polarization=None, dissolve=True, compute: bool = False):
         """
@@ -829,6 +871,7 @@ class BatchCore(dict):
     def plot(self,
             dissolve: bool = True,
             cmap: matplotlib.colors.Colormap | str | None = 'gist_rainbow_r',
+            alpha: float = 1.0,
             vmin: float | None = None,
             vmax: float | None = None,
             quantile: float | None = None,
@@ -845,6 +888,7 @@ class BatchCore(dict):
         import xarray as xr
         import numpy as np
         import pandas as pd
+        import matplotlib.ticker as mticker
         import matplotlib.pyplot as plt
         from .Batch import BatchWrap
         from insardev_toolkit import progressbar
@@ -863,7 +907,7 @@ class BatchCore(dict):
 
         # use outer variables
         def plot_polarization(polarization):
-            stackvar = list(sample.dims)[0]
+            stackvar = list(sample[polarization].dims)[0]
             #print ('stackvar', stackvar)
             #da = self[[polarization]]
             #da = self[[polarization]].isel({stackvar: slice(0, rows)})
@@ -901,11 +945,19 @@ class BatchCore(dict):
                 .plot.imshow(
                 col=stackvar,
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
-                vmin=_vmin, vmax=_vmax, cmap=cmap
+                vmin=_vmin, vmax=_vmax,
+                cmap=cmap, alpha=alpha
             )
-            #fg.set_axis_labels('Range', 'Azimuth')
+            fg.set_axis_labels('easting [m]', 'northing [m]')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
             fg.fig.suptitle(f'{polarization} {caption}', y=y)
+
+            # fg is the FacetGrid returned by xarray.plot.imshow
+            for ax in fg.axes.flatten():
+                # disable the offset text (like "1e6")
+                # force plain formatting (no scientific notation) on the y‐axis
+                ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+                
             return fg
 
         if quantile is not None:
@@ -915,7 +967,7 @@ class BatchCore(dict):
         # find all variables in the first dataset related to polarizations
         # TODO
         polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
-        print ('polarizations', polarizations)
+        #print ('polarizations', polarizations)
 
         # process polarizations one by one
         fgs = []
