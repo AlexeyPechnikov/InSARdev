@@ -16,8 +16,8 @@ class S1_dem(S1_tidal):
 
     # Xarray's interpolation can be inefficient for large grids;
     # this custom function handles the task more effectively.
-    @staticmethod
-    def _interp2d_like(data, grid, method='cubic', **kwargs):
+    def _interp2d_like(self, data, grid, method='cubic', **kwargs):
+        import numpy as np
         import xarray as xr
         import dask.array as da
         import os
@@ -62,7 +62,7 @@ class S1_dem(S1_tidal):
             method=method,
             **kwargs
         )
-        da_out = xr.DataArray(dask_out, coords=coords, dims=dims).rename(data.name)
+        da_out = xr.DataArray(dask_out, coords=coords, dims=dims).rename(data.name).astype(np.float32)
         del dask_out
         # append all the input coordinates
         return da_out.assign_coords({k: v for k, v in data.coords.items() if k not in coords})
@@ -88,21 +88,20 @@ class S1_dem(S1_tidal):
         -----
         See EGM96 geoid heights on http://icgem.gfz-potsdam.de/tom_longtime
         """
+        import numpy as np
         import xarray as xr
         import os
         import importlib.resources as resources
 
         with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
-            geoid = xr.open_dataarray(geoid_filename, engine=self.netcdf_engine_read, chunks=self.netcdf_chunksize).rename({'y': 'lat', 'x': 'lon'})
+            geoid = xr.open_dataarray(geoid_filename, engine=self.netcdf_engine_read, chunks=self.netcdf_chunksize)\
+                .rename({'y': 'lat', 'x': 'lon'})\
+                .astype(np.float32).transpose('lat','lon').rename('geoid')
         if grid is not None:
             return self._interp2d_like(geoid, grid)
         return geoid
 
-    # buffer required to get correct (binary) results from SAT_llt2rat tool
-    # small buffer produces incomplete area coverage and restricted NaNs
-    # 0.02 degrees works well worldwide but not in Siberia
-    # minimum buffer size: 8 arc seconds for 90 m DEM
-    def get_dem_wgs84ellipsoid(self, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=0.04):
+    def get_dem(self, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=0):
         """
         Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
 
@@ -115,24 +114,8 @@ class S1_dem(S1_tidal):
 
         Returns
         -------
-        None
-
-        Examples
-        --------
-        Load and crop from local NetCDF file:
-        stack.load_dem('GEBCO_2020/GEBCO_2020.nc')
-
-        Load and crop from local GeoTIF file:
-        stack.load_dem('GEBCO_2019.tif')
-
-        Load from Xarray DataArray or Dataset:
-        stack.set_dem(None).load_dem(dem)
-        stack.set_dem(None).load_dem(dem.to_dataset())
-
-        Notes
-        -----
-        This method loads DEM from the user specified file. The data is then preprocessed by removing
-        the EGM96 geoid to make the heights relative to the WGS84 ellipsoid.
+        xarray.DataArray
+            The DEM data array.
         """
         import xarray as xr
         import numpy as np
@@ -176,8 +159,53 @@ class S1_dem(S1_tidal):
         bounds = self.get_bounds(geometry.buffer(buffer_degrees))
         ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
 
+        # suppose missed values are water surface
+        ds = ortho.fillna(0).astype(np.float32).transpose('lat','lon').rename("dem")
+        return self.spatial_ref(ds, 4326)
+
+    # buffer required to get correct (binary) results from SAT_llt2rat tool
+    # small buffer produces incomplete area coverage and restricted NaNs
+    # 0.02 degrees works well worldwide but not in Siberia
+    # minimum buffer size: 8 arc seconds for 90 m DEM
+    def get_dem_wgs84ellipsoid(self, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=0.04):
+        """
+        Load and preprocess digital elevation model (DEM) data from specified datafile or variable.
+
+        Parameters
+        ----------
+        geometry : geopandas.GeoDataFrame, optional
+            The geometry of the area to crop the DEM.
+        buffer_degrees : float, optional
+            The buffer in degrees to add to the geometry.
+
+        Returns
+        -------
+        xarray.DataArray
+            WGS84 ellipsoid DEM data array.
+
+        Examples
+        --------
+        Load and crop from local NetCDF file:
+        stack.load_dem('GEBCO_2020/GEBCO_2020.nc')
+
+        Load and crop from local GeoTIF file:
+        stack.load_dem('GEBCO_2019.tif')
+
+        Load from Xarray DataArray or Dataset:
+        stack.set_dem(None).load_dem(dem)
+        stack.set_dem(None).load_dem(dem.to_dataset())
+
+        Notes
+        -----
+        This method loads DEM from the user specified file. The data is then preprocessed by removing
+        the EGM96 geoid to make the heights relative to the WGS84 ellipsoid.
+        """
+        import numpy as np
+        
+        # DEM
+        ortho = self.get_dem(geometry, buffer_degrees)
         # heights correction
         geoid = self.get_geoid(ortho)
         # suppose missed values are water surface
-        ds = (ortho.fillna(0) + geoid).astype(np.float32).transpose('lat','lon').rename("dem")
+        ds = (ortho + geoid).rename("dem")
         return self.spatial_ref(ds, 4326)

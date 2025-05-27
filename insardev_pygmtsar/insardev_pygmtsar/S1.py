@@ -35,7 +35,7 @@ class S1(S1_transform):
         
         plt.figure()
         if self.DEM is not None:
-            dem = self.get_dem_wgs84ellipsoid()
+            dem = self.get_dem()
             # there is no reason to plot huge arrays much larger than screen size for small plots
             #print ('screen_size', screen_size)
             size_y, size_x = dem.shape
@@ -44,13 +44,10 @@ class S1(S1_transform):
             factor_x = int(np.round(size_x / _size[0]))
             #print ('factor_x, factor_y', factor_x, factor_y)
             # coarsen and materialize data for all the calculations and plotting
-            dem = dem[::max(1, factor_y), ::max(1, factor_x)].load()
+            dem = dem[::max(1, factor_y), ::max(1, factor_x)]
             dem.plot.imshow(cmap='gray', alpha=alpha, add_colorbar=True)
-            dem.close()
-            del dem
         cmap = matplotlib.colormaps[cmap]
         colors = dict([(v, cmap(k)) for k, v in enumerate(records.index.unique())])
-
         # Calculate overlaps including self-overlap
         overlap_count = [sum(1 for geom2 in records.geometry if geom1.intersects(geom2)) for geom1 in records.geometry]
         _alpha=max(1/max(overlap_count), 0.002)
