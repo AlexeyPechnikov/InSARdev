@@ -219,7 +219,7 @@ class S1_topo(S1_geocode):
         import warnings
         warnings.filterwarnings('ignore')
 
-        def trans_inv_block(azis, rngs, tolerance, chunksize):
+        def trans_inv_block(azis, rngs, tolerance, y_chunksize, x_chunksize):
             from scipy.spatial import cKDTree
             import warnings
             warnings.filterwarnings('ignore')
@@ -244,8 +244,8 @@ class S1_topo(S1_geocode):
                 # coordinates
                 block_lt, block_ll = [block.ravel() for block in np.meshgrid(lt_blocks[block_y], ll_blocks[block_x], indexing='ij')]
                 # variables
-                block_trans = transform.isel(y=slice(chunksize*block_y,chunksize*(block_y+1)),
-                                         x=slice(chunksize*block_x,chunksize*(block_x+1)))[['azi', 'rng', 'ele']]\
+                block_trans = transform.isel(y=slice(y_chunksize*block_y, y_chunksize*(block_y+1)),
+                                         x=slice(x_chunksize*block_x, x_chunksize*(block_x+1)))[['azi', 'rng', 'ele']]\
                                    .compute(n_workers=1).to_array().values.reshape(3,-1)
                 # select valuable coordinates only
                 mask = (block_trans[0,:]>=azis_min)&(block_trans[0,:]<=azis_max)&\
@@ -290,7 +290,9 @@ class S1_topo(S1_geocode):
             return np.asarray([grid_ele]).reshape((1, azis.size, rngs.size))
 
         # calculate indices on the fly
-        trans_blocks = transform[['azi', 'rng']].coarsen(y=self.chunksize, x=self.chunksize, boundary='pad')
+        y_chunksize = self.chunksize if isinstance(self.chunksize, int) else self.chunksize['y']
+        x_chunksize = self.chunksize if isinstance(self.chunksize, int) else self.chunksize['x']
+        trans_blocks = transform[['azi', 'rng']].coarsen(y=y_chunksize, x=x_chunksize, boundary='pad')
         #block_min, block_max = dask.compute(trans_blocks.min(), trans_blocks.max())
         # materialize without progress bar indication
         #trans_blocks_persist = dask.persist(trans_blocks.min(), trans_blocks.max()
@@ -306,8 +308,8 @@ class S1_topo(S1_geocode):
         #chunks = trans.azi.data.chunks
         #lt_blocks = np.array_split(trans['lat'].values, np.cumsum(chunks[0])[:-1])
         #ll_blocks = np.array_split(trans['lon'].values, np.cumsum(chunks[1])[:-1])
-        lt_blocks = np.array_split(transform['y'].values, np.arange(0, transform['y'].size, self.chunksize)[1:])
-        ll_blocks = np.array_split(transform['x'].values, np.arange(0, transform['x'].size, self.chunksize)[1:])
+        lt_blocks = np.array_split(transform['y'].values, np.arange(0, transform['y'].size, y_chunksize)[1:])
+        ll_blocks = np.array_split(transform['x'].values, np.arange(0, transform['x'].size, x_chunksize)[1:])
 
         # split radar coordinate grid to equal chunks and rest
         prm = self.PRM(burst_ref, basedir)
@@ -316,8 +318,8 @@ class S1_topo(S1_geocode):
         rngs = np.arange(0.5, r_max, 1)
         #print ('azis', azis, 'rngs', rngs, 'sizes', azis.size, rngs.size)
         
-        azis_blocks = np.array_split(azis, np.arange(0, azis.size, self.chunksize)[1:])
-        rngs_blocks = np.array_split(rngs, np.arange(0, rngs.size, self.chunksize)[1:])
+        azis_blocks = np.array_split(azis, np.arange(0, azis.size, y_chunksize)[1:])
+        rngs_blocks = np.array_split(rngs, np.arange(0, rngs.size, x_chunksize)[1:])
         #print ('azis_blocks.size', len(azis_blocks), 'rngs_blocks.size', len(rngs_blocks))
 
         blocks_total = []
@@ -325,7 +327,7 @@ class S1_topo(S1_geocode):
             blocks = []
             for rngs_block in rngs_blocks:
                 block = dask.array.from_delayed(dask.delayed(trans_inv_block, traverse=False)
-                                               (azis_block, rngs_block, 2, self.chunksize),
+                                               (azis_block, rngs_block, 2, y_chunksize, x_chunksize),
                                                shape=(1, azis_block.size, rngs_block.size), dtype=np.float32)
                 blocks.append(block)
                 del block

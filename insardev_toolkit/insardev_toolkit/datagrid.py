@@ -9,35 +9,12 @@
 # ----------------------------------------------------------------------------
 
 class datagrid:
-    """
-    A class representing a data grid.
-
-    Attributes
-    ----------
-    chunksize : int
-        The chunk size for data compression. Default is 512.
-    netcdf_engine : str
-        The engine used for NetCDF file operations. Default is 'h5netcdf'.
-    netcdf_complevel : int
-        The compression level for data compression. Default is 3.
-    noindex : np.uint32
-        The NODATA index value for transform matrices.
-    
-    Notes
-    ----------
-    That's possible to define a special NetCDF backend for Docker environment or other cases:
-
-    if os.path.exists('/.dockerenv') and not 'google.colab' in sys.modules:
-        # use different NetCDF backend in Docker containers
-        from pygmtsar import datagrid
-        datagrid.netcdf_engine = 'netcdf4'
-    
-    """
     import numpy as np
 
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
     # processing chunksize
-    chunksize: int = 2*1280
+    #chunksize: int = 4*1280
+    chunksize: int|dict|str = {'y': 2*1280, 'x': 8*1280}
 
     netcdf_engine_read: str = 'h5netcdf'
     netcdf_engine_write: str = 'netcdf4'
@@ -46,45 +23,6 @@ class datagrid:
     netcdf_compression_algorithm: str = 'zlib'
     netcdf_complevel: int = 3
     netcdf_shuffle: bool = True
-
-    # output chunksize for zarr exported datasets
-    zarr_chunksize: int = 4*1280
-    # ['lz4', 'lz4hc', 'blosclz', 'zstd', 'zlib']
-    zarr_compression_algorithm: str = 'zstd'
-    zarr_clevel: int = 6
-    zarr_shuffle: str = 'bitshuffle'
-    zarr_blocksize: int = 0
-
-    # define lost class variables due to joblib via arguments
-    def get_encoding_zarr(self, chunks=None, dtype=None, shuffle=None, fill_value=None, compression=True):
-        import numpy as np
-        from zarr.codecs import BloscCodec
-
-        if dtype is not None:
-            if np.issubdtype(dtype, np.floating):
-                fill_value = np.nan if fill_value is None else fill_value
-            else:
-                fill_value = np.iinfo(dtype).max if fill_value is None else fill_value
-        if shuffle is None:
-            shuffle = self.zarr_shuffle
-        if fill_value is None:
-            fill_value = np.nan
-
-        compressor = BloscCodec(
-            cname=self.zarr_compression_algorithm,
-            clevel=self.zarr_clevel,
-            shuffle=shuffle,
-            blocksize=self.zarr_blocksize
-        )
-
-        opts = dict(fill_value=fill_value)
-        if chunks is not None:
-            opts['chunks'] = chunks
-        if compression and self.zarr_compression_algorithm is not None and self.zarr_clevel >= 0:
-            opts['compressors'] = (compressor,)
-        else:
-            opts['compressor'] = None
-        return opts
 
     # define lost class variables due to joblib via arguments
     def get_encoding_netcdf(self, shape=None, chunksize=None):
@@ -172,87 +110,6 @@ class datagrid:
             dy *= coarsen[0]
             dx *= coarsen[1]
         return (dy, dx)
-# 
-#     @staticmethod
-#     def spatial_ref(da, target=None):
-#         """
-#         Add geospatial attributes (CRS and spatial dimensions) to allow raster operations using RioXarray.
-# 
-#         Parameters
-#         ----------
-#         da : xarray.DataArray or xarray.Dataset
-#             The input 2D or 3D grid to be converted to geospatial.
-#         target : int, xarray.DataArray, or xarray.Dataset, optional
-#             The target EPSG code or an xarray object from which to derive the CRS.
-# 
-#         Returns
-#         -------
-#         xarray.DataArray or xarray.Dataset
-#             The geospatial 2D or 3D grid with spatial attributes.
-# 
-#         Examples
-#         --------
-#         Convert a raster to geospatial and mask it using a Shapely vector geometry:
-#         Stack.spatial_ref(grid).rio.clip([geometry])
-#         """
-#         import xarray as xr
-#         import rioxarray
-#         import sys
-#         #assert 'rioxarray' in sys.modules, 'rioxarray module is not found'
-# 
-#         if target is None:
-#             return da
-# 
-#         # extract EPSG from target xarray object or use provided EPSG
-#         if isinstance(target, (xr.DataArray, xr.Dataset)):
-#             if target.rio.crs is None:
-#                 raise ValueError("ERROR: Target xarray object has no CRS defined.")
-#             epsg = target.rio.crs.to_epsg()
-#             if epsg is None:
-#                 raise ValueError("ERROR: Target CRS is not an EPSG code, consider using PROJ string.")
-#         else:
-#             epsg = target
-#         #print ('epsg', epsg)
-# 
-#         if epsg == 4326:
-#             # EPSG:4326 (WGS84, lat/lon)
-#             da_spatial = (
-#                 da.rio.write_crs(4326)
-#                   .rio.set_spatial_dims(y_dim='lat', x_dim='lon')
-#                   .rio.write_grid_mapping()
-#                   .assign_coords(lat=da.lat.assign_attrs(axis='Y', 
-#                                                        standard_name='latitude',
-#                                                        long_name='latitude'),
-#                                lon=da.lon.assign_attrs(axis='X', 
-#                                                        standard_name='longitude',
-#                                                        long_name="longitude"))
-#                   .assign_attrs({'Conventions': 'CF-1.8'}))
-#             if isinstance(da, xr.Dataset):
-#                 return da_spatial.assign({
-#                     var: da[var].assign_attrs(grid_mapping='spatial_ref', coordinates='lon lat')  
-#                         for var in da.data_vars if set(da[var].dims) == {'lat', 'lon'}
-#                 })
-#             return da_spatial.assign_attrs(grid_mapping='spatial_ref', coordinates='lon lat')
-# 
-#         # projected coordinates
-#         da_spatial = (
-#             da.rio.write_crs(epsg)
-#               .rio.set_spatial_dims(y_dim='y', x_dim='x')
-#               .rio.write_grid_mapping()
-#               .assign_coords(y=da.y.assign_attrs(axis='Y', 
-#                                                standard_name='projection_y_coordinate',
-#                                                long_name='northing'),
-#                            x=da.x.assign_attrs(axis='X', 
-#                                                standard_name='projection_x_coordinate',
-#                                                long_name="easting"))
-#               .assign_attrs({'Conventions': 'CF-1.8'}))
-# 
-#         if isinstance(da, xr.Dataset):
-#             return da_spatial.assign({
-#                 var: da[var].assign_attrs(grid_mapping='spatial_ref', coordinates='x y')  
-#                     for var in da.data_vars if set(da[var].dims) == {'y', 'x'}
-#             })
-#         return da_spatial.assign_attrs(grid_mapping='spatial_ref', coordinates='x y')
 
     @staticmethod
     def spatial_ref(da, target=None):
@@ -345,86 +202,6 @@ class datagrid:
                 da_spatial = da_spatial.assign_attrs(grid_mapping='spatial_ref', coordinates='x y')
 
         return da_spatial.assign_attrs(coordinates='spatial_ref')
-
-#     # da.dropna(dim=dim, how='all') is not fast at all
-#     @staticmethod
-#     def cropna(das, index=-1):
-#         """
-#         Crop the valid extent of a raster by removing rows and columns containing only NODATA values.
-# 
-#         Parameters
-#         ----------
-#         das : xarray.DataArray
-#             The input 2D or 3D grid to be cropped.
-# 
-#         Returns
-#         -------
-#         xarray.DataArray
-#             The cropped 2D or 3D grid.
-# 
-#         Examples
-#         --------
-#         Crop the valid extent of a raster:
-#         stack.cropna(grid)
-# 
-#         Notes
-#         -----
-#         This method crops the input grid by removing rows and columns that contain only NODATA values.
-#         It operates on 2D or 3D grids, where the NODATA values are represented as NaN values.
-#         The resulting grid has a reduced size, containing only the valid extent of the input grid.
-#         If the input grid is 3D, the cropping is performed along the dimensions other than 'pair' or 'date'.
-#         """
-#         # crop NaNs
-#         dims = [dim for dim in das.dims if dim != 'pair' and dim != 'date']
-#         dim0 = [dim for dim in das.dims if dim in ['pair', 'date']]
-#         #print ('dims', dims, 'dim0', dim0)
-#         assert len(dims) == 2, 'ERROR: the input should be 3D array with "pair" or "date" coordinate'
-#         # slow check using all the grids in the stack
-#         #da = das.min(dim0)
-#         # fast check using the only "index" grid in the stack
-#         da = das.isel({dim0[index]: index}) if dim0 != [] else das
-#         indexer = {}
-#         for dim in dims:
-#             da = da.dropna(dim=dim, how='all')
-#             dim_min, dim_max = da[dim].min().item(), da[dim].max().item()
-#             indexer[dim] = slice(dim_min, dim_max)
-#         #print ('indexer', indexer)
-#         return das.loc[indexer]
-
-#     # replacement for GMTSAR gaussians
-#     # gauss5x5 = np.genfromtxt('/usr/local/GMTSAR/share/gmtsar/filters/gauss5x5',skip_header=True)
-#     # gaussian_kernel(5,1) ~= gauss5x5
-#     @staticmethod
-#     def gaussian_kernel(size=(5,5), std=(1,1)):
-#         """
-#         Generate a 2D Gaussian kernel matrix.
-# 
-#         Parameters
-#         ----------
-#         size : tuple, optional
-#             The size of the kernel matrix in (rows, columns). Default is (5, 5).
-#         std : tuple, optional
-#             The standard deviation of the Gaussian distribution in (row_std, column_std). Default is (1, 1).
-# 
-#         Returns
-#         -------
-#         numpy.ndarray
-#             The 2D Gaussian kernel matrix.
-# 
-#         Examples
-#         --------
-#         Generate a 5x5 Gaussian kernel with standard deviation of 1 in both dimensions:
-#         gaussian_kernel(size=(5, 5), std=(1, 1))
-# 
-#         Generate a 3x3 Gaussian kernel with standard deviation of 0.5 in row dimension and 1 in column dimension:
-#         gaussian_kernel(size=(3, 3), std=(0.5, 1))
-#         """
-#         import numpy as np
-#         from scipy import signal
-#         matrix1 = signal.gaussian(size[0], std=std[0]).reshape(size[0], 1)
-#         matrix2 = signal.gaussian(size[1], std=std[1]).reshape(size[1], 1)
-#         matrix2d = np.outer(matrix1, matrix2)
-#         return matrix2d
 
     @staticmethod
     def get_bounds(geometry, epsg=4326):

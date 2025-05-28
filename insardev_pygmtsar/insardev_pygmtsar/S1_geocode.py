@@ -301,8 +301,9 @@ class S1_geocode(S1_align):
         def trans_blocks(ys, xs, chunksize):
             #print ('ys', ys, 'xs', xs, 'sizes', ys.size, xs.size)
             # split to equal chunks and rest
-            ys_blocks = np.array_split(ys, np.arange(0, ys.size, chunksize)[1:])
-            xs_blocks = np.array_split(xs, np.arange(0, xs.size, chunksize)[1:])
+            #print ('chunksize', chunksize)
+            ys_blocks = np.array_split(ys, np.arange(0, ys.size, chunksize if isinstance(chunksize, int) else chunksize['y'])[1:])
+            xs_blocks = np.array_split(xs, np.arange(0, xs.size, chunksize if isinstance(chunksize, int) else chunksize['x'])[1:])
             #print ('ys_blocks.size', len(ys_blocks), 'xs_blocks.size', len(xs_blocks))
             #print ('ys_blocks[0]', xs_blocks[0])
     
@@ -390,14 +391,11 @@ class S1_geocode(S1_align):
         trans = self.spatial_ref(trans, epsg)
         trans.attrs['spatial_ref'] = trans.spatial_ref.attrs['spatial_ref']
         trans = trans.drop_vars('spatial_ref')
+        for var in list(trans.data_vars):
+            trans[var].attrs.pop('grid_mapping', None)
 
-        encoding_vars = {var: self.get_encoding_zarr(dtype=trans[var].dtype) for var in trans.data_vars}
-        #print ('encoding_vars', encoding_vars)
-        encoding_coords = {coord: self.get_encoding_zarr(chunks=(trans[coord].size,), dtype=trans[coord].dtype) for coord in trans.coords}
-        #print ('encoding_coords', encoding_coords)
-        trans.chunk(self.zarr_chunksize).to_zarr(
+        trans.to_zarr(
             store=os.path.join(outdir, 'transform'),
-            encoding=encoding_vars | encoding_coords,
             mode='w',
             zarr_format=3,
             consolidated=True

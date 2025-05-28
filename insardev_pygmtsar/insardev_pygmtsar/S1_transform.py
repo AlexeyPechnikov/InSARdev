@@ -192,9 +192,10 @@ class S1_transform(S1_topo):
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         
+        joblib_backend = 'threading' if not debug else 'sequential'
         for refrep in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
             # single worker is used to help Dask cleanup memory
-            joblib.Parallel(n_jobs=1, backend='threading')(
+            joblib.Parallel(n_jobs=1, backend=joblib_backend)(
                 [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
             )
 
@@ -301,17 +302,11 @@ class S1_transform(S1_topo):
             data_proj[varname].attrs['scale_factor'] = scale
             data_proj[varname].attrs['add_offset'] = 0
             data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
-        
-        encoding_vars = {var: self.get_encoding_zarr(chunks=(data_proj.x.size,),
-                                                     dtype=data_proj[var].dtype,
-                                                     shuffle='noshuffle'
-                                                     ) for var in data_proj.data_vars}
-        #print ('encoding_vars', encoding_vars)
+
         # use transfrom coordinates
         data_proj = data_proj.drop_vars(['x','y'])
-        data_proj.chunk(self.zarr_chunksize).to_zarr(
+        data_proj.to_zarr(
             store=os.path.join(outdir, burst_rep),
-            encoding=encoding_vars,
             mode='w',
             zarr_format=3,
             consolidated=True
