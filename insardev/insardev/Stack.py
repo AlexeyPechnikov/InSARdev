@@ -12,7 +12,7 @@ from __future__ import annotations
 from .Stack_plot import Stack_plot
 from .BatchCore import BatchCore
 from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
-from collections.abc import Mapping
+#from collections.abc import Mapping
 from . import utils_io
 from . import utils_xarray
 from typing import TYPE_CHECKING
@@ -21,92 +21,17 @@ if TYPE_CHECKING:
     import pandas as pd
     import xarray as xr
 
-class Stack(Stack_plot, Mapping):
+class Stack(Stack_plot, BatchCore):
     
-    def __init__(self, dss:dict[str, xr.Dataset] | None = None):
-        self.dss = BatchCore(dss)
+    def __init__(self, mapping:dict[str, xr.Dataset] | None = None):
+        #print('Stack __init__', 0 if mapping is None else len(mapping))
+        super().__init__(mapping)
 
-    def __repr__(self):
-        if not getattr(self, 'dss', {}):
-            return f"{self.__class__.__name__}(empty)"
-        n = len(self)
-        if n <= 1:
-            # delegate to the underlying dict repr
-            #return dict.__repr__(self.dss)
-            key, ds = next(iter(self.items()))
-            return f"{self.__class__.__name__}['{key}']:\n{ds!r}"
-        sample = next(iter(self.dss.values()))
-        keys = list(self.dss.keys())
-        return f'{self.__class__.__name__} containing {len(self.dss)} items for {len(sample.date)} date ({keys[0]} … {keys[-1]})' 
-
-    def __len__(self):
-        return len(getattr(self, 'dss', {}))
-
-    def __getitem__(self, key):
-        # so stack[key] → self.dss[key]
-        return self.dss[key]
-
-    def __iter__(self):
-        # iteration yields the same keys as the Batch
-        return iter(self.dss)
-
-    def __bool__(self):
-        return bool(self.__len__())
-
-    def __add__(self, other):
-        """
-        Add two stacks together.
-
-        s3 = s1 + s2
-        """
-        import copy
-        if not isinstance(other, Stack):
-            return NotImplemented
-        # make a shallow copy of self
-        new = copy.copy(self)
-        # merge the dicts
-        new.dss = self.dss | other.dss
-        return new
-
-    def __iadd__(self, other):
-        """
-        Add two stacks together in place.
-
-        s1 += s2
-        """
-        if not isinstance(other, Stack):
-            return NotImplemented
-        # update in‐place
-        self.dss.update(other.dss)
-        return self
-
-    def sel(self, *args, **kwargs) -> 'Stack':
-        # call through to the Batch.sel
-        dss = self.dss.sel(*args, **kwargs)
-        # build a fresh Stack without re-running __init__
-        new = self.__class__.__new__(self.__class__)
-        new.__dict__.update(self.__dict__)
-        new.dss = dss
-        return new
-
-    def isel(self, *args, **kwargs) -> 'Stack':
-        dss = self.dss.isel(*args, **kwargs)
-        new = self.__class__.__new__(self.__class__)
-        new.__dict__.update(self.__dict__)
-        new.dss = dss
-        return new
-        
     def PRM(self, key:str) -> str|float|int:
         """
         Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
         """
         return next(iter(self.dss.values())).attrs[key]
-
-    def crs(self) -> rio.crs.CRS:
-        return next(iter(self.dss.values())).rio.crs
-
-    def epsg(self) -> int:
-        return next(iter(self.dss.values())).rio.crs.to_epsg()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
@@ -157,10 +82,10 @@ class Stack(Stack_plot, Mapping):
             raise ValueError(f'ERROR: datas is not None or a dict: {type(datas)}')
     
         if crs is not None and isinstance(crs, str) and crs == 'auto':
-            crs = self.crs()
+            crs = self.crs
 
         if datas is None:
-            datas = self.dss
+            datas = self
 
         polarizations = [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in next(iter(datas.values())).data_vars]
         #print ('polarizations', polarizations)
@@ -366,8 +291,8 @@ class Stack(Stack_plot, Mapping):
             # get transform subgroup
             grp_transform = grp['transform']
             transform = xr.open_zarr(grp_transform.store, group=grp_transform.path, consolidated=True, zarr_format=3)
-            # combine bursts and transform
-            ds = bursts_transform_preprocess(dss, transform)
+            # combine bursts and transform casted to 32 bit floats
+            ds = bursts_transform_preprocess(dss, transform.astype(np.float32))
             del dss, transform
             return group, ds
 
@@ -379,7 +304,7 @@ class Stack(Stack_plot, Mapping):
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
             # list of key - dataset converted to dict and appended to the existing dict
-            self.dss.update(dss)
+            self.update(dss)
         # elif isinstance(urls, FsspecStore):
         #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
         #     dss = []
@@ -431,4 +356,4 @@ class Stack(Stack_plot, Mapping):
                 del ds, bursts, transform
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
-            self.dss.update(dss)
+            self.update(dss)

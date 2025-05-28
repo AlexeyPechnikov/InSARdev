@@ -49,16 +49,6 @@ class Stack_phasediff(Stack_base):
             module=r'dask\._task_spec'
         )
 
-        #print ('data', data)
-        # print ('weight', weight)
-        # print ('phase', phase)
-        # print ('pairs', pairs)
-        # print ('wavelength', wavelength)
-        # print ('gaussian_threshold', gaussian_threshold)
-        # print ('multilook', multilook)
-        # print ('goldstein_window', goldstein_window)
-        # print ('complex', complex)
-
         assert isinstance(data, xr.DataArray), 'ERROR: data should be a DataArray'
 
         # wrap simplified single pair argument in a list
@@ -125,112 +115,16 @@ class Stack_phasediff(Stack_base):
         # return (intfs, corrs)
 
     def phasediff_singlelook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
+        from .Batch import BatchComplex
         kwarg['multilook'] = False
-        intfs, corrs = utils_xarray.apply_pol(self.dss, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        intfs, corrs = utils_xarray.apply_pol(BatchComplex(self), weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
         return BatchWrap(intfs), BatchUnit(corrs)
 
     def phasediff_multilook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
+        from .Batch import BatchComplex
         kwarg['multilook'] = True
-        intfs, corrs = utils_xarray.apply_pol(self.dss, weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
+        intfs, corrs = utils_xarray.apply_pol(BatchComplex(self), weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
         return BatchWrap(intfs), BatchUnit(corrs)
-
-    # def phasediff(self,
-    #                   pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame,
-    #                   datas:dict[str,xr.Dataset],
-    #                   weights:dict[str,xr.DataArray]|None=None,
-    #                   phases:dict[str,xr.DataArray]|None=None,
-    #                   wavelength:float|None=None,
-    #                   gaussian_threshold:float=0.5,
-    #                   multilook:bool=False,
-    #                   goldstein_window:int|list[int,int]|None=None,
-    #                   complex:bool=False,
-    #                   compute:bool=False,
-    #                   debug:bool=False
-    #                   ) -> dict[str,xr.Dataset]:
-    #     import xarray as xr
-    #     import numpy as np
-    #     import dask
-
-    #     assert isinstance(datas, dict), 'ERROR: datas should be a dict of xarray.Dataset'
-    #     assert isinstance(weights, dict) or weights is None, 'ERROR: weights should be a dict of xarray.DataArray'
-    #     assert isinstance(phases, dict) or phases is None, 'ERROR: phases should be a dict of xarray.DataArray'
-    #     # workaround for previous code
-
-    #     polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in next(iter(datas.values())).data_vars]
-    #     #print ('polarizations', polarizations)
-
-    #     results = []
-    #     for polarization in polarizations:
-    #         results_pol = [self._phasediff(pairs,
-    #                                    data=datas[k][polarization],
-    #                                    weight=weights[k] if weights is not None else None,
-    #                                    phase=phases[k] if phases is not None else None,
-    #                                    wavelength=wavelength,
-    #                                    gaussian_threshold=gaussian_threshold,
-    #                                    multilook=multilook,
-    #                                    goldstein_window=goldstein_window,
-    #                                    complex=complex,
-    #                                    debug=debug) for k in datas.keys()]
-    #         if compute:
-    #             progressbar(results_pol := dask.persist(*results_pol), desc=f'Computing {polarization} Phasediff...'.ljust(25))
-    #         results.append(results_pol)
-    #         del results_pol
-
-    #     # unpack the results
-    #     intfs = {k:xr.merge([results[pidx][idx][0] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
-    #     corrs = {k:xr.merge([results[pidx][idx][1] for pidx in range(len(polarizations))]) for idx,k in enumerate(datas.keys())}
-    #     return intfs, corrs
-
-    # # single-look interferogram processing has a limited set of arguments
-    # # resolution and coarsen are not applicable here
-    # def phasediff_singlelook(self,
-    #                             pairs,
-    #                             datas=None,
-    #                             weights=None,
-    #                             phases=None,
-    #                             wavelength=None,
-    #                             gaussian_threshold=0.5,
-    #                             goldstein_window=None,
-    #                             complex=False,
-    #                             compute=False,
-    #                             debug=False):
-    #     return self._phasediff(
-    #                             datas,
-    #                             weights,
-    #                             phases,
-    #                             pairs=pairs,
-    #                             wavelength=wavelength,
-    #                             gaussian_threshold=gaussian_threshold,
-    #                             multilook=False,
-    #                             goldstein_window=goldstein_window,
-    #                             complex=complex,
-    #                             compute=compute,
-    #                             debug=debug)
-
-    # # Goldstein filter requires square grid cells means 1:4 range multilooking.
-    # # For multilooking interferogram we can use square grid always using coarsen = (1,4)
-    # def phasediff_multilook(self,
-    #                           pairs,
-    #                           datas=None,
-    #                           weights=None,
-    #                           phases=None,
-    #                           wavelength=None,
-    #                           gaussian_threshold=0.5,
-    #                           goldstein_window=None,
-    #                           complex=False,
-    #                           compute=False,
-    #                           debug=False):
-    #     return self.phasediff(pairs=pairs,
-    #                             datas=datas,
-    #                             weights=weights,
-    #                             phases=phases,
-    #                             wavelength=wavelength,
-    #                             gaussian_threshold=gaussian_threshold,
-    #                             multilook=True,
-    #                             goldstein_window=goldstein_window,
-    #                             complex=complex,
-    #                             compute=compute,
-                                # debug=debug)
 
     @staticmethod
     def _interferogram(phase, debug=False):
@@ -339,6 +233,8 @@ class Stack_phasediff(Stack_base):
         import xarray as xr
         import numpy as np
         import dask
+        from numbers import Real
+        from collections.abc import Mapping
         import warnings
         # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
         warnings.filterwarnings(
@@ -361,8 +257,11 @@ class Stack_phasediff(Stack_base):
             # miss the processing
             return phase
         
-        if not isinstance(psize, (list, tuple)):
-            psize = (psize, psize)
+        if not isinstance(psize, (Real, Mapping)):
+            raise ValueError('ERROR: psize should be an integer, float, or dictionary')
+
+        if isinstance(psize, Real):
+            psize = {'y': psize, 'x': psize}
 
         def apply_pspec(data, alpha):
             # NaN is allowed value
@@ -372,7 +271,7 @@ class Stack_phasediff(Stack_base):
             return data
 
         def make_wgt(psize):
-            nyp, nxp = psize
+            nyp, nxp = psize['y'], psize['x']
             # Create arrays of horizontal and vertical weights
             wx = 1.0 - np.abs(np.arange(nxp // 2) - (nxp / 2.0 - 1.0)) / (nxp / 2.0 - 1.0)
             wy = 1.0 - np.abs(np.arange(nyp // 2) - (nyp / 2.0 - 1.0)) / (nyp / 2.0 - 1.0)
@@ -396,9 +295,9 @@ class Stack_phasediff(Stack_base):
             """
             # Calculate alpha
             alpha = 1 - (wgt * corr).sum() / wgt.sum()
-            data = np.fft.fft2(data, s=psize)
+            data = np.fft.fft2(data, s=(psize['y'], psize['x']))
             data = apply_pspec(data, alpha)
-            data = np.fft.ifft2(data, s=psize)
+            data = np.fft.ifft2(data, s=(psize['y'], psize['x']))
             return wgt * data
 
         def apply_goldstein_filter(data, corr, psize, wgt_matrix):
@@ -410,11 +309,11 @@ class Stack_phasediff(Stack_base):
             # Create the weight matrix
             #wgt_matrix = make_wgt(psize)
             # Iterate over windows of the data
-            for i in range(0, data.shape[0] - psize[0], psize[0] // 2):
-                for j in range(0, data.shape[1] - psize[1], psize[1] // 2):
+            for i in range(0, data.shape[0] - psize['y'], psize['y'] // 2):
+                for j in range(0, data.shape[1] - psize['x'], psize['x'] // 2):
                     # Create proocessing windows
-                    data_window = data[i:i+psize[0], j:j+psize[1]]
-                    corr_window = corr[i:i+psize[0], j:j+psize[1]]
+                    data_window = data[i:i+psize['y'], j:j+psize['x']]
+                    corr_window = corr[i:i+psize['y'], j:j+psize['x']]
                     # do not process NODATA areas filled with zeros
                     fraction_valid = np.count_nonzero(data_window != 0) / data_window.size
                     if fraction_valid >= 0.5:
@@ -422,8 +321,8 @@ class Stack_phasediff(Stack_base):
                         # Apply the filter to the window
                         filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
                         # Add the result to the output array
-                        slice_i = slice(i, min(i + psize[0], out.shape[0]))
-                        slice_j = slice(j, min(j + psize[1], out.shape[1]))
+                        slice_i = slice(i, min(i + psize['y'], out.shape[0]))
+                        slice_j = slice(j, min(j + psize['x'], out.shape[1]))
                         out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
             return out
 
@@ -443,7 +342,7 @@ class Stack_phasediff(Stack_base):
             block = dask.array.map_overlap(apply_goldstein_filter,
                                            (phase[ind] if stackvar is not None else phase).fillna(0).data,
                                            (corr[ind]  if stackvar is not None else corr ).fillna(0).data,
-                                           depth=(psize[0] // 2 + 2, psize[1] // 2 + 2),
+                                           depth=(psize['y'] // 2 + 2, psize['x'] // 2 + 2),
                                            dtype=np.complex64, 
                                            meta=np.array(()),
                                            psize=psize,

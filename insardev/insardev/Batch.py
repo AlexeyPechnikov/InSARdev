@@ -157,7 +157,17 @@ class BatchWrap(BatchCore):
             out[key] = agg_result.astype('float32')
             
         #print ('wrap _agg self.chunks', self.chunks)
-        return type(self)(out).chunk(self.chunks)
+        #return type(self)(out).chunk(self.chunks)
+        print ('wrap _agg self.chunks', self.chunks)
+        # filter out collapsed dimensions
+        sample = next(iter(out.values()), None)
+        dims = (sample.dims or []) if hasattr(sample, 'dims') else []
+        chunks = {d: size for d, size in self.chunks.items() if d in dims}
+        print ('wrap chunks', chunks)
+        result = type(self)(out)
+        if chunks:
+            return result.chunk(chunks)
+        return result
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """

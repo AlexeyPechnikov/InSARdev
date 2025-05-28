@@ -10,13 +10,16 @@
 # ----------------------------------------------------------------------------
 from __future__ import annotations
 from . import utils_io,  utils_xarray
-from typing import TYPE_CHECKING
 import operator
 import numpy as np
 import xarray as xr
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
     from .Stack import Stack
+    import rasterio as rio
+    import pandas as pd
     import matplotlib
 
 class BatchCore(dict):
@@ -39,9 +42,10 @@ class BatchCore(dict):
         import numpy as np
         return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
-    def __init__(self, mapping: dict[str, xr.Dataset] | Stack | BatchComplex | None = None):
+    def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
         from .Batch import BatchComplex
+        #print('BatchCore __init__', 0 if mapping is None else len(mapping))
         if isinstance(mapping, (Stack, BatchComplex)):
             real_dict = {}
             for key, ds in mapping.items():
@@ -49,7 +53,7 @@ class BatchCore(dict):
                 real_vars = [v for v in ds.data_vars if ds[v].dtype.kind != 'c' and tuple(ds[v].dims) == ('y', 'x')]
                 real_dict[key] = ds[real_vars]
             mapping = real_dict
-        dict.__init__(self, mapping or {})
+        super().__init__(mapping or {})
 
     # def __repr__(self):
     #     if not self:
@@ -115,6 +119,22 @@ class BatchCore(dict):
             f"({keys[0]} … {keys[-1]})"
         )
 
+    def __or__(self, other):
+        # Batch | Mapping
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        merged = dict(self)
+        merged.update(other)
+        return type(self)(merged)
+
+    def __ror__(self, other):
+        # Mapping | Batch
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        merged = dict(other)
+        merged.update(self)
+        return type(self)(merged)
+
     @property
     def data(self) -> xr.Dataset:
         """
@@ -144,6 +164,10 @@ class BatchCore(dict):
     #         return (1, -1, -1)
     #     else:
     #         return tuple(chunks[0] for chunks in sample[data_var].chunks)
+
+    @property
+    def crs(self) -> rio.crs.CRS:
+        return next(iter(self.values())).rio.crs
 
     @property
     def chunks(self) -> dict[str, int]:
@@ -529,12 +553,12 @@ class BatchCore(dict):
         """
         import numpy as np
 
-        # === NEW: if they passed a dict as the first argument, treat it like keyword indexers ===
+        # dict as a keyword indexers
         if isinstance(indices, dict):
             indexers = indices
             indices = None
 
-        # xarray‐style keyword isel (including now dict-via-positional)
+        # xarray‐style keyword isel (including dict-via-positional)
         if indexers:
             return type(self)({
                 k: ds.isel(**indexers)
@@ -544,7 +568,8 @@ class BatchCore(dict):
         # fallback: positional isel over the batch keys (old behavior)
         keys = list(self.keys())
         if indices is None:
-            return type(self)(dict(self))  # no selection
+            # no selection, cast to dict to prevent special logic in the class constructor
+            return type(self)(dict(self))
         if isinstance(indices, (int, np.integer)):
             idxs = [indices]
         elif isinstance(indices, slice):
@@ -556,6 +581,9 @@ class BatchCore(dict):
             keys[i]: self[keys[i]]
             for i in idxs
         })
+
+    def expand_dims(self, *args, **kw):
+        return type(self)({k: ds.expand_dims(*args, **kw) for k, ds in self.items()})
 
     def drop_vars(self, names):
         """Return a new Batch with those data-vars removed from each dataset."""
@@ -600,8 +628,16 @@ class BatchCore(dict):
             else:
                 out[key] = fn(**kwargs)
 
-        print ('_agg self.chunks', self.chunks)
-        return type(self)(out).chunk(self.chunks)
+        #print ('_agg self.chunks', self.chunks)
+        # filter out collapsed dimensions
+        sample = next(iter(out.values()), None)
+        dims = (sample.dims or []) if hasattr(sample, 'dims') else []
+        chunks = {d: size for d, size in self.chunks.items() if d in dims}
+        #print ('chunks', chunks)
+        result = type(self)(out)
+        if chunks:
+            return result.chunk(chunks)
+        return result
 
     def mean(self, dim=None, **kwargs):
         return self._agg("mean", dim=dim, **kwargs)
@@ -684,6 +720,12 @@ class BatchCore(dict):
         from insardev_toolkit import progressbar
         progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
         return type(self)(result)
+    
+    def persist(self):
+        return type(self)({
+            k: ds.chunk(ds.chunks).persist()
+            for k, ds in self.items()
+        })
 
     @property
     def spacing(self) -> tuple[float, float]:
@@ -775,8 +817,6 @@ class BatchCore(dict):
         datas = [self[k][polarization] for k in self.keys()]
 
         # process list of dataarrays with single polarization
-        y_chunksize = datas[0].chunks[-2][0]
-        x_chunksize = datas[0].chunks[-1][0]
         # define unified grid
         y_min = min(ds.y.min().item() for ds in datas)
         y_max = max(ds.y.max().item() for ds in datas)
@@ -799,52 +839,67 @@ class BatchCore(dict):
         extents = [(float(da.y.min()), float(da.y.max()), float(da.x.min()), float(da.x.max())) for da in datas]
         
         # use outer variable datas
-        def block_dask(stack, y_chunk, x_chunk, wrap):
+        def block_dask(stack, y_chunk, x_chunk, wrap, fill_dtype):
+            #fill_dtype = datas[0].dtype
+            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+
+            # TEST: return empty block
+            #fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+            #return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
+
             #print ('pair', pair)
             #print ('concat: block_dask', stackvar, stack)
             # extract extent of the current chunk once
             ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
             xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
             # select all datasets overlapping with the current chunk
-            das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute(num_workers=1)
-                         for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
-                         if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
-            #print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
-            
-            fill_dtype = datas[0].dtype
-            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+            # das_slice = [da.isel({stackvar: stackidx}).sel({'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)}).compute()
+            #              for da, (ymin, ymax, xmin, xmax) in zip(datas, extents)
+            #              if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
+            # print ('concat: das_slice', len(das_slice), [da.shape for da in das_slice])
+            das_slice = [(idx, {'y': slice(ymin0, ymax0), 'x': slice(xmin0, xmax0)})
+                           for idx, (ymin, ymax, xmin, xmax) in enumerate(extents)
+                           if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin]
             if len(das_slice) == 0:
                 # return empty block
                 return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
-            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
-            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice]
+            das_block = [datas[idx].isel({stackvar: stackidx}).sel(slice) for idx, slice in das_slice]
             del das_slice
+            das_block = dask.compute(*das_block)
+            print ('concat: das_block', len(das_block))
+
+            # TEST: return empty block
+            #return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
+            
+            #das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_slice if da.size > 0]
+            das_block = [da.reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False) for da in das_block]
+            
             if len(das_block) == 1:
-                # return single block as is
-                return das_block[0].values
+               # return single block as is
+               return das_block[0].values
 
             if not dissolve:
-                #print ('wrap None')
+                print ('wrap None')
                 # ffill does not work correct on complex data and per-component ffill is faster
                 # the magic trick is to use sorting to ensure burst overpapping order
                 # bursts ends should be overlapped by bursts starts
-                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+                das_block_concat = xr.concat(das_block, dim='stack_dim', join='inner')
                 if np.issubdtype(das_block_concat.dtype, np.complexfloating):
-                    return (das_block_concat.real.ffill("stack_dim").isel(stack_dim=-1)
-                            + 1j*das_block_concat.imag.ffill("stack_dim").isel(stack_dim=-1)).values
+                    return (das_block_concat.real.ffill('stack_dim').isel(stack_dim=-1)
+                            + 1j*das_block_concat.imag.ffill('stack_dim').isel(stack_dim=-1)).values
                 else:
-                    return das_block_concat.ffill("stack_dim").isel(stack_dim=-1).values
+                    return das_block_concat.ffill('stack_dim').isel(stack_dim=-1).values
             elif wrap == True:
-                #print ('wrap True')
+                print ('wrap True')
                 # calculate circular mean for interferogram data
                 das_block_concat = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim')
                 block_complex = das_block_concat.mean('stack_dim', skipna=True).values
                 return np.arctan2(block_complex.imag, block_complex.real)
             elif wrap == False:
-                #print ('wrap False')
-                das_block_concat = xr.concat(das_block, dim="stack_dim", join="inner")
+                print ('wrap False')
+                das_block_concat = xr.concat(das_block, dim='stack_dim', join='outer')
                 # calculate arithmetic mean for phase and correlation data
-                return das_block_concat.mean('stack_dim', skipna=True).values
+                return das_block_concat.mean('stack_dim', skipna=True).reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False).values
             else:
                 raise ValueError(f'ERROR: wrap is not a boolean or None: {wrap}')
 
@@ -852,16 +907,23 @@ class BatchCore(dict):
         import warnings
         from dask.array.core import PerformanceWarning
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=PerformanceWarning)
-            # rechunk data for expected usage
+            warnings.simplefilter('ignore', category=PerformanceWarning)
+            # rechunk data for expected usage using Dask machinery
+            #print('Default target chunk size:', dask.config.get('array.chunk-size'))
+            # control chunk size using Dask config:
+            # with dask.config.set({'array.chunk-size': '256MiB'}):
+            # ....to_dataset()
+            chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=datas[0].dtype)
+            print ('chunks', chunks)
             data = dask.array.blockwise(
                 block_dask,
                 'zyx',
                 stackidx.chunk(1), 'z',
-                ys.chunk({'y': y_chunksize}), 'y',
-                xs.chunk({'x': x_chunksize}), 'x',
+                ys.chunk({'y': chunks[0]}), 'y',
+                xs.chunk({'x': chunks[1]}), 'x',
                 meta = np.empty((0, 0, 0), dtype=datas[0].dtype),
-                wrap=wrap
+                wrap=wrap,
+                fill_dtype=datas[0].dtype
             )
         da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
             .rename(datas[0].name)\
