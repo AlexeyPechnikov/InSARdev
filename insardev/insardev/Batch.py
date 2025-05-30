@@ -23,6 +23,7 @@ class Batch(BatchCore):
         from .Stack import Stack
         # pick off only the real 2D vars from Stack
         if isinstance(mapping, Stack):
+            #print ('Batch __init__: Stack')
             real_dict: dict[str, xr.Dataset] = {}
             for key, ds in mapping.items():
                 # keep only non-complex data_vars that live on the ('y','x') grid
@@ -33,7 +34,7 @@ class Batch(BatchCore):
                 ]
                 real_dict[key] = ds[real_vars]
             mapping = real_dict
-
+        #print('Batch __init__ mapping', mapping or {}, '\n')
         # delegate to your base class for the actual init
         super().__init__(mapping or {})
     
@@ -59,6 +60,10 @@ class BatchWrap(BatchCore):
         if isinstance(mapping, (Stack, BatchComplex)):
             raise ValueError(f'ERROR: BatchWrap does not support Stack or BatchComplex objects.')
         dict.__init__(self, mapping or {})
+
+    @staticmethod
+    def wrap(data):
+        return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
     # def _agg(self, name: str, dim=None, **kwargs):
     #     """
@@ -88,6 +93,27 @@ class BatchWrap(BatchCore):
     #         out[key] = np.arctan2(agg_result.imag, agg_result.real).astype(np.float32)
             
     #     return type(self)(out)
+
+    def __add__(self, other: Batch):
+        keys = self.keys()
+        #& other.keys()
+        return type(self)({k: self.wrap(self[k] + other[k] if k in other else self[k]) for k in keys})
+
+    def __sub__(self, other: Batch):
+        keys = self.keys()
+        return type(self)({k: self.wrap(self[k] - other[k] if k in other else self[k]) for k in keys})
+
+    def __mul__(self, other: Batch):
+        keys = self.keys()
+        return type(self)({k: self.wrap(self[k] * other[k] if k in other else self[k]) for k in keys})
+
+    def __rmul__(self, other):
+        # scalar * batch  → map scalar * each dataset
+        return type(self)({k: self.wrap(other * v) for k, v in self.items()})
+
+    def __truediv__(self, other: Batch):
+        keys = self.keys()
+        return type(self)({k: self.wrap(self[k] / other[k] if k in other else self[k]) for k in keys})
 
     def sin(self, **kwargs) -> Batch:
         """
@@ -215,12 +241,16 @@ class BatchWrap(BatchCore):
         cmap = 'gist_rainbow_r',
         alpha = 0.5,
         caption='Phase, [rad]',
+        vmin=-np.pi,
+        vmax=np.pi,
         *args,
         **kwargs
     ):
         kwargs["cmap"] = cmap
         kwargs["alpha"] = alpha
         kwargs["caption"] = caption
+        kwargs["vmin"] = vmin
+        kwargs["vmax"] = vmax
         return super().plot(*args, **kwargs)
 
     # def gaussian(self, *args, **kwargs):
@@ -295,6 +325,8 @@ class BatchUnit(BatchCore):
         self,
         cmap = 'auto',
         caption='Correlation',
+        vmin=0,
+        vmax=1,
         *args,
         **kwargs
     ):
@@ -306,7 +338,63 @@ class BatchUnit(BatchCore):
             )
         kwargs["cmap"] = cmap
         kwargs["caption"] = caption
+        kwargs["vmin"] = vmin
+        kwargs["vmax"] = vmax
         return super().plot(*args, **kwargs)
+
+    def goldstein(self, corr: 'BatchUnit', psize: int | dict[str, int] = 32, debug: bool = False) -> BatchComplex:
+        """
+        Apply Goldstein adaptive filter to each dataset in the batch.
+        
+        Parameters
+        ----------
+        corr : BatchUnit
+            Batch of correlation values to use for filtering.
+        psize : int or dict[str, int], optional
+            Patch size for the filter. If int, same size used for both dimensions.
+            If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
+        debug : bool, optional
+            Print debug information. Default is False.
+            
+        Returns
+        -------
+        BatchComplex
+            New batch with filtered phase values
+        """
+        # Check if corr is a BatchUnit by checking its class name
+        if corr.__class__.__name__ != 'BatchUnit':
+            raise ValueError("corr must be a BatchUnit")
+            
+        if set(corr.keys()) != set(self.keys()):
+            raise ValueError("corr must have the same keys as self")
+            
+        # Apply Goldstein filter to each dataset
+        result = {}
+        for k in self.keys():
+            ds = self[k]
+            filtered_vars = {}
+            
+            # Process each complex data variable in the dataset
+            for var_name, var_data in ds.data_vars.items():
+                if var_data.dtype.kind == 'c':  # Only process complex variables
+                    filtered_data = self._goldstein(
+                        phase=var_data,
+                        corr=corr[k],
+                        psize=psize,
+                        debug=debug
+                    )
+                    filtered_vars[var_name] = filtered_data
+                else:
+                    filtered_vars[var_name] = var_data
+            
+            # Create a new dataset with the filtered variables
+            result[k] = xr.Dataset(
+                filtered_vars,
+                coords=ds.coords,
+                attrs=ds.attrs
+            )
+            
+        return type(self)(result)
 
 class BatchComplex(BatchCore):
     """
@@ -326,6 +414,7 @@ class BatchComplex(BatchCore):
                 complex_dict[key] = ds[complex_vars]
             mapping = complex_dict
 
+        #print('BatchComplex __init__ mapping', mapping or {}, '\n')
         # delegate to your base class for the actual init
         super().__init__(mapping or {})
 
@@ -353,6 +442,7 @@ class BatchComplex(BatchCore):
         return Batch(out)
 
     def abs(self, **kwargs):
+        print ('BatchComplex abs')
         return Batch(self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs))
 
     def power(self, **kwargs):
@@ -408,3 +498,193 @@ class BatchComplex(BatchCore):
             "  • use `.angle()` to get wrapped phase → BatchWrap\n"
             "  • use `.abs()` or `.power()` to get magnitude → Batch"
         )
+
+    @staticmethod
+    def _goldstein(phase, corr, psize=32, debug=False):
+        import xarray as xr
+        import numpy as np
+        import dask
+        from numbers import Real
+        from collections.abc import Mapping
+        import warnings
+        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
+        warnings.filterwarnings(
+            'ignore',
+            category=RuntimeWarning,
+            module=r'dask\._task_spec'
+        )
+        # …and just in case you want to match by message too:
+        warnings.filterwarnings(
+            'ignore',
+            message='invalid value encountered in divide',
+            category=RuntimeWarning,
+            module=r'dask\._task_spec'
+        )
+
+        if debug:
+            print ('DEBUG: goldstein')
+
+        if psize is None:
+            # miss the processing
+            return phase
+        
+        if not isinstance(psize, (Real, Mapping)):
+            raise ValueError('ERROR: psize should be an integer, float, or dictionary')
+
+        if isinstance(psize, Real):
+            psize = {'y': psize, 'x': psize}
+
+        # Handle Dataset objects by extracting the first DataArray
+        if isinstance(phase, xr.Dataset):
+            phase = next(iter(phase.data_vars.values()))
+        if isinstance(corr, xr.Dataset):
+            corr = next(iter(corr.data_vars.values()))
+
+        def apply_pspec(data, alpha):
+            # NaN is allowed value
+            assert not(alpha < 0), f'Invalid parameter value {alpha} < 0'
+            wgt = np.power(np.abs(data)**2, alpha / 2)
+            data = wgt * data
+            return data
+
+        def make_wgt(psize):
+            nyp, nxp = psize['y'], psize['x']
+            # Create arrays of horizontal and vertical weights
+            wx = 1.0 - np.abs(np.arange(nxp // 2) - (nxp / 2.0 - 1.0)) / (nxp / 2.0 - 1.0)
+            wy = 1.0 - np.abs(np.arange(nyp // 2) - (nyp / 2.0 - 1.0)) / (nyp / 2.0 - 1.0)
+            # Compute the outer product of wx and wy to create the top-left quadrant of the weight matrix
+            quadrant = np.outer(wy, wx)
+            # Create a full weight matrix by mirroring the quadrant along both axes
+            wgt = np.block([[quadrant, np.flip(quadrant, axis=1)],
+                            [np.flip(quadrant, axis=0), np.flip(np.flip(quadrant, axis=0), axis=1)]])
+            return wgt
+
+        def patch_goldstein_filter(data, corr, wgt, psize):
+            """
+            Apply the Goldstein adaptive filter to the given data.
+
+            Args:
+                data: 2D numpy array of complex values representing the data to be filtered.
+                corr: 2D numpy array of correlation values. Must have the same shape as `data`.
+
+            Returns:
+                2D numpy array of filtered data.
+            """
+            # Calculate alpha
+            alpha = 1 - (wgt * corr).sum() / wgt.sum()
+            data = np.fft.fft2(data, s=(psize['y'], psize['x']))
+            data = apply_pspec(data, alpha)
+            data = np.fft.ifft2(data, s=(psize['y'], psize['x']))
+            return wgt * data
+
+        def apply_goldstein_filter(data, corr, psize, wgt_matrix):
+            # Create an empty array for the output
+            out = np.zeros(data.shape, dtype=np.complex64)
+            # ignore processing for empty chunks 
+            if np.all(np.isnan(data)):
+                return out
+            # Create the weight matrix
+            #wgt_matrix = make_wgt(psize)
+            # Iterate over windows of the data
+            for i in range(0, data.shape[0] - psize['y'], psize['y'] // 2):
+                for j in range(0, data.shape[1] - psize['x'], psize['x'] // 2):
+                    # Create proocessing windows
+                    data_window = data[i:i+psize['y'], j:j+psize['x']]
+                    corr_window = corr[i:i+psize['y'], j:j+psize['x']]
+                    # do not process NODATA areas filled with zeros
+                    fraction_valid = np.count_nonzero(data_window != 0) / data_window.size
+                    if fraction_valid >= 0.5:
+                        wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
+                        # Apply the filter to the window
+                        filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
+                        # Add the result to the output array
+                        slice_i = slice(i, min(i + psize['y'], out.shape[0]))
+                        slice_j = slice(j, min(j + psize['x'], out.shape[1]))
+                        out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
+            return out
+
+        assert phase.shape == corr.shape, f'ERROR: phase and correlation variables have different shape \
+                                          ({phase.shape} vs {corr.shape})'
+
+        stack =[]
+        for ind in range(len(phase)):
+            # Apply function with overlap; psize//2 overlap is not enough (some empty lines produced)
+            # use complex data and real correlation
+            # fill NaN values in correlation by zeroes to prevent empty output blocks
+            block = dask.array.map_overlap(apply_goldstein_filter,
+                                           phase[ind].fillna(0).data,
+                                           corr[ind].fillna(0).data,
+                                           depth=(psize['y'] // 2 + 2, psize['x'] // 2 + 2),
+                                           dtype=np.complex64, 
+                                           meta=np.array(()),
+                                           psize=psize,
+                                           wgt_matrix = make_wgt(psize))
+            # Calculate the phase
+            stack.append(block)
+            del block
+
+        # Create DataArray with proper coordinates and attributes
+        ds = xr.DataArray(
+            dask.array.stack(stack),
+            coords=phase.coords,
+            dims=phase.dims,
+            name=phase.name,
+            attrs=phase.attrs
+        )
+        del stack
+        # replace zeros produces in NODATA areas
+        return ds.where(np.isfinite(phase))
+
+    def goldstein(self, corr: BatchUnit, psize: int | dict[str, int] = 32, debug: bool = False):
+        """
+        Apply Goldstein adaptive filter to each dataset in the batch.
+        
+        Parameters
+        ----------
+        corr : BatchUnit
+            Batch of correlation values to use for filtering.
+        psize : int or dict[str, int], optional
+            Patch size for the filter. If int, same size used for both dimensions.
+            If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
+        debug : bool, optional
+            Print debug information. Default is False.
+            
+        Returns
+        -------
+        BatchComplex
+            New batch with filtered phase values
+        """
+        # Check if correlation is a BatchUnit by checking its class name
+        if corr.__class__.__name__ != 'BatchUnit':
+            raise ValueError("corr must be a BatchUnit")
+            
+        if set(corr.keys()) != set(self.keys()):
+            raise ValueError("corr must have the same keys as self")
+            
+        # Apply Goldstein filter to each dataset
+        result = {}
+        for k in self.keys():
+            ds = self[k]
+            filtered_vars = {}
+            
+            # Process each complex data variable in the dataset
+            for var_name, var_data in ds.data_vars.items():
+                if var_data.dtype.kind == 'c':  # Only process complex variables
+                    filtered_data = self._goldstein(
+                        phase=var_data,
+                        corr=corr[k],
+                        psize=psize,
+                        debug=debug
+                    )
+                    filtered_vars[var_name] = filtered_data
+                else:
+                    filtered_vars[var_name] = var_data
+            
+            # Create a new dataset with the filtered variables
+            result[k] = xr.Dataset(
+                filtered_vars,
+                coords=ds.coords,
+                attrs=ds.attrs
+            )
+            
+        return type(self)(result)

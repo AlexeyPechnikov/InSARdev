@@ -191,13 +191,19 @@ class Stack(Stack_plot, BatchCore):
             ds['data'] = (ds.re + 1j*ds.im).astype(np.complex64)
             if not debug:
                 del ds['re'], ds['im']
-            date = pd.to_datetime(ds['startTime'].item())
-            return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
+            #date = pd.to_datetime(ds['startTime'].item())
+            #date64s = np.array([np.datetime64(date)], dtype="datetime64[s]")
+            #return ds.expand_dims({'date': np.array([date.date()], dtype='U10')})
+            #return ds.expand_dims({'date': date64s})
+            return ds.expand_dims(
+                date=[np.datetime64(ds["startTime"].item(), 's')]
+            )
 
         def _bursts_transform_preprocess(bursts, transform, chunksize):
             import xarray as xr
             import numpy as np
-
+            #print ('_bursts_transform_preprocess')
+            
             # in case of multiple polarizations, merge them into a single dataset
             polarizations = np.unique(bursts.polarization)
             if len(polarizations) > 1:
@@ -230,6 +236,7 @@ class Stack(Stack_plot, BatchCore):
             """
             import xarray as xr
             import numpy as np
+            #print ('bursts_transform_preprocess')
 
             polarizations = np.unique([ds.polarization for ds in dss])
             #print ('polarizations', polarizations)
@@ -239,6 +246,7 @@ class Stack(Stack_plot, BatchCore):
             for polarization in polarizations:
                 data = [ds for ds in dss if ds.polarization==polarization]
                 data = xr.concat(data, dim='date', combine_attrs='no_conflicts').rename({'data': polarization})
+                #data = xr.concat(data, dim='date', combine_attrs='no_conflicts').rename({'data': polarization}).sortby('date')
                 # cannot combine in a single value VV and VH polarizations and corresponding burst names
                 data.burst.values = [v.replace(polarization, 'XX') for v in data.burst.values]
                 del data['polarization']

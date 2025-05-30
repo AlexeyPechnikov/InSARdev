@@ -37,22 +37,35 @@ class BatchCore(dict):
     intfs60_detrend.isel(slice(1, None))
     """
 
-    @staticmethod
-    def wrap(data):
-        import numpy as np
-        return np.mod(data + np.pi, 2 * np.pi) - np.pi
+    class CoordCollection:
+        def __init__(self, ds):
+            self._ds = ds
+        def __getitem__(self, key):
+            return self._ds.coords[key]
+        def __contains__(self, key):
+            return key in self._ds.coords
+        def get(self, key, default=None):
+            return self._ds.coords.get(key, default)
+        def keys(self):
+            return self._ds.coords.keys()
+        def values(self):
+            return self._ds.coords.values()
+        def items(self):
+            return self._ds.coords.items()
 
     def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
-        from .Batch import BatchComplex
+        from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
         #print('BatchCore __init__', 0 if mapping is None else len(mapping))
-        if isinstance(mapping, (Stack, BatchComplex)):
+        # Batch/etc. initialization won't filter out the data when it's a child class of BatchCore
+        if isinstance(mapping, (Stack, BatchComplex)) and not isinstance(self, (Batch, BatchWrap, BatchUnit, BatchComplex)):
             real_dict = {}
             for key, ds in mapping.items():
                 # pick only the data_vars whose dtype is not complex
                 real_vars = [v for v in ds.data_vars if ds[v].dtype.kind != 'c' and tuple(ds[v].dims) == ('y', 'x')]
                 real_dict[key] = ds[real_vars]
             mapping = real_dict
+        #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
     # def __repr__(self):
@@ -192,38 +205,59 @@ class BatchCore(dict):
         return {dim: sizes[0] if len(sizes) > 1 else (1 if sizes[0] == 1 else -1) for dim, sizes in zip(sample[data_var].dims, chunks)}
 
     def __getitem__(self, key):
-        # like batch[['azi','rng']]
+        """
+        Access coordinates, data variables, or datasets in the batch.
+        
+        Parameters
+        ----------
+        key : str, list, or tuple
+            If str: access coordinate or data variable across all datasets
+            If list/tuple: select subset of datasets
+            
+        Returns
+        -------
+        Batch
+            Batch of the requested coordinate/variable or selected datasets
+        """
+        # Handle list/tuple keys for dataset selection
         if isinstance(key, (list, tuple)):
             return type(self)({
                 burst_id: ds[key]
                 for burst_id, ds in self.items()
             })
-        # otherwise fall back to dictionary lookup: batch['033_069722_IW3']
-        return super().__getitem__(key)
+            
+        # Try to access as a dataset key first
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            # If not a dataset key, try to access as coordinate/variable
+            return type(self)({
+                k: ds[key] if not isinstance(ds, self.CoordCollection) else ds._ds.coords[key]
+                for k, ds in self.items()
+                if (isinstance(ds, self.CoordCollection) and key in ds._ds.coords) or 
+                   (not isinstance(ds, self.CoordCollection) and (key in ds.coords or key in ds.data_vars))
+            })
 
     def __add__(self, other: Batch):
         keys = self.keys()
         #& other.keys()
-        return type(self)({k: self.wrap(self[k] + other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
 
     def __sub__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] - other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: (self[k] - other[k] if k in other else self[k]) for k in keys})
 
     def __mul__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] * other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: (self[k] * other[k] if k in other else self[k]) for k in keys})
 
     def __rmul__(self, other):
         # scalar * batch  → map scalar * each dataset
-        return type(self)({
-            k: other * v
-            for k, v in self.items()
-        })
+        return type(self)({k: other * v for k, v in self.items()})
 
     def __truediv__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] / other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: (self[k] / other[k] if k in other else self[k]) for k in keys})
     
     def _binop(self, other, op):
         """
@@ -472,7 +506,7 @@ class BatchCore(dict):
             # select all records for the current burst group
             records = keys[keys.index.get_level_values(0)==id]
             # filter dates
-            dates = records.startTime.dt.date.values.astype(str)
+            dates = records.startTime.values.astype(str)
             ds = self[id].sel(date=dates)
             # filter polarizations
             pols = records.polarization.unique()
@@ -581,6 +615,122 @@ class BatchCore(dict):
             keys[i]: self[keys[i]]
             for i in idxs
         })
+    
+    @property
+    def coords(self):
+        """Return a Batch of coordinate collections for each dataset."""
+        return type(self)({k: self.CoordCollection(ds) for k, ds in self.items()})
+
+    def assign_coords(self, coords=None, **coords_kwargs):
+        """
+        Assign new coordinates to each dataset in the batch.
+        Works like xarray.Dataset.assign_coords but handles batch operations.
+        
+        Parameters
+        ----------
+        coords : dict-like or Batch, optional
+            Dictionary of coordinates to assign or Batch of coordinates
+        **coords_kwargs : optional
+            Coordinates to assign, specified as keyword arguments
+        
+        Returns
+        -------
+        Batch
+            New batch with assigned coordinates
+        """
+        if coords is None:
+            coords = {}
+        coords = dict(coords, **coords_kwargs)
+        
+        def process_coord(coord):
+            if not isinstance(coord, tuple) or len(coord) != 2:
+                return coord
+                
+            dims, data = coord
+            
+            # Handle DataArray directly
+            if isinstance(data, xr.DataArray):
+                values = data.values
+                return xr.DataArray(values if data.ndim > 0 else np.array([values]), dims=dims)
+            
+            # Handle BatchComplex
+            if isinstance(data, type(self)):
+                first_ds = next(iter(data.values()))
+                if isinstance(first_ds, xr.DataArray):
+                    values = first_ds.values
+                    return xr.DataArray(values if first_ds.ndim > 0 else np.array([values]), dims=dims)
+                elif isinstance(first_ds, xr.Dataset):
+                    coord_name = first_ds.dims[0]
+                    values = first_ds.coords[coord_name].values
+                    return xr.DataArray(values if not np.isscalar(values) else np.array([values]), dims=dims)
+            
+            # Handle objects with values attribute
+            if hasattr(data, 'values'):
+                values = data.values() if callable(data.values) else data.values
+                if hasattr(values, '__iter__'):
+                    values = next(iter(values))
+                    if isinstance(values, xr.DataArray):
+                        values = values.values
+                values = np.asarray(values)
+                return xr.DataArray(values if values.ndim > 0 else np.array([values]), dims=dims)
+            
+            # Handle array-like inputs
+            values = np.asarray(data)
+            return xr.DataArray(values if values.ndim > 0 else np.array([values]), dims=dims)
+        
+        # Get target dimension size from first dataset
+        first_ds = next(iter(self.values()))
+        target_size = first_ds.dims[list(coords.values())[0][0]]
+        
+        # Process coordinates
+        processed_coords = {name: process_coord(coord) for name, coord in coords.items()}
+        
+        # Ensure consistent dimension sizes
+        for name, coord in processed_coords.items():
+            if coord.size != target_size:
+                if coord.size == 1 and target_size == 2:
+                    processed_coords[name] = xr.DataArray([coord.values[0], coord.values[0]], dims=coord.dims)
+                else:
+                    raise ValueError(f"Coordinate {name} has size {coord.size} but expected size {target_size}")
+        
+        return type(self)({
+            k: ds.assign_coords(processed_coords)
+            for k, ds in self.items()
+        })
+
+    def set_index(self, indexes=None, **indexes_kwargs):
+        """
+        Set Dataset index(es) for each dataset in the batch.
+        Works like xarray.Dataset.set_index but handles batch operations.
+        
+        Parameters
+        ----------
+        indexes : dict-like or Batch, optional
+            Dictionary of indexes to set or Batch of indexes
+        **indexes_kwargs : optional
+            Indexes to set, specified as keyword arguments
+        
+        Returns
+        -------
+        Batch
+            New batch with set indexes
+        """
+        if indexes is None:
+            indexes = {}
+        indexes = dict(indexes, **indexes_kwargs)
+        
+        # Handle both dict and Batch inputs
+        if isinstance(indexes, type(self)):
+            return type(self)({
+                k: ds.set_index(indexes[k])
+                for k, ds in self.items()
+                if k in indexes
+            })
+        else:
+            return type(self)({
+                k: ds.set_index(indexes)
+                for k, ds in self.items()
+            })
 
     def expand_dims(self, *args, **kw):
         return type(self)({k: ds.expand_dims(*args, **kw) for k, ds in self.items()})
@@ -596,6 +746,9 @@ class BatchCore(dict):
 
     def rename_vars(self, **kw):
         return type(self)({k: ds.rename_vars(**kw) for k, ds in self.items()})
+    
+    def rename(self, **kw):
+        return type(self)({k: ds.rename(**kw) for k, ds in self.items()})
 
     def reindex(self, **kw):
         return type(self)({k: ds.reindex(**kw) for k, ds in self.items()})
@@ -1134,4 +1287,3 @@ class BatchCore(dict):
             })
 
         return type(self)(out)
-

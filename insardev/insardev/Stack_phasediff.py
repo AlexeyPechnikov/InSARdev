@@ -63,11 +63,11 @@ class Stack_phasediff(Stack_base):
         
         # data = data[polarization]
 
-        if weight is not None:
-            # unify shape of data and weight
-            data = data.reindex_like(weight, fill_value=np.nan)
+        #if weight is not None:
+        #    # unify shape of data and weight
+        #    data = data.reindex_like(weight, fill_value=np.nan)
         intensity = np.square(np.abs(data))
-        # Gaussian filtering with cut-off wavelength and optional multilooking on amplitudes
+        # Gaussian filtering with cut-off wavelength on amplitudes
         intensity_look = self._multilooking(intensity, weight=weight,
                                             wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
         del intensity
@@ -75,11 +75,14 @@ class Stack_phasediff(Stack_base):
         phasediff = self._conj(_pairs, data, debug=debug)
         if phase is not None:
             phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
-        # Gaussian filtering with cut-off wavelength and optional multilooking on phase difference
+        # Gaussian filtering with cut-off wavelength on phase difference
         phasediff_look = self._multilooking(phasediff, weight=weight,
                                             wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
         # correlation requires multilooking to detect influence between pixels
         # hint: use multilook=False argument to keep phase difference without multilooking
+
+        #print (phasediff)
+
         corr_look = self._correlation(phasediff_look, intensity_look, debug=debug)
         if not multilook:
             # keep phase difference without multilooking
@@ -108,12 +111,6 @@ class Stack_phasediff(Stack_base):
 
         return (intf_look.assign_attrs(data.attrs), corr_look.assign_attrs(data.attrs))
 
-        # if compute:
-        #     progressbar(result := dask.persist(intfs, corrs), desc=f'Computing {data.name} Interferogram'.ljust(25))
-        #     del intfs, corrs
-        #     return result
-        # return (intfs, corrs)
-
     def phasediff_singlelook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
         from .Batch import BatchComplex
         kwarg['multilook'] = False
@@ -125,236 +122,3 @@ class Stack_phasediff(Stack_base):
         kwarg['multilook'] = True
         intfs, corrs = utils_xarray.apply_pol(BatchComplex(self), weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
         return BatchWrap(intfs), BatchUnit(corrs)
-
-    @staticmethod
-    def _interferogram(phase, debug=False):
-        import numpy as np
-
-        if debug:
-            print ('DEBUG: interferogram')
-
-        if np.issubdtype(phase.dtype, np.complexfloating):
-            return np.arctan2(phase.imag, phase.real).astype(np.float32)
-        return phase
-
-    def _correlation(self, phase, intensity, debug=False):
-        """
-        Example:
-        data_200m = stack.multilooking(np.abs(sbas.open_data()), wavelength=200, coarsen=(4,16))
-        intf2_200m = stack.multilooking(intf2, wavelength=200, coarsen=(4,16))
-        stack.correlation(intf2_200m, data_200m)
-
-        Note:
-        Multiple interferograms require the same data grids, allowing us to speed up the calculation
-        by saving filtered data to a disk file.
-        """
-        import pandas as pd
-        import dask
-        import xarray as xr
-        import numpy as np
-        import warnings
-        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
-        warnings.filterwarnings(
-            'ignore',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-        # …and just in case you want to match by message too:
-        warnings.filterwarnings(
-            'ignore',
-            message='invalid value encountered in divide',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-
-        # check correctness for user-defined data arguments
-        assert np.issubdtype(phase.dtype, np.complexfloating), 'ERROR: Phase should be complex-valued data.'
-        assert not np.issubdtype(intensity.dtype, np.complexfloating), 'ERROR: Intensity cannot be complex-valued data.'
-
-        if debug:
-            print ('DEBUG: correlation')
-
-        # convert pairs (list, array, dataframe) to 2D numpy array
-        pairs, dates = self._get_pairs(phase, dates=True)
-        pairs = pairs[['ref', 'rep']].astype(str).values
-
-        stack = []
-        for stack_idx, pair in enumerate(pairs):
-            date1, date2 = pair
-            # calculate correlation
-            corr = (np.abs(phase.sel(pair=' '.join(pair)) / np.sqrt(intensity.sel(date=date1) * intensity.sel(date=date2)))).clip(0, 1)
-            # add to stack
-            stack.append(corr)
-            del corr
-
-        return xr.concat(stack, dim='pair')
-
-    def _conj(self, pairs, data, debug=False):
-        import dask.array as da
-        import xarray as xr
-        import numpy as np
-        import pandas as pd
-        import warnings
-        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
-        warnings.filterwarnings(
-            'ignore',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-        # …and just in case you want to match by message too:
-        warnings.filterwarnings(
-            'ignore',
-            message='invalid value encountered in divide',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-
-        if debug:
-            print ('DEBUG: _conj')
-
-        # convert pairs (list, array, dataframe) to 2D numpy array
-        pairs, dates = self._get_pairs(pairs, dates=True)
-        pairs = pairs[['ref', 'rep']].astype(str).values
-        # append coordinates which usually added from topo phase dataarray
-        coord_pair = [' '.join(pair) for pair in pairs]
-        coord_ref = xr.DataArray(pd.to_datetime(pairs[:,0]), coords={'pair': coord_pair})
-        coord_rep = xr.DataArray(pd.to_datetime(pairs[:,1]), coords={'pair': coord_pair})
-
-        # calculate phase difference
-        data1 = data.sel(date=pairs[:,0]).drop_vars('date').rename({'date': 'pair'})
-        data2 = data.sel(date=pairs[:,1]).drop_vars('date').rename({'date': 'pair'})
-
-        da = (data1 * data2.conj()).assign_coords(ref=coord_ref, rep=coord_rep, pair=coord_pair)
-        del data1, data2
-        
-        return da
-
-    def _goldstein(self, phase, corr, psize=32, debug=False):
-        import xarray as xr
-        import numpy as np
-        import dask
-        from numbers import Real
-        from collections.abc import Mapping
-        import warnings
-        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
-        warnings.filterwarnings(
-            'ignore',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-        # …and just in case you want to match by message too:
-        warnings.filterwarnings(
-            'ignore',
-            message='invalid value encountered in divide',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-
-        if debug:
-            print ('DEBUG: goldstein')
-
-        if psize is None:
-            # miss the processing
-            return phase
-        
-        if not isinstance(psize, (Real, Mapping)):
-            raise ValueError('ERROR: psize should be an integer, float, or dictionary')
-
-        if isinstance(psize, Real):
-            psize = {'y': psize, 'x': psize}
-
-        def apply_pspec(data, alpha):
-            # NaN is allowed value
-            assert not(alpha < 0), f'Invalid parameter value {alpha} < 0'
-            wgt = np.power(np.abs(data)**2, alpha / 2)
-            data = wgt * data
-            return data
-
-        def make_wgt(psize):
-            nyp, nxp = psize['y'], psize['x']
-            # Create arrays of horizontal and vertical weights
-            wx = 1.0 - np.abs(np.arange(nxp // 2) - (nxp / 2.0 - 1.0)) / (nxp / 2.0 - 1.0)
-            wy = 1.0 - np.abs(np.arange(nyp // 2) - (nyp / 2.0 - 1.0)) / (nyp / 2.0 - 1.0)
-            # Compute the outer product of wx and wy to create the top-left quadrant of the weight matrix
-            quadrant = np.outer(wy, wx)
-            # Create a full weight matrix by mirroring the quadrant along both axes
-            wgt = np.block([[quadrant, np.flip(quadrant, axis=1)],
-                            [np.flip(quadrant, axis=0), np.flip(np.flip(quadrant, axis=0), axis=1)]])
-            return wgt
-
-        def patch_goldstein_filter(data, corr, wgt, psize):
-            """
-            Apply the Goldstein adaptive filter to the given data.
-
-            Args:
-                data: 2D numpy array of complex values representing the data to be filtered.
-                corr: 2D numpy array of correlation values. Must have the same shape as `data`.
-
-            Returns:
-                2D numpy array of filtered data.
-            """
-            # Calculate alpha
-            alpha = 1 - (wgt * corr).sum() / wgt.sum()
-            data = np.fft.fft2(data, s=(psize['y'], psize['x']))
-            data = apply_pspec(data, alpha)
-            data = np.fft.ifft2(data, s=(psize['y'], psize['x']))
-            return wgt * data
-
-        def apply_goldstein_filter(data, corr, psize, wgt_matrix):
-            # Create an empty array for the output
-            out = np.zeros(data.shape, dtype=np.complex64)
-            # ignore processing for empty chunks 
-            if np.all(np.isnan(data)):
-                return out
-            # Create the weight matrix
-            #wgt_matrix = make_wgt(psize)
-            # Iterate over windows of the data
-            for i in range(0, data.shape[0] - psize['y'], psize['y'] // 2):
-                for j in range(0, data.shape[1] - psize['x'], psize['x'] // 2):
-                    # Create proocessing windows
-                    data_window = data[i:i+psize['y'], j:j+psize['x']]
-                    corr_window = corr[i:i+psize['y'], j:j+psize['x']]
-                    # do not process NODATA areas filled with zeros
-                    fraction_valid = np.count_nonzero(data_window != 0) / data_window.size
-                    if fraction_valid >= 0.5:
-                        wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
-                        # Apply the filter to the window
-                        filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
-                        # Add the result to the output array
-                        slice_i = slice(i, min(i + psize['y'], out.shape[0]))
-                        slice_j = slice(j, min(j + psize['x'], out.shape[1]))
-                        out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
-            return out
-
-        assert phase.shape == corr.shape, f'ERROR: phase and correlation variables have different shape \
-                                          ({phase.shape} vs {corr.shape})'
-
-        if len(phase.dims) == 2:
-            stackvar = None
-        else:
-            stackvar = phase.dims[0]
-    
-        stack =[]
-        for ind in range(len(phase) if stackvar is not None else 1):
-            # Apply function with overlap; psize//2 overlap is not enough (some empty lines produced)
-            # use complex data and real correlation
-            # fill NaN values in correlation by zeroes to prevent empty output blocks
-            block = dask.array.map_overlap(apply_goldstein_filter,
-                                           (phase[ind] if stackvar is not None else phase).fillna(0).data,
-                                           (corr[ind]  if stackvar is not None else corr ).fillna(0).data,
-                                           depth=(psize['y'] // 2 + 2, psize['x'] // 2 + 2),
-                                           dtype=np.complex64, 
-                                           meta=np.array(()),
-                                           psize=psize,
-                                           wgt_matrix = make_wgt(psize))
-            # Calculate the phase
-            stack.append(block)
-            del block
-
-        if stackvar is not None:
-            ds = xr.DataArray(dask.array.stack(stack), coords=phase.coords)
-        else:
-            ds = xr.DataArray(stack[0], coords=phase.coords)
-        del stack
-        # replace zeros produces in NODATA areas
-        return ds.where(np.isfinite(phase)).rename(phase.name)
