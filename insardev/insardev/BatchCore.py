@@ -947,7 +947,7 @@ class BatchCore(dict):
             return None
 
         wrap = True if type(self) == BatchWrap else False
-        print ('dtype', type(self), 'wrap', wrap, 'dissolve', dissolve, 'polarization', polarization)
+        #print ('dtype', type(self), 'wrap', wrap, 'dissolve', dissolve, 'polarization', polarization)
 
         #print (type(datas))
         
@@ -961,7 +961,9 @@ class BatchCore(dict):
         if polarization is None:
             # find all variables in the first dataset related to polarizations
             # TODO
-            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
+            #polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
+            polarizations = list(sample.data_vars)
+            #print ('polarizations', polarizations)
 
             # process list of datasets with one or multiple polarizations
             das = xr.merge([self.to_dataset(polarization=pol, dissolve=dissolve) for pol in polarizations])
@@ -980,14 +982,20 @@ class BatchCore(dict):
         x_min = min(ds.x.min().item() for ds in datas)
         x_max = max(ds.x.max().item() for ds in datas)
         #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
-        stackvar = list(datas[0].dims)[0]
-        print ('stackvar', stackvar)
+        dims = datas[0].dims
+        #print ('dims', dims, len(dims))
+        stackvar = list(dims)[0] if len(dims) > 2 else None
+        #print ('stackvar', stackvar)
         # workaround for dask.array.blockwise
         if stackvar == 'pair':
             # multiindex pair
             stackval = [(str(ref)[:10] +' '+ str(rep)[:10]) for ref, rep in datas[0][stackvar].values]
-        else:
+        elif stackvar is not None:
             stackval = datas[0][stackvar].astype(str)
+        else:
+            stackvar = 'fake'
+            stackval = [0]
+            datas = [da.expand_dims({stackvar: [0]}) for da in datas]
         stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
         dy = datas[0].y.diff('y').item(0)
         dx = datas[0].x.diff('x').item(0)
@@ -1028,7 +1036,7 @@ class BatchCore(dict):
             das_block = [datas[idx].isel({stackvar: stackidx}).sel(slice) for idx, slice in das_slice]
             del das_slice
             das_block = dask.compute(*das_block)
-            print ('concat: das_block', len(das_block))
+            #print ('concat: das_block', len(das_block))
 
             # TEST: return empty block
             #return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
@@ -1041,7 +1049,7 @@ class BatchCore(dict):
                return das_block[0].values
 
             if not dissolve:
-                print ('wrap None')
+                #print ('wrap None')
                 # ffill does not work correct on complex data and per-component ffill is faster
                 # the magic trick is to use sorting to ensure burst overpapping order
                 # bursts ends should be overlapped by bursts starts
@@ -1052,13 +1060,13 @@ class BatchCore(dict):
                 else:
                     return das_block_concat.ffill('stack_dim').isel(stack_dim=-1).values
             elif wrap == True:
-                print ('wrap True')
+                #print ('wrap True')
                 # calculate circular mean for interferogram data
                 das_block_concat = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim')
                 block_complex = das_block_concat.mean('stack_dim', skipna=True).values
                 return np.arctan2(block_complex.imag, block_complex.real)
             elif wrap == False:
-                print ('wrap False')
+                #print ('wrap False')
                 das_block_concat = xr.concat(das_block, dim='stack_dim', join='outer')
                 # calculate arithmetic mean for phase and correlation data
                 return das_block_concat.mean('stack_dim', skipna=True).reindex({'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False).values
@@ -1076,7 +1084,7 @@ class BatchCore(dict):
             # with dask.config.set({'array.chunk-size': '256MiB'}):
             # ....to_dataset()
             chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=datas[0].dtype)
-            print ('chunks', chunks)
+            #print ('chunks', chunks)
             data = dask.array.blockwise(
                 block_dask,
                 'zyx',
@@ -1090,12 +1098,13 @@ class BatchCore(dict):
         da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
             .rename(datas[0].name)\
             .assign_attrs(datas[0].attrs)
-        return datagrid.spatial_ref(da, datas)
+        da = datagrid.spatial_ref(da, datas)
+        return da if stackvar != 'fake' else da.isel({stackvar: 0})
 
     def plot(self,
-            dissolve: bool = True,
-            cmap: matplotlib.colors.Colormap | str | None = 'gist_rainbow_r',
-            alpha: float = 1.0,
+            dissolve: bool = False,
+            cmap: matplotlib.colors.Colormap | str | None = 'viridis',
+            alpha: float = 0.7,
             vmin: float | None = None,
             vmax: float | None = None,
             quantile: float | None = None,
@@ -1122,7 +1131,7 @@ class BatchCore(dict):
             return
         
         wrap = True if type(self) == BatchWrap else False
-        print ('dtype', type(self), 'wrap', wrap, 'dissolve', dissolve)
+        #print ('dtype', type(self), 'wrap', wrap, 'dissolve', dissolve)
 
         # screen size in pixels (width, height) to estimate reasonable number pixels per plot
         # this is quite large to prevent aliasing on 600dpi plots without additional processing
@@ -1131,18 +1140,22 @@ class BatchCore(dict):
 
         # use outer variables
         def plot_polarization(polarization):
-            stackvar = list(sample[polarization].dims)[0]
+            stackvar = list(sample[polarization].dims)[0] if len(sample[polarization].dims) > 2 else None
             #print ('stackvar', stackvar)
-            #da = self[[polarization]]
-            #da = self[[polarization]].isel({stackvar: slice(0, rows)})
-            da = self[[polarization]].isel({stackvar: slice(0, rows)}).to_dataset(dissolve=dissolve)[polarization]
+            if stackvar is None:
+                stackvar = 'fake'
+                da = self[[polarization]].to_dataset(dissolve=dissolve)[polarization].expand_dims({stackvar: [0]})
+            else:
+                #da = self[[polarization]]
+                #da = self[[polarization]].isel({stackvar: slice(0, rows)})
+                da = self[[polarization]].isel({stackvar: slice(0, rows)}).to_dataset(dissolve=dissolve)[polarization]
             #print ('da', da)
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
                 da = da.unstack('stack')
             
             # there is no reason to plot huge arrays much larger than screen size for small plots
             #print ('screen_size', screen_size)
-            size_y, size_x = da.shape[1:]
+            size_y, size_x = da.shape[-2:]
             #print ('size_x, size_y', size_x, size_y)
             factor_y = int(np.round(size_y / (_size[1] / rows)))
             factor_x = int(np.round(size_x / (_size[0] / cols)))
@@ -1170,7 +1183,7 @@ class BatchCore(dict):
                 col=stackvar,
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax,
-                cmap=cmap, alpha=alpha
+                cmap=cmap, alpha=alpha,
             )
             fg.set_axis_labels('easting [m]', 'northing [m]')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
@@ -1181,6 +1194,9 @@ class BatchCore(dict):
                 # disable the offset text (like "1e6")
                 # force plain formatting (no scientific notation) on the y‐axis
                 ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+                if stackvar == 'fake':
+                    # remove 'fake = 0' title
+                    ax.set_title('')
                 
             return fg
 
@@ -1190,7 +1206,8 @@ class BatchCore(dict):
         sample = next(iter(self.values()))
         # find all variables in the first dataset related to polarizations
         # TODO
-        polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
+        #polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
+        polarizations = list(sample.data_vars)
         #print ('polarizations', polarizations)
 
         # process polarizations one by one
