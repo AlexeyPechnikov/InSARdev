@@ -51,6 +51,7 @@ setup(
                       'distributed',
                       'dask[complete]',
                       'zarr',
+                      'cf_xarray',
                       'scipy',
                       'cffi',
                       'scikit-learn',

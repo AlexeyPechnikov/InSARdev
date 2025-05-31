@@ -124,6 +124,7 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
                 raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
     
     def _save_grp(grp, ds):
+        import cf_xarray
         # silently drop problematic attributes
         ds_clean = ds.copy()
         for v in ds_clean.data_vars:
@@ -131,6 +132,9 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
         # prevent chunks mismatch between variables and coordinates
         for coord in ds_clean.coords:
             ds_clean[coord].encoding.pop('chunks', None)
+        if 'pair' in ds_clean.coords:
+            # encode multiindex pair for saving
+            ds_clean = cf_xarray.encode_multi_index_as_compress(ds_clean, 'pair')
         # save to subdirectory
         #print (ds_clean)
         ds_clean.to_zarr(
@@ -204,8 +208,12 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     joblib_backend = 'sequential' if debug else 'threading'
 
     def _load_grp(grp):
+        import cf_xarray
         #ds = xr.open_zarr(store, group=grp, consolidated=True, zarr_format=3)
         ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
+        if 'pair' in ds.coords:
+            # decode multiindex pair
+            ds = cf_xarray.decode_compress_to_multi_index(ds, 'pair')
         return grp, ds
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
         results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp) for grp in groups)

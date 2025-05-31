@@ -10,7 +10,7 @@
 # ----------------------------------------------------------------------------
 from .Stack_base import Stack_base
 from insardev_toolkit import progressbar
-from .Batch import Batch, BatchWrap, BatchUnit
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
 from . import utils_xarray
 
 class Stack_phasediff(Stack_base):
@@ -19,106 +19,78 @@ class Stack_phasediff(Stack_base):
     import pandas as pd
 
     # internal method to compute interferogram on single polarization data array(s)
-    def _phasediff(self,
-                       data:xr.DataArray|None=None,
+    def phasediff(self,
+                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame|None=None,
                        weight:xr.DataArray|None=None,
                        phase:xr.DataArray|None=None,
-                       pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame|None=None,
                        wavelength:float|None=None,
                        gaussian_threshold:float=0.5,
-                       multilook:bool=False,
-                       goldstein_window:int|list[int,int]|None=None,
-                       complex:bool=False,
-                       debug:bool=False
+                       multilook:bool=True,
+                       goldstein:int|list[int,int]|None=None,
+                       complex:bool=False
                        ) -> tuple[xr.DataArray,xr.DataArray]:
-        import xarray as xr
+        """
+        hint: use multilook=False argument to keep phase difference without multilooking
+        """
         import numpy as np
-        import dask
-        import warnings
-        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
-        warnings.filterwarnings(
-            'ignore',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-        # …and just in case you want to match by message too:
-        warnings.filterwarnings(
-            'ignore',
-            message='invalid value encountered in divide',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
 
-        assert isinstance(data, xr.DataArray), 'ERROR: data should be a DataArray'
+        if wavelength is None:
+            raise ValueError('wavelength is required to define spatial correlation')
 
-        # wrap simplified single pair argument in a list
-        pairs = pairs if isinstance(pairs[0], (list, tuple)) else [pairs]
+        pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
+        print ('pairs', pairs)
+        ref_dates = pairs[:,0]
+        rep_dates = pairs[:,1]
 
+        data = BatchComplex(self)
         if weight is not None:
-           # convert to lazy data
-           weight = weight.astype(np.float32).chunk(-1 if weight.chunks is None else weight.chunks)
-        
-        # convert numeric pairs to date pairs
-        _pairs = [pair if isinstance(pair[0], str) else (data.date.isel(date=pair[0]).item(), data.date.isel(date=pair[1]).item()) for pair in pairs]
-        
-        # data = data[polarization]
+            data = data.reindex_like(weight, fill_value=np.nan)
 
-        #if weight is not None:
-        #    # unify shape of data and weight
-        #    data = data.reindex_like(weight, fill_value=np.nan)
-        intensity = np.square(np.abs(data))
-        # Gaussian filtering with cut-off wavelength on amplitudes
-        intensity_look = self._multilooking(intensity, weight=weight,
-                                            wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
-        del intensity
-        # calculate phase difference with topography correction
-        phasediff = self._conj(_pairs, data, debug=debug)
+        data1 = data.isel(date=ref_dates).rename(date='pair')
+        data2 = data.isel(date=rep_dates).rename(date='pair')
+        phasediff = data1.drop_vars('pair') * data2.drop_vars('pair').conj()
         if phase is not None:
-            phasediff = phasediff * (np.exp(-1j * phase) if np.issubdtype(phase.dtype, np.floating) else phase)
+            phasediff = phasediff * (phase.iexp(-1) if not isinstance(phase, BatchComplex) else phase)
         # Gaussian filtering with cut-off wavelength on phase difference
-        phasediff_look = self._multilooking(phasediff, weight=weight,
-                                            wavelength=wavelength, gaussian_threshold=gaussian_threshold, debug=debug)
+        phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+
+        # Gaussian filtering with cut-off wavelength on amplitudes
+        intensity_look = data.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+        intensity_look1 = intensity_look.isel(date=ref_dates).drop_vars('date').rename(date='pair')
+        intensity_look2 = intensity_look.isel(date=rep_dates).drop_vars('date').rename(date='pair')
+
         # correlation requires multilooking to detect influence between pixels
-        # hint: use multilook=False argument to keep phase difference without multilooking
+        corr_look = (phasediff_look.abs() / (intensity_look1 * intensity_look2).sqrt()).clip(0, 1)
 
-        #print (phasediff)
-
-        corr_look = self._correlation(phasediff_look, intensity_look, debug=debug)
+        # keep phase difference without multilooking if multilook=False
         if not multilook:
-            # keep phase difference without multilooking
             phasediff_look = phasediff
-        del phasediff
-        del intensity_look
-        if goldstein_window is not None:
-            # Goldstein filter in "psize" patch size, pixels
-            phasediff_look = self._goldstein(phasediff_look, corr_look, psize=goldstein_window, debug=debug)
+        if goldstein is not None:
+            phasediff_look = phasediff_look.goldstein(corr_look, goldstein)
 
         # filter out not valid pixels
         if weight is not None:
-            # apply coarsening to weight to match the phase difference grid
-            # no multilooking for weight because wavelength=None
-            weight_coarsen = self._multilooking(weight, wavelength=None, debug=debug)
-            phasediff_look = phasediff_look.where(np.isfinite(weight_coarsen))
-            corr_look = corr_look.where(np.isfinite(weight_coarsen))
-            del weight_coarsen
-            
-        # convert complex phase difference to interferogram
+            phasediff_look = phasediff_look.where(np.isfinite(weight))
+            corr_look = corr_look.where(np.isfinite(weight))
+        
         if not complex:
-            intf_look = self._interferogram(phasediff_look, debug=debug)
-        else:
-            intf_look = phasediff_look
-        del phasediff_look
+            phasediff_look = phasediff_look.angle()
 
-        return (intf_look.assign_attrs(data.attrs), corr_look.assign_attrs(data.attrs))
+        return [da.assign_coords(
+            ref=('pair', data1.coords['pair']),
+            rep=('pair', data2.coords['pair'])
+        ).set_index(pair=['ref', 'rep']) for da in [phasediff_look, corr_look]]
 
-    def phasediff_singlelook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
+    def phasediff_singlelook(self, **kwarg):
         from .Batch import BatchComplex
         kwarg['multilook'] = False
-        intfs, corrs = utils_xarray.apply_pol(BatchComplex(self), weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
-        return BatchWrap(intfs), BatchUnit(corrs)
+        return self.phasediff(**kwarg)
+        #intfs, corrs = self.phasediff(**kwarg)
+        #return BatchWrap(intfs), BatchUnit(corrs)
 
-    def phasediff_multilook(self, pairs, weights=None, phases=None, compute=False, **kwarg):
+    def phasediff_multilook(self, **kwarg):
         from .Batch import BatchComplex
         kwarg['multilook'] = True
-        intfs, corrs = utils_xarray.apply_pol(BatchComplex(self), weights, phases, func=self._phasediff, compute=compute, pairs=pairs, **kwarg)
-        return BatchWrap(intfs), BatchUnit(corrs)
+        return self.phasediff(**kwarg)
+        #intfs, corrs = self.phasediff(**kwarg)
+        #return BatchWrap(intfs), BatchUnit(corrs)

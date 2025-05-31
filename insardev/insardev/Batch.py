@@ -38,6 +38,12 @@ class Batch(BatchCore):
         # delegate to your base class for the actual init
         super().__init__(mapping or {})
     
+    def clip(self, min=None, max=None, **kwargs):
+        """
+        used for correlation in [0,1] range
+        """
+        return BatchUnit(super().clip(min=min, max=max, **kwargs))
+    
     def plot(
         self,
         cmap = 'turbo',
@@ -127,10 +133,15 @@ class BatchWrap(BatchCore):
         """
         return Batch(self.map_da(lambda da: xr.ufuncs.cos(da), **kwargs))
     
-    def iexp(self, **kwargs):
-        """np.exp(-1j * intfs)"""
+    def iexp(self, sign: int = -1, **kwargs):
+        """
+        Apply exp(sign * 1j * da) like np.exp(-1j * intfs)
+        
+        - If sign = -1 (the default), this is exp(-1j * da).
+        - If sign = +1, this is exp(+1j * da).
+        """
         from .Batch import BatchComplex
-        return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(1j * da), **kwargs))
+        return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(sign * 1j * da), **kwargs))
 
     def _agg(self, name: str, dim=None, **kwargs):
         """

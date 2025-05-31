@@ -615,6 +615,10 @@ class BatchCore(dict):
             keys[i]: self[keys[i]]
             for i in idxs
         })
+
+    @property
+    def dims(self):
+        return {k: self[k].dims for k in self.keys()}
     
     @property
     def coords(self):
@@ -758,10 +762,10 @@ class BatchCore(dict):
 
     def interp_like(self, other: Batch, **interp_kwargs):
         """Regrid each Dataset onto the coords of the *corresponding* Dataset in `other`."""
-        return type(self)({
-            k: ds.interp_like(other[k], **interp_kwargs)
-            for k, ds in self.items() if k in other
-        })
+        return type(self)({k: ds.interp_like(other[k], **interp_kwargs) for k, ds in self.items() if k in other})
+
+    def reindex_like(self, other: Batch, **reindex_kwargs):
+        return type(self)({k: ds.reindex_like(other[k], **reindex_kwargs) for k, ds in self.items() if k in other})
 
     def transpose(self, *dims, **kw):
         return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
@@ -977,8 +981,13 @@ class BatchCore(dict):
         x_max = max(ds.x.max().item() for ds in datas)
         #print (y_min, y_max, x_min, x_max, y_max-y_min, x_max-x_min)
         stackvar = list(datas[0].dims)[0]
+        print ('stackvar', stackvar)
         # workaround for dask.array.blockwise
-        stackval = datas[0][stackvar].astype(str)
+        if stackvar == 'pair':
+            # multiindex pair
+            stackval = [(str(ref)[:10] +' '+ str(rep)[:10]) for ref, rep in datas[0][stackvar].values]
+        else:
+            stackval = datas[0][stackvar].astype(str)
         stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
         dy = datas[0].y.diff('y').item(0)
         dx = datas[0].x.diff('x').item(0)
