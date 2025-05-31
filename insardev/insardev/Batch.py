@@ -71,35 +71,6 @@ class BatchWrap(BatchCore):
     def wrap(data):
         return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
-    # def _agg(self, name: str, dim=None, **kwargs):
-    #     """
-    #     Converts wrapped phase to complex numbers before aggregation and back to wrapped phase after.
-    #     """
-    #     print ('wrap _agg')
-    #     import inspect
-    #     import numpy as np
-    #     out = {}
-    #     for key, obj in self.items():
-    #         # get the aggregation function
-    #         fn = getattr(obj, name)
-    #         sig = inspect.signature(fn)
-            
-    #         # perform aggregation in complex domain
-    #         if 'dim' in sig.parameters:
-    #             # intfs.mean('pair').isel(0)
-    #             #agg_result = fn(dim=dim, **kwargs)
-    #             complex_obj = np.exp(1j * obj.astype(np.float32))
-    #             fn_complex = getattr(complex_obj, name)
-    #             agg_result = fn_complex(dim=dim, **kwargs)
-    #         else:
-    #             #intfs.coarsen({'y':2, 'x':2}, boundary='trim').mean()
-    #             agg_result = fn(**kwargs)
-            
-    #         # Convert back to wrapped phase
-    #         out[key] = np.arctan2(agg_result.imag, agg_result.real).astype(np.float32)
-            
-    #     return type(self)(out)
-
     def __add__(self, other: Batch):
         keys = self.keys()
         #& other.keys()
@@ -150,6 +121,7 @@ class BatchWrap(BatchCore):
         print ('wrap _agg')
         import inspect
         import xarray as xr
+        import pandas as pd
         out = {}
         for key, obj in self.items():
             # get the aggregation function
@@ -192,6 +164,11 @@ class BatchWrap(BatchCore):
             
             # Convert back to wrapped phase
             out[key] = agg_result.astype('float32')
+
+            # xarray coarsen + aggregate do not preserve multiindex pair
+            if all(coord in out[key].coords for coord in ('pair', 'ref','rep')) \
+                   and not isinstance(out[key].coords['pair'], pd.MultiIndex):
+                out[key] = out[key].set_index(pair=['ref', 'rep'])
             
         #print ('wrap _agg self.chunks', self.chunks)
         #return type(self)(out).chunk(self.chunks)
@@ -250,7 +227,7 @@ class BatchWrap(BatchCore):
     def plot(
         self,
         cmap = 'gist_rainbow_r',
-        alpha = 0.5,
+        alpha = 0.7,
         caption='Phase, [rad]',
         vmin=-np.pi,
         vmax=np.pi,
@@ -336,6 +313,7 @@ class BatchUnit(BatchCore):
         self,
         cmap = 'auto',
         caption='Correlation',
+        alpha=1,
         vmin=0,
         vmax=1,
         *args,
@@ -351,61 +329,8 @@ class BatchUnit(BatchCore):
         kwargs["caption"] = caption
         kwargs["vmin"] = vmin
         kwargs["vmax"] = vmax
+        kwargs["alpha"] = alpha
         return super().plot(*args, **kwargs)
-
-    def goldstein(self, corr: 'BatchUnit', psize: int | dict[str, int] = 32, debug: bool = False) -> BatchComplex:
-        """
-        Apply Goldstein adaptive filter to each dataset in the batch.
-        
-        Parameters
-        ----------
-        corr : BatchUnit
-            Batch of correlation values to use for filtering.
-        psize : int or dict[str, int], optional
-            Patch size for the filter. If int, same size used for both dimensions.
-            If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
-        debug : bool, optional
-            Print debug information. Default is False.
-            
-        Returns
-        -------
-        BatchComplex
-            New batch with filtered phase values
-        """
-        # Check if corr is a BatchUnit by checking its class name
-        if corr.__class__.__name__ != 'BatchUnit':
-            raise ValueError("corr must be a BatchUnit")
-            
-        if set(corr.keys()) != set(self.keys()):
-            raise ValueError("corr must have the same keys as self")
-            
-        # Apply Goldstein filter to each dataset
-        result = {}
-        for k in self.keys():
-            ds = self[k]
-            filtered_vars = {}
-            
-            # Process each complex data variable in the dataset
-            for var_name, var_data in ds.data_vars.items():
-                if var_data.dtype.kind == 'c':  # Only process complex variables
-                    filtered_data = self._goldstein(
-                        phase=var_data,
-                        corr=corr[k],
-                        psize=psize,
-                        debug=debug
-                    )
-                    filtered_vars[var_name] = filtered_data
-                else:
-                    filtered_vars[var_name] = var_data
-            
-            # Create a new dataset with the filtered variables
-            result[k] = xr.Dataset(
-                filtered_vars,
-                coords=ds.coords,
-                attrs=ds.attrs
-            )
-            
-        return type(self)(result)
 
 class BatchComplex(BatchCore):
     """

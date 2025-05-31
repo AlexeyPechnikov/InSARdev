@@ -776,6 +776,7 @@ class BatchCore(dict):
         If the target object's .<name>() accepts a `dim=` arg, we pass dim, otherwise we just call it without.
         """
         import inspect
+        import pandas as pd
         out = {}
         for key, obj in self.items():
             fn = getattr(obj, name)
@@ -784,6 +785,11 @@ class BatchCore(dict):
                 out[key] = fn(dim=dim, **kwargs)
             else:
                 out[key] = fn(**kwargs)
+            
+            # xarray coarsen + aggregate do not preserve multiindex pair
+            if all(coord in out[key].coords for coord in ('pair', 'ref','rep')) \
+                   and not isinstance(out[key].coords['pair'], pd.MultiIndex):
+                out[key] = out[key].set_index(pair=['ref', 'rep'])
 
         #print ('_agg self.chunks', self.chunks)
         # filter out collapsed dimensions
@@ -1083,7 +1089,8 @@ class BatchCore(dict):
             # control chunk size using Dask config:
             # with dask.config.set({'array.chunk-size': '256MiB'}):
             # ....to_dataset()
-            chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=datas[0].dtype)
+            # TODO: fix the hard coded value 16
+            chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size, 16), dtype=datas[0].dtype)
             #print ('chunks', chunks)
             data = dask.array.blockwise(
                 block_dask,
