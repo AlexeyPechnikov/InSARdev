@@ -73,11 +73,10 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Operating System :: MacOS',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13'
     ],
-    python_requires='>=3.10',
+    python_requires='>=3.11',
     keywords='remote sensing, geospatial analysis, DEM, topography, SRTM, Copernicus, ALOS, OpenStreetMap, OSM, Google Maps, ASF, NetCDF, GeoTIFF, VTK'
 )
