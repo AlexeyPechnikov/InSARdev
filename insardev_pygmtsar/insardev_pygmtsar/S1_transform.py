@@ -46,7 +46,7 @@ class S1_transform(S1_topo):
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
                   append: bool=False,
-                  n_jobs: int=1,
+                  n_jobs: int | None=None,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -87,6 +87,7 @@ class S1_transform(S1_topo):
         import os
         import tempfile
         import shutil
+        from distributed import get_client
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -201,7 +202,10 @@ class S1_transform(S1_topo):
         #     joblib.Parallel(n_jobs=1, backend=joblib_backend)(
         #         [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
         #     )
-        
+
+        if n_jobs is None:
+            # use all available workers when every worker can parallelize the processing on multiple threads
+            n_jobs = get_client().scheduler_info()['n_workers']
         with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
 
