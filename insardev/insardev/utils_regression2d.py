@@ -111,11 +111,16 @@ def regression2d(data, variables, weight=None, algorithm='linear', degree=1, wra
             raise ValueError(f"Unsupported algorithm {algorithm}. Should be 'linear', 'sgd', or 'hgb'.")
         del weight_values
 
-        regr.fit(variables_values[:, ~nanmask].T, Y[~nanmask], **fit_params)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            regr.fit(variables_values[:, ~nanmask].T, Y[~nanmask], **fit_params)
         del Y, nanmask
 
         # Predict for all valid pixels
-        model_pred = regr.predict(variables_values[:, ~nanmask_values].T)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            model_pred = regr.predict(variables_values[:, ~nanmask_values].T)
         del regr, variables_values
 
         model = np.full_like(data, np.nan).ravel()
