@@ -46,6 +46,7 @@ class S1_transform(S1_topo):
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
                   append: bool=False,
+                  n_jobs: int=1,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -72,6 +73,8 @@ class S1_transform(S1_topo):
             Overwrite existing results and process all bursts. 
         append : bool, optional
             Append new burstID processed with the same parameters to the existing results.
+        n_jobs : int, optional
+            The number of jobs to run in parallel.
         debug : bool, optional
             Whether to print debug information.
 
@@ -192,12 +195,15 @@ class S1_transform(S1_topo):
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         
-        joblib_backend = 'threading' if not debug else 'sequential'
-        for refrep in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-            # single worker is used to help Dask cleanup memory
-            joblib.Parallel(n_jobs=1, backend=joblib_backend)(
-                [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
-            )
+        # joblib_backend = 'threading' if not debug else 'sequential'
+        # for refrep in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+        #     # single worker is used to help Dask cleanup memory
+        #     joblib.Parallel(n_jobs=1, backend=joblib_backend)(
+        #         [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
+        #     )
+        
+        with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
+            joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
 
         # consolidate zarr metadata for the resolution directory
         self.consolidate_metadata(target, resolution=resolution)
