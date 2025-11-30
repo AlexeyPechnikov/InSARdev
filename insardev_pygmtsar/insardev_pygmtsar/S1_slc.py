@@ -161,7 +161,11 @@ class S1_slc(S1_base):
             # GMTSAR assemble_tops.c produces malformed xml
             # https://github.com/gmtsar/gmtsar/issues/354
             #doc = xmltodict.parse(fd.read().replace('/></','></'))
-            doc = xmltodict.parse(fd.read())
+            try:
+                doc = xmltodict.parse(fd.read())
+            except Exception as e:
+                print(f'Error parsing XML file {filename}: {e}')
+                raise e
         return doc
 
     def get_geoloc(self, annotation: dict) -> gpd.GeoDataFrame:
