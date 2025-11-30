@@ -59,7 +59,8 @@ setup(
                       'nc-time-axis',
                       'remotezip',
                       'asf_search',
-                      'matplotlib'
+                      'matplotlib',
+                      'imageio'
                       ],
     extras_require={
                       'vtk_support': ['vtk', 'panel']
