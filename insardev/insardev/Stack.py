@@ -243,18 +243,26 @@ class Stack(Stack_plot, BatchCore):
 
             # convert generic 'data' variable for all polarizations to VV, VH,... variables
             datas = []
+            spatial_ref = None
             for polarization in polarizations:
                 data = [ds for ds in dss if ds.polarization==polarization]
-                data = xr.concat(data, dim='date', combine_attrs='no_conflicts').rename({'data': polarization})
-                #data = xr.concat(data, dim='date', combine_attrs='no_conflicts').rename({'data': polarization}).sortby('date')
+                # newer xarray tightened attribute checks; keep first dataset attrs
+                data = xr.concat(data, dim='date', combine_attrs='override').rename({'data': polarization})
+                #data = xr.concat(data, dim='date', combine_attrs='override').rename({'data': polarization}).sortby('date')
                 # cannot combine in a single value VV and VH polarizations and corresponding burst names
                 data.burst.values = [v.replace(polarization, 'XX') for v in data.burst.values]
                 del data['polarization']
+                if spatial_ref is None:
+                    spatial_ref = data.attrs.get('spatial_ref')
                 datas.append(data)
                 del data
-            ds = xr.merge(datas)
-            # only reference burst has spatial_ref attribute, concat bursts before getting spatial_ref
-            spatial_ref = ds.attrs['spatial_ref']
+            ds = xr.merge(datas, combine_attrs='override')
+            # only reference burst has spatial_ref attribute, capture before merge and restore if needed
+            if spatial_ref is None:
+                spatial_ref = transform.attrs.get('spatial_ref')
+            if spatial_ref is None:
+                raise KeyError('spatial_ref')
+            ds.attrs['spatial_ref'] = spatial_ref
             del datas
 
             # add transform variables
