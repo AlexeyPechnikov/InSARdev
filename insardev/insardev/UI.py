@@ -99,13 +99,45 @@ class UI:
             </style>
         """
         
-        # inject CSS
-        display(HTML(dark_css))
-        # inject CSS after delay
-        if delay is not None:
-            js = f"""
-            setTimeout(function(){{
-                document.head.insertAdjacentHTML('beforeend', `{dark_css}`);
-            }}, {delay});
+        # inject CSS with MutationObserver for dynamic widgets
+        js = f"""
+        (function(){{
+            const css = `{dark_css}`;
+            
+            // Create and inject style element directly into head
+            const styleElement = document.createElement('style');
+            styleElement.textContent = css.replace(/<\\/?style>/g, '');
+            document.head.appendChild(styleElement);
+            
+            // Apply styles immediately to existing elements
+            document.querySelectorAll('.progress-bar-success').forEach(el => {{
+                el.style.backgroundColor = '#4caf50';
+            }});
+            
+            // Observer for dynamically created widgets
+            const observer = new MutationObserver(function(mutations) {{
+                mutations.forEach(function(mutation) {{
+                    if (mutation.addedNodes.length) {{
+                        mutation.addedNodes.forEach(function(node) {{
+                            if (node.nodeType === 1) {{ // Element node
+                                // Re-apply progress bar styling to new elements
+                                node.querySelectorAll('.progress-bar-success').forEach(el => {{
+                                    el.style.backgroundColor = '#4caf50';
+                                }});
+                                if (node.classList && node.classList.contains('progress-bar-success')) {{
+                                    node.style.backgroundColor = '#4caf50';
+                                }}
+                            }}
+                        }});
+                    }}
+                }});
+            }});
+            
+            // Observe the entire document for changes
+            observer.observe(document.body, {{
+                childList: true,
+                subtree: true
+            }});
+        }})();
         """
         display(Javascript(js))
