@@ -44,12 +44,22 @@ class S1_geocode(S1_align):
         import warnings
         warnings.filterwarnings('ignore')
 
+        # check for duplicates to avoid inconsistent indexing errors
+        if np.unique(data.a.values).size != data.a.values.size:
+            raise AssertionError("Duplicate azimuth coordinates detected")
+        if np.unique(data.r.values).size != data.r.values.size:
+            raise AssertionError("Duplicate range coordinates detected")
+        if not data.indexes['a'].is_unique:
+            raise AssertionError("Duplicate azimuth coordinates in indexes detected")
+        if not data.indexes['r'].is_unique:
+            raise AssertionError("Duplicate range coordinates in indexes detected")
+
         # use outer data variable
         def trans_block(trans_block_azi, trans_block_rng):
             from scipy.interpolate import RegularGridInterpolator
 
-            coord_a = data.a
-            coord_r = data.r
+            coord_a = data.a.values
+            coord_r = data.r.values
 
             # check if the data block exists
             if not trans_block_azi.size:
@@ -65,6 +75,9 @@ class S1_geocode(S1_align):
             rmin, rmax = np.nanmin(rngs), np.nanmax(rngs)
             coord_a = coord_a[(coord_a>amin-1)&(coord_a<amax+1)]
             coord_r = coord_r[(coord_r>rmin-1)&(coord_r<rmax+1)]
+            # check for duplicates to avoid inconsistent indexing errors
+            if np.unique(coord_a).size != coord_a.size or np.unique(coord_r).size != coord_r.size:
+                raise AssertionError("Duplicate selected azimuth/range coordinates detected")
             del amin, amax, rmin, rmax
             # when no valid pixels for the processing
             if coord_a.size == 0 or coord_r.size == 0:
