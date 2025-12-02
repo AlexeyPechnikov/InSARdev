@@ -141,3 +141,46 @@ class UI:
         }})();
         """
         display(Javascript(js))
+        
+        # Monkey-patch xarray to inject dark theme CSS directly into its HTML repr
+        # This ensures the CSS travels with the HTML into VS Code's isolated output frames
+        try:
+            import xarray as xr
+            
+            xarray_dark_css = """
+            <style>
+            .xr-wrap, .xr-wrap * { background-color: #2b2b2b !important; color: #d0d0d0 !important; border-color: #444 !important; box-shadow: none !important; }
+            .xr-header { background-color: #1f1f1f !important; color: #e0e0e0 !important; }
+            .xr-section-summary, .xr-section-inline-details { background-color: #2b2b2b !important; color: #d0d0d0 !important; }
+            .xr-var-list, .xr-var-item { background-color: #2b2b2b !important; color: #d0d0d0 !important; }
+            .xr-var-name, .xr-var-dims, .xr-var-dtype, .xr-var-preview { color: #d0d0d0 !important; }
+            .xr-index-name { color: #d0d0d0 !important; }
+            .xr-array-wrap { background-color: #252525 !important; }
+            pre.xr-text-repr-fallback { background-color: #252525 !important; color: #cfcfcf !important; }
+            </style>
+            """
+            
+            # Patch DataArray._repr_html_ (only once - check for marker)
+            if hasattr(xr.DataArray, '_repr_html_') and not getattr(xr.DataArray._repr_html_, '_dark_patched', False):
+                _original_da_repr = xr.DataArray._repr_html_
+                def _dark_da_repr(self):
+                    html = _original_da_repr(self)
+                    if html:
+                        return xarray_dark_css + html
+                    return html
+                _dark_da_repr._dark_patched = True
+                xr.DataArray._repr_html_ = _dark_da_repr
+            
+            # Patch Dataset._repr_html_ (only once - check for marker)
+            if hasattr(xr.Dataset, '_repr_html_') and not getattr(xr.Dataset._repr_html_, '_dark_patched', False):
+                _original_ds_repr = xr.Dataset._repr_html_
+                def _dark_ds_repr(self):
+                    html = _original_ds_repr(self)
+                    if html:
+                        return xarray_dark_css + html
+                    return html
+                _dark_ds_repr._dark_patched = True
+                xr.Dataset._repr_html_ = _dark_ds_repr
+        except ImportError:
+            # xarray not installed
+            pass
