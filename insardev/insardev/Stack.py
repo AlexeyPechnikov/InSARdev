@@ -27,11 +27,11 @@ class Stack(Stack_plot, BatchCore):
         #print('Stack __init__', 0 if mapping is None else len(mapping))
         super().__init__(mapping)
 
-    def PRM(self, key:str) -> str|float|int:
-        """
-        Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
-        """
-        return next(iter(self.dss.values())).attrs[key]
+    # def PRM(self, key:str) -> str|float|int:
+    #     """
+    #     Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
+    #     """
+    #     return next(iter(self.dss.values())).attrs[key]
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
