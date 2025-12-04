@@ -61,11 +61,16 @@ class BatchWrap(BatchCore):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores wrapped phase (real values).
     """
-    def __init__(self, mapping: dict[str, xr.Dataset] | Stack | None = None):
+    def __init__(self, mapping: dict[str, xr.Dataset] | Stack | None = None, wrap: bool = True):
         from .Stack import Stack
         if isinstance(mapping, (Stack, BatchComplex)):
             raise ValueError(f'ERROR: BatchWrap does not support Stack or BatchComplex objects.')
-        dict.__init__(self, mapping or {})
+        # skip wrapping for intermediate objects like DatasetCoarsen
+        if not wrap:
+            dict.__init__(self, mapping or {})
+        else:
+            wrapped = {k: self.wrap(v) for k, v in (mapping or {}).items()}
+            dict.__init__(self, wrapped)
 
     @staticmethod
     def wrap(data):
@@ -74,23 +79,23 @@ class BatchWrap(BatchCore):
     def __add__(self, other: Batch):
         keys = self.keys()
         #& other.keys()
-        return type(self)({k: self.wrap(self[k] + other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self[k] + other[k] if k in other else self[k] for k in keys})
 
     def __sub__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] - other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self[k] - other[k] if k in other else self[k] for k in keys})
 
     def __mul__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] * other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self[k] * other[k] if k in other else self[k] for k in keys})
 
     def __rmul__(self, other):
         # scalar * batch  → map scalar * each dataset
-        return type(self)({k: self.wrap(other * v) for k, v in self.items()})
+        return type(self)({k: other * v for k, v in self.items()})
 
     def __truediv__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: self.wrap(self[k] / other[k] if k in other else self[k]) for k in keys})
+        return type(self)({k: self[k] / other[k] if k in other else self[k] for k in keys})
 
     def sin(self, **kwargs) -> Batch:
         """
@@ -222,7 +227,8 @@ class BatchWrap(BatchCore):
             # coarsen
             out[key] = ds2.coarsen(window, **kwargs)
 
-        return type(self)(out)
+        # wrap=False since these are DatasetCoarsen objects, not actual data
+        return type(self)(out, wrap=False)
 
     def plot(
         self,
