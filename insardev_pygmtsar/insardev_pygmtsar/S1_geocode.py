@@ -55,11 +55,11 @@ class S1_geocode(S1_align):
             raise AssertionError("Duplicate range coordinates in indexes detected")
 
         # use outer data variable
-        def trans_block(trans_block_azi, trans_block_rng):
+        def trans_block(trans_block_azi, trans_block_rng, coord_a, coord_r):
             from scipy.interpolate import RegularGridInterpolator
 
-            coord_a = data.a.values
-            coord_r = data.r.values
+            # coord_a = data.a.values
+            # coord_r = data.r.values
 
             # check if the data block exists
             if not trans_block_azi.size:
@@ -75,9 +75,9 @@ class S1_geocode(S1_align):
             rmin, rmax = np.nanmin(rngs), np.nanmax(rngs)
             coord_a = coord_a[(coord_a>amin-1)&(coord_a<amax+1)]
             coord_r = coord_r[(coord_r>rmin-1)&(coord_r<rmax+1)]
-            # check for duplicates to avoid inconsistent indexing errors
-            if np.unique(coord_a).size != coord_a.size or np.unique(coord_r).size != coord_r.size:
-                raise AssertionError("Duplicate selected azimuth/range coordinates detected")
+            # # check for duplicates to avoid inconsistent indexing errors
+            # if np.unique(coord_a).size != coord_a.size or np.unique(coord_r).size != coord_r.size:
+            #     raise AssertionError("Duplicate selected azimuth/range coordinates detected")
             del amin, amax, rmin, rmax
             # when no valid pixels for the processing
             if coord_a.size == 0 or coord_r.size == 0:
@@ -98,7 +98,9 @@ class S1_geocode(S1_align):
             'yx',
             transform.azi, 'yx',
             transform.rng, 'yx',
-            dtype=data.dtype
+            dtype=data.dtype,
+            coord_a=data.a.values,
+            coord_r=data.r.values
         )
 
         da = xr.DataArray(out, transform.ele.coords).rename(data.name)
