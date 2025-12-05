@@ -116,6 +116,12 @@ class BatchCore(dict):
 
         # multi‐item: show summary
         sample = next(iter(self.values()))
+        
+        # Handle CoordCollection objects
+        if isinstance(sample, self.CoordCollection):
+            keys = list(self.keys())
+            return f"{self.__class__.__name__} coords containing {n} items ({keys[0]} … {keys[-1]})"
+        
         if 'date' in sample.coords:
             count = sample.coords['date'].size
             axis = 'date'
@@ -265,7 +271,7 @@ class BatchCore(dict):
         """
         if isinstance(other, (int, float)):
             return type(self)({k: op(ds, other) for k, ds in self.items()})
-        elif isinstance(other, Batch):
+        elif isinstance(other, BatchCore):
             common = set(self) & set(other)
             return type(self)({k: op(self[k], other[k]) for k in common})
         else:
@@ -436,6 +442,16 @@ class BatchCore(dict):
                     mask_da = mask_obj[data_vars[0]]
                 else:
                     mask_da = mask_obj
+                
+                # Align mask to data coordinates (handles different x/y grids)
+                # Get reference DataArray from ds for alignment
+                if isinstance(ds, xr.Dataset):
+                    ref_var = list(ds.data_vars)[0]
+                    ref_da = ds[ref_var]
+                else:
+                    ref_da = ds
+                mask_da = mask_da.reindex_like(ref_da, method='nearest')
+                
                 out[k] = ds.where(mask_da, other, **kwargs)
             return type(self)(out)
 
@@ -498,7 +514,31 @@ class BatchCore(dict):
         if not isinstance(keys, pd.DataFrame):
             if isinstance(keys, str):
                 keys = [keys]
-            return type(self)({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
+            if isinstance(keys, list):
+                return type(self)({k: self[k] for k in keys})
+            
+            # keys is dict-like (e.g., BatchWrap, BatchUnit)
+            # Select matching burst IDs and align dimensions (like 'pair') per key
+            result = {}
+            for k in keys.keys():
+                if k not in self:
+                    continue
+                ds = self[k]
+                other_ds = keys[k]
+                
+                # Align 'pair' dimension if both have it (per burst key)
+                if hasattr(other_ds, 'dims') and 'pair' in getattr(other_ds, 'dims', []):
+                    if hasattr(ds, 'dims') and 'pair' in ds.dims:
+                        # Get pairs from the other dataset for THIS key
+                        other_pairs = set(other_ds.coords['pair'].values)
+                        my_pairs = ds.coords['pair'].values
+                        matching = [p for p in my_pairs if p in other_pairs]
+                        if matching:
+                            ds = ds.sel(pair=matching)
+                        # If no matching pairs, keep ds as-is (will have 0 after filtering)
+                
+                result[k] = ds
+            return type(self)(result)
 
         dss = {}
         # iterate all burst groups
@@ -622,8 +662,8 @@ class BatchCore(dict):
     
     @property
     def coords(self):
-        """Return a Batch of coordinate collections for each dataset."""
-        return type(self)({k: self.CoordCollection(ds) for k, ds in self.items()})
+        """Return a Batch of Coordinates for each dataset."""
+        return type(self)({k: ds.coords.to_dataset() for k, ds in self.items()})
 
     def assign_coords(self, coords=None, **coords_kwargs):
         """
