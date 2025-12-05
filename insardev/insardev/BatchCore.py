@@ -541,13 +541,22 @@ class BatchCore(dict):
             return type(self)(result)
 
         dss = {}
-        # iterate all burst groups
+        # iterate all burst groups (fullBurstID is the first index level)
         for id in keys.index.get_level_values(0).unique():
+            if id not in self:
+                continue
             # select all records for the current burst group
             records = keys[keys.index.get_level_values(0)==id]
-            # filter dates
-            dates = records.startTime.values.astype(str)
-            ds = self[id].sel(date=dates)
+            ds = self[id]
+            
+            # Detect dimension type: date for Stack-like, pair for Batch-like
+            if 'date' in ds.dims:
+                # Stack-like: filter by dates
+                dates = records.startTime.values.astype(str)
+                ds = ds.sel(date=dates)
+            # For pair-based data, we just select the burst if it exists
+            # (pair filtering is handled elsewhere or not needed for simple selection)
+            
             # filter polarizations
             pols = records.polarization.unique()
             if len(pols) > 1:
@@ -923,6 +932,136 @@ class BatchCore(dict):
         from insardev_toolkit import progressbar
         progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
         return type(self)(result)
+
+    def to_dataframe(self,
+                     crs: str | int | None = 'auto',
+                     debug: bool = False) -> pd.DataFrame:
+        """
+        Return a Pandas/GeoPandas DataFrame for all Batch scenes.
+        
+        Extracts attributes from each Dataset in the Batch (from .attrs or dim-indexed data vars)
+        and combines them into a single DataFrame, matching the Stack.to_dataframe format
+        with additional ref/rep columns for pair information.
+
+        Parameters
+        ----------
+        crs : str | int | None, optional
+            Coordinate reference system for the output GeoDataFrame.
+            If 'auto', uses CRS from the data. If None, returns without CRS conversion.
+        debug : bool, optional
+            Print debug information. Default is False.
+
+        Returns
+        -------
+        pandas.DataFrame or geopandas.GeoDataFrame
+            The DataFrame containing Batch scenes with their attributes.
+            Index is (fullBurstID, burst) matching Stack.to_dataframe.
+            For pair-based data, ref and rep columns are added after the index.
+
+        Examples
+        --------
+        >>> df = batch.to_dataframe()
+        >>> df = batch.to_dataframe(crs=4326)
+        """
+        import geopandas as gpd
+        from shapely import wkt
+        import pandas as pd
+
+        if not self:
+            return pd.DataFrame()
+
+        # Detect CRS from data if auto
+        if crs is not None and isinstance(crs, str) and crs == 'auto':
+            sample = next(iter(self.values()))
+            crs = sample.attrs.get('crs', 4326)
+
+        # Detect polarizations
+        sample = next(iter(self.values()))
+        polarizations = [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in sample.data_vars]
+
+        # Detect dimension: 'date' for BatchComplex, 'pair' for others
+        dim = 'date' if 'date' in sample.dims else 'pair'
+
+        # Define the attribute order matching Stack.to_dataframe
+        # Order: fullBurstID, burst, startTime, polarization, flightDirection, pathNumber, subswath, mission, beamModeType, BPR, geometry
+        attr_order = ['fullBurstID', 'burst', 'startTime', 'polarization', 'flightDirection', 
+                      'pathNumber', 'subswath', 'mission', 'beamModeType', 'BPR', 'geometry']
+
+        # Make attributes dataframe from data
+        processed_attrs = []
+        for key, ds in self.items():
+            for idx in range(ds.dims[dim]):
+                processed_attr = {}
+                
+                # Get ref/rep for pair dimension
+                if dim == 'pair':
+                    if 'ref' in ds.coords:
+                        processed_attr['ref'] = pd.Timestamp(ds['ref'].values[idx])
+                    if 'rep' in ds.coords:
+                        processed_attr['rep'] = pd.Timestamp(ds['rep'].values[idx])
+                else:
+                    processed_attr['date'] = pd.Timestamp(ds[dim].values[idx])
+                
+                # Extract attributes from ds.attrs
+                for attr_name in attr_order:
+                    if attr_name in ds.attrs and attr_name not in processed_attr:
+                        value = ds.attrs[attr_name]
+                        if attr_name == 'geometry' and isinstance(value, str):
+                            processed_attr[attr_name] = wkt.loads(value)
+                        elif attr_name == 'startTime':
+                            processed_attr[attr_name] = pd.Timestamp(value)
+                        else:
+                            processed_attr[attr_name] = value
+                
+                processed_attrs.append(processed_attr)
+
+        if not processed_attrs:
+            return pd.DataFrame()
+
+        # Check if we have geometry column for GeoDataFrame
+        has_geometry = 'geometry' in processed_attrs[0]
+        
+        if has_geometry:
+            df = gpd.GeoDataFrame(processed_attrs, crs=4326)
+        else:
+            df = pd.DataFrame(processed_attrs)
+
+        # Add polarization info if not already present
+        if 'polarization' not in df.columns and polarizations:
+            df['polarization'] = ','.join(map(str, polarizations))
+
+        # Round BPR for readability
+        if 'BPR' in df.columns:
+            df['BPR'] = df['BPR'].round(1)
+
+        # Reorder columns to match Stack.to_dataframe format
+        # For pair data: fullBurstID, burst (index), then ref, rep, then rest
+        if 'fullBurstID' in df.columns and 'burst' in df.columns:
+            # Build column order
+            if dim == 'pair':
+                # ref, rep first after index, then startTime, polarization, etc.
+                first_cols = ['fullBurstID', 'burst', 'ref', 'rep']
+            else:
+                first_cols = ['fullBurstID', 'burst', 'date']
+            
+            # Rest of columns in attr_order, excluding index columns and ref/rep/date
+            other_cols = [c for c in attr_order if c not in first_cols and c in df.columns]
+            
+            # Reorder
+            ordered_cols = [c for c in first_cols if c in df.columns] + other_cols
+            df = df[ordered_cols]
+            
+            # Sort and set index
+            df = df.sort_values(by=['fullBurstID', 'burst']).set_index(['fullBurstID', 'burst'])
+            
+            # Move geometry to end if present
+            if has_geometry and 'geometry' in df.columns:
+                df = df.loc[:, df.columns.drop("geometry").tolist() + ["geometry"]]
+
+        # Convert CRS if requested and we have a GeoDataFrame
+        if has_geometry and crs is not None:
+            return df.to_crs(crs)
+        return df
     
     def persist(self):
         return type(self)({
