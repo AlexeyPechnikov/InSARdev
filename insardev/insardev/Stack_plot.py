@@ -259,9 +259,14 @@ class Stack_plot(Stack_export):
     @staticmethod
     def burst_offset(intfs: 'BatchWrap',
                      method: str = 'median',
-                     debug: bool = False) -> tuple[dict[str, float], dict[str, float]]:
+                     debug: bool = False) -> dict[str, float]:
         """
-        Estimate cumulative phase offsets for all bursts to align them.
+        Estimate phase offsets for all bursts using global least-squares optimization.
+        
+        Finds all overlapping burst pairs based on their y,x tile extents, computes
+        pairwise phase differences in overlap regions, then solves a global linear
+        system to find consistent offsets for all bursts. Handles disconnected groups
+        of bursts separately.
         
         Uses row-wise gradient-based alignment: computes mean phase per row (range direction),
         then takes median across rows. This is robust to ionospheric ramps which vary along
@@ -273,7 +278,7 @@ class Stack_plot(Stack_export):
             Batch of wrapped interferograms, optionally pre-filtered by coherence.
             Example: dss.where(corrs.sel(dss).reindex_like(dss, method='nearest') > 0.5)
         method : str, optional
-            Estimation method:
+            Estimation method for pairwise offsets:
             - 'median' (default): Robust median with MAD-based outlier rejection
             - 'mean': Circular mean - faster but less robust
         debug : bool, optional
@@ -281,23 +286,51 @@ class Stack_plot(Stack_export):
         
         Returns
         -------
-        tuple[dict[str, float], dict[str, float]]
-            Two dictionaries:
-            - offsets: burst IDs to cumulative offsets (radians). First burst has offset 0.
-            - confidence: burst IDs to MAD (Median Absolute Deviation) in radians. Lower is better.
-              First burst has confidence 0 (reference).
+        dict[str, float]
+            Dictionary mapping burst IDs to phase offsets (radians).
+            Reference burst(s) in each connected group have offset 0.
             Can be used directly with BatchWrap arithmetic: intfs - offsets
         
         Examples
         --------
         >>> # Filter by coherence and estimate offsets
         >>> dss_filtered = dss.where(corrs.sel(dss).reindex_like(dss, method='nearest') > 0.5)
-        >>> offsets, confidence = Stack.burst_offset(dss_filtered)
+        >>> offsets = Stack.burst_offset(dss_filtered)
         >>> intfs_aligned = dss - offsets
-        >>> # Check quality - lower std means more reliable offset
-        >>> print(confidence)
+        
+        Notes
+        -----
+        Works for any set of bursts: sequential, cross-subswath, cross-scene, or
+        spatially disconnected groups. Each disconnected group is solved independently
+        with its own reference (first burst in sorted order has offset 0).
         """
         import numpy as np
+        from scipy import sparse
+        from scipy.sparse.linalg import lsqr
+        from scipy.sparse.csgraph import connected_components
+                
+        # Minimum valid pixels for reliable phase offset estimation
+        # 50 pixels is enough for statistical reliability
+        MIN_OVERLAP_PIXELS = 50
+        
+        # Minimum pixels per row for row-wise phase estimation
+        # 10 pixels provides enough samples for reliable row mean calculation
+        MIN_ROW_PIXELS = 10
+        
+        # Minimum valid rows for row-wise processing
+        # Need enough rows for median to be robust (5 rows minimum)
+        # If fewer rows qualify, fall back to flat pixel approach
+        MIN_VALID_ROWS = 5
+        
+        # Minimum samples after outlier rejection to accept the result
+        MIN_INLIER_SAMPLES = 10
+        
+        # MAD multiplier for outlier rejection (2.5 = ~99% of normal distribution)
+        MAD_OUTLIER_THRESHOLD = 2.5
+        
+        # Output precision (decimal places for rounding)
+        # 3 decimal places = 0.001 rad =~ 0.01mm
+        OUTPUT_PRECISION = 3
         
         # Circular statistics helper functions
         def circ_wrap(x):
@@ -316,26 +349,59 @@ class Stack_plot(Stack_export):
             """Circular MAD: median of absolute circular deviations from given center"""
             return np.median(np.abs(circ_diff(a, center)))
         
-        def circ_std(a, center):
-            """Circular standard deviation"""
-            diff = circ_diff(a, center)
-            R = np.sqrt(np.mean(np.sin(diff))**2 + np.mean(np.cos(diff))**2)
-            return np.sqrt(-2 * np.log(np.clip(R, 1e-10, 1.0)))
-        
-        # Get sorted burst IDs
+        # Step 1: Collect burst extents for fast overlap lookup
         ids = sorted(intfs.keys())
+        n_bursts = len(ids)
+        id_to_idx = {bid: i for i, bid in enumerate(ids)}
         
-        # First burst has zero offset and zero std (reference)
-        offsets = {ids[0]: 0.0}
-        confidence = {ids[0]: 0.0}
-        cumulative = 0.0
+        if debug:
+            print(f'Collecting extents for {n_bursts} bursts...', flush=True)
         
-        for id1, id2 in zip(ids[:-1], ids[1:]):
-            # Get phase data for both bursts
+        extents = {}  # burst_id -> (y_min, y_max, x_min, x_max)
+        for bid in ids:
+            ds = intfs[bid]
+            # Get first data variable
+            pol = list(ds.data_vars)[0] if hasattr(ds, 'data_vars') else None
+            if pol:
+                da = ds[pol]
+            else:
+                da = ds
+            # Select first pair if pair dimension exists
+            if 'pair' in da.dims:
+                da = da.isel(pair=0)
+            
+            y_coords = da.coords['y'].values
+            x_coords = da.coords['x'].values
+            extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
+        
+        # Step 2: Find all overlapping pairs and compute pairwise offsets
+        if debug:
+            print(f'Finding overlapping pairs...', flush=True)
+        
+        def extents_overlap(e1, e2):
+            """Check if two extents overlap"""
+            y1_min, y1_max, x1_min, x1_max = e1
+            y2_min, y2_max, x2_min, x2_max = e2
+            y_overlap = not (y1_max < y2_min or y2_max < y1_min)
+            x_overlap = not (x1_max < x2_min or x2_max < x1_min)
+            return y_overlap and x_overlap
+        
+        def compute_pairwise_offset(id1, id2):
+            """Compute phase offset between two bursts in their overlap region.
+            
+            Returns: (offset, n_used, debug_info) where debug_info is a dict with:
+                - n_total: total valid pixels in overlap
+                - n_rows: total rows in overlap
+                - n_valid_rows: rows with >= MIN_ROW_PIXELS
+                - n_rowwise: pixels captured by valid rows
+                - n_inliers: rows after outlier rejection (if median method)
+                - n_inlier_pixels: pixels in inlier rows
+                - reject_reason: why overlap was rejected (if offset is None)
+            """
             i1 = intfs[id1]
             i2 = intfs[id2]
             
-            # Get first data variable (VV, VH, etc.)
+            # Get first data variable
             pol = list(i1.data_vars)[0] if hasattr(i1, 'data_vars') else None
             if pol:
                 i1 = i1[pol]
@@ -349,201 +415,352 @@ class Stack_plot(Stack_export):
             
             # Compute phase difference in overlap region
             phase = i2 - i1
-            # Force computation if lazy
             if hasattr(phase, 'compute'):
                 phase = phase.compute()
             
-            # Row-wise alignment: compute mean phase per row (along x/range),
-            # then take median across rows. Robust to ionospheric y-ramps.
-            if 'y' in phase.dims and 'x' in phase.dims:
-                row_means = []
-                row_weights = []
-                for y_idx in range(phase.shape[0]):
-                    row = phase.values[y_idx, :]
-                    row = row[np.isfinite(row)]
-                    if len(row) > 10:
-                        # Unwrap row to handle phase wrapping within the row
-                        row_unwrapped = np.unwrap(row)
-                        # Take mean of unwrapped values, then wrap back
-                        row_mean = circ_wrap(np.mean(row_unwrapped))
-                        row_means.append(row_mean)
-                        row_weights.append(len(row))
-                
-                if len(row_means) > 0:
-                    a = np.array(row_means)
-                    weights = np.array(row_weights)
-                else:
-                    a = np.array([])
-                    weights = np.array([])
-            else:
-                a = phase.values.ravel()
-                a = a[np.isfinite(a)]
-                weights = None
+            # Initialize debug info
+            info = {
+                'n_total': 0,
+                'n_rows': 0,
+                'n_valid_rows': 0,
+                'n_rowwise': 0,
+                'n_inliers': 0,
+                'n_inlier_pixels': 0,
+                'reject_reason': None
+            }
             
-            if a.size == 0:
-                offset, conf = np.nan, np.nan
-                if debug:
-                    print(f'{id1} -> {id2}: NO OVERLAP (0 valid rows)', flush=True)
-            else:
-                # Wrap to [-π, π)
-                a = circ_wrap(a)
-                
-                if debug:
-                    print(f'{id1} -> {id2}: {a.size} valid rows, range [{a.min():.3f}, {a.max():.3f}]', flush=True)
-                
-                if method == 'median':
-                    # Initial estimate
-                    offset = np.median(a)
-                    
-                    # Outlier rejection using MAD
-                    mad = circ_mad(a, offset)
-                    if mad > 0:
-                        inliers = np.abs(circ_diff(a, offset)) <= 2.5 * mad
-                        if np.sum(inliers) > 10:
-                            if debug:
-                                print(f'  Outlier rejection: {a.size} -> {np.sum(inliers)} rows, MAD={mad:.3f}', flush=True)
-                            a_inliers = a[inliers]
-                            if weights is not None:
-                                w_inliers = weights[inliers]
-                                # Weighted median
-                                sorted_idx = np.argsort(a_inliers)
-                                cumsum = np.cumsum(w_inliers[sorted_idx])
-                                median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
-                                offset = a_inliers[sorted_idx[median_idx]]
-                            else:
-                                offset = np.median(a_inliers)
-                            # Compute MAD on inliers as confidence (lower = better)
-                            a = a_inliers
-                    # Use MAD as confidence metric (more robust than std)
-                    conf = circ_mad(a, offset)
-                else:
-                    offset = circ_mean(a)
-                    conf = circ_mad(a, offset)
+            # Get all valid pixels first
+            all_valid = phase.values.ravel()
+            all_valid = all_valid[np.isfinite(all_valid)]
+            info['n_total'] = len(all_valid)
             
-            # Wrap offset to [-π, π] and accumulate
-            offset = circ_wrap(offset)
-            cumulative += offset
-            offsets[id2] = cumulative
-            confidence[id2] = round(conf, 2)
+            if info['n_total'] < MIN_OVERLAP_PIXELS:
+                info['reject_reason'] = f"too few pixels ({info['n_total']} < {MIN_OVERLAP_PIXELS})"
+                return None, 0, info
+            
+            # Row-wise alignment for robustness to ionospheric ramps
+            if 'y' not in phase.dims or 'x' not in phase.dims:
+                info['reject_reason'] = "missing y/x dimensions"
+                return None, 0, info
+            
+            info['n_rows'] = phase.shape[0]
+            row_means = []
+            row_weights = []
+            for y_idx in range(phase.shape[0]):
+                row = phase.values[y_idx, :]
+                row = row[np.isfinite(row)]
+                if len(row) >= MIN_ROW_PIXELS:
+                    row_unwrapped = np.unwrap(row)
+                    row_mean = circ_wrap(np.mean(row_unwrapped))
+                    row_means.append(row_mean)
+                    row_weights.append(len(row))
+            
+            info['n_valid_rows'] = len(row_means)
+            info['n_rowwise'] = sum(row_weights)
+            
+            # Require enough valid rows for robust median
+            if info['n_valid_rows'] < MIN_VALID_ROWS:
+                info['reject_reason'] = f"too few valid rows ({info['n_valid_rows']} < {MIN_VALID_ROWS})"
+                return None, 0, info
+            
+            a = np.array(row_means)
+            weights = np.array(row_weights)
+            n_valid = np.sum(row_weights)
+            
+            # Wrap to [-π, π)
+            a = circ_wrap(a)
+            
+            if method == 'median':
+                offset = np.median(a)
+                mad = circ_mad(a, offset)
+                if mad > 0:
+                    inliers = np.abs(circ_diff(a, offset)) <= MAD_OUTLIER_THRESHOLD * mad
+                    info['n_inliers'] = int(np.sum(inliers))
+                    if info['n_inliers'] >= MIN_INLIER_SAMPLES:
+                        a_inliers = a[inliers]
+                        w_inliers = weights[inliers]
+                        info['n_inlier_pixels'] = int(np.sum(w_inliers))
+                        sorted_idx = np.argsort(a_inliers)
+                        cumsum = np.cumsum(w_inliers[sorted_idx])
+                        median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
+                        offset = a_inliers[sorted_idx[median_idx]]
+                        n_valid = info['n_inlier_pixels']
+                    else:
+                        # Not enough inliers but still use all rows
+                        info['n_inliers'] = len(a)
+                        info['n_inlier_pixels'] = int(np.sum(weights))
+                else:
+                    # MAD is 0, all values identical - use all
+                    info['n_inliers'] = len(a)
+                    info['n_inlier_pixels'] = int(np.sum(weights))
+            else:
+                offset = circ_mean(a)
+                info['n_inliers'] = len(a)
+                info['n_inlier_pixels'] = int(np.sum(weights))
+            
+            return circ_wrap(offset), n_valid, info
+        
+        # Find all pairs with extent overlap, then check for valid pixel overlap
+        pairs = []  # List of (id1, id2, offset, weight)
+        analyzed = set()
+        
+        for i, id1 in enumerate(ids):
+            e1 = extents[id1]
+            for j, id2 in enumerate(ids):
+                if i >= j:
+                    continue
+                pair_key = (id1, id2)
+                if pair_key in analyzed:
+                    continue
+                analyzed.add(pair_key)
+                
+                e2 = extents[id2]
+                if not extents_overlap(e1, e2):
+                    continue
+                
+                # Check valid pixel overlap and compute offset
+                offset, n_used, info = compute_pairwise_offset(id1, id2)
+                
+                if offset is None:
+                    if debug:
+                        print(f'{id1} <-> {id2}: REJECTED - {info["reject_reason"]}', flush=True)
+                        print(f'  pipeline: {info["n_total"]} pixels -> {info["n_rows"]} rows -> '
+                              f'{info["n_valid_rows"]} valid rows (>={MIN_ROW_PIXELS} px) -> '
+                              f'{info["n_rowwise"]} pixels', flush=True)
+                    continue
+                
+                # Weight by overlap quality (sqrt of used pixels)
+                weight = np.sqrt(n_used)
+                pairs.append((id1, id2, offset, weight))
+                
+                if debug:
+                    print(f'{id1} <-> {id2}: offset={offset:.3f}, weight={weight:.1f}', flush=True)
+                    print(f'  pipeline: {info["n_total"]} pixels -> {info["n_rows"]} rows -> '
+                          f'{info["n_valid_rows"]} valid rows (>={MIN_ROW_PIXELS} px) -> '
+                          f'{info["n_rowwise"]} pixels -> {info["n_inliers"]} inlier rows -> '
+                          f'{info["n_inlier_pixels"]} pixels', flush=True)
+        
+        if debug:
+            print(f'Found {len(pairs)} overlapping pairs', flush=True)
+        
+        if len(pairs) == 0:
+            # No overlaps found - return all zeros
+            return {bid: 0.0 for bid in ids}
+        
+        # Step 3: Build connectivity graph and find connected components
+        adjacency = sparse.lil_matrix((n_bursts, n_bursts))
+        for id1, id2, _, _ in pairs:
+            i, j = id_to_idx[id1], id_to_idx[id2]
+            adjacency[i, j] = 1
+            adjacency[j, i] = 1
+        
+        n_components, labels = connected_components(adjacency.tocsr(), directed=False)
+        
+        if debug:
+            print(f'Found {n_components} connected component(s)', flush=True)
+        
+        # Step 4: Solve for offsets in each connected component
+        offsets = {}
+        
+        for comp in range(n_components):
+            # Get burst indices in this component
+            comp_indices = np.where(labels == comp)[0]
+            comp_ids = [ids[i] for i in comp_indices]
+            comp_id_to_local = {bid: i for i, bid in enumerate(comp_ids)}
+            n_comp = len(comp_ids)
             
             if debug:
-                print(f'{id1} -> {id2}: offset={offset:.3f}, MAD={conf:.3f}, cumulative={cumulative:.3f}', flush=True)
+                print(f'Component {comp}: {n_comp} bursts', flush=True)
+            
+            if n_comp == 1:
+                # Single burst - offset is 0
+                offsets[comp_ids[0]] = 0.0
+                continue
+            
+            # Get pairs within this component
+            comp_pairs = [(id1, id2, off, w) for id1, id2, off, w in pairs
+                          if id1 in comp_id_to_local and id2 in comp_id_to_local]
+            
+            if len(comp_pairs) == 0:
+                # No pairs - all offsets are 0
+                for bid in comp_ids:
+                    offsets[bid] = 0.0
+                continue
+            
+            # Build linear system: A @ x = b
+            # For each pair (i, j) with offset d_ij: x_j - x_i = d_ij
+            # Design matrix A: row k has +1 at j, -1 at i
+            n_pairs = len(comp_pairs)
+            A = sparse.lil_matrix((n_pairs + 1, n_comp))
+            b = np.zeros(n_pairs + 1)
+            W = np.zeros(n_pairs + 1)
+            
+            for k, (id1, id2, off, w) in enumerate(comp_pairs):
+                i = comp_id_to_local[id1]
+                j = comp_id_to_local[id2]
+                A[k, i] = -1
+                A[k, j] = +1
+                b[k] = off
+                W[k] = w
+            
+            # Add constraint: first burst has offset 0 (reference)
+            # Weight should dominate other observations to enforce the constraint
+            # Using sum of all pair weights * 100 ensures constraint is effectively exact
+            constraint_weight = np.sum(W[:-1]) * 100 if np.sum(W[:-1]) > 0 else 1e6
+            A[n_pairs, 0] = 1
+            b[n_pairs] = 0
+            W[n_pairs] = constraint_weight
+            
+            # Weighted least squares: minimize ||sqrt(W) @ (A @ x - b)||^2
+            A_csr = A.tocsr()
+            sqrt_W = np.sqrt(W)
+            A_weighted = sparse.diags(sqrt_W) @ A_csr
+            b_weighted = sqrt_W * b
+            
+            # Solve using LSQR
+            result = lsqr(A_weighted, b_weighted)
+            x = result[0]
+            
+            # Wrap offsets to [-π, π) and round to avoid floating point noise
+            for i, bid in enumerate(comp_ids):
+                offsets[bid] = round(float(circ_wrap(x[i])), OUTPUT_PRECISION)
+            
+            if debug:
+                for bid in comp_ids:
+                    print(f'  {bid}: offset={offsets[bid]:.{OUTPUT_PRECISION}f}', flush=True)
         
-        return offsets, confidence
+        return offsets
 
     @staticmethod
-    def burst_offsets(intfs_list: list['BatchWrap'],
-                      method: str = 'median',
-                      debug: bool = False) -> tuple[dict[str, float], dict[str, float]]:
+    def burst_discrepancy(intfs: 'BatchWrap', debug: bool = False) -> float:
         """
-        Estimate cumulative phase offsets using multiple coherence thresholds and select the best.
+        Measure phase offset discrepancy across all burst overlaps.
         
-        Runs burst_offset on each BatchWrap in the list and selects the complete result
-        from the threshold with the lowest total MAD (sum of MAD across all transitions).
+        Computes the weighted mean of absolute median phase differences
+        across all overlapping regions. After offset correction with burst_offset(),
+        these median differences should be close to zero.
         
         Parameters
         ----------
-        intfs_list : list[BatchWrap]
-            List of BatchWrap objects, typically filtered at different coherence thresholds.
-            Example: [dss.where(corr > 0.5), dss.where(corr > 0.6), dss.where(corr > 0.7)]
-        method : str, optional
-            Estimation method passed to burst_offset. Default is 'median'.
+        intfs : BatchWrap
+            Batch of wrapped interferograms, optionally pre-filtered by coherence.
         debug : bool, optional
-            Print debug information. Default is False.
+            Print debug information for each overlap. Default is False.
         
         Returns
         -------
-        tuple[dict[str, float], dict[str, float]]
-            Two dictionaries:
-            - offsets: burst IDs to cumulative offsets (radians) from the best threshold.
-            - confidence: burst IDs to MAD (radians) for each transition.
+        float
+            Weighted mean absolute median phase discrepancy in radians.
+            0.0 = perfect alignment, π = maximum discrepancy.
+            Returns 0.0 if no valid overlaps found.
+            
+            Practical interpretation:
+            
+            - < 0.1 rad: Excellent alignment
+            - 0.1 - 0.5 rad: Good alignment
+            - 0.5 - 1.0 rad: Moderate misalignment
+            - > 1.0 rad: Poor alignment
         
         Examples
         --------
-        >>> intfs1 = dss.where(corrs.sel(dss).reindex_like(dss, method='nearest') > 0.5)
-        >>> intfs2 = dss.where(corrs.sel(dss).reindex_like(dss, method='nearest') > 0.6)
-        >>> intfs3 = dss.where(corrs.sel(dss).reindex_like(dss, method='nearest') > 0.7)
-        >>> offsets, confidence = Stack.burst_offsets([intfs1, intfs2, intfs3])
-        >>> intfs_aligned = dss - offsets
+        >>> # Compare before and after alignment
+        >>> before = Stack.burst_discrepancy(intfs)
+        >>> offsets = Stack.burst_offset(intfs)
+        >>> after = Stack.burst_discrepancy(intfs - offsets)
+        >>> print(f'Discrepancy reduced from {before:.3f} to {after:.3f} rad')
         """
         import numpy as np
-        from .Stack_plot import Stack_plot as Stack
         
-        if not intfs_list:
-            raise ValueError("intfs_list cannot be empty")
+        def circ_wrap(x):
+            """Wrap to [-π, π)"""
+            return (x + np.pi) % (2*np.pi) - np.pi
         
-        # Run burst_offset for each input, also track number of valid rows
-        all_results = []
-        all_nrows = []
-        for idx, intfs in enumerate(intfs_list):
-            if debug:
-                print(f'=== Processing threshold {idx + 1}/{len(intfs_list)} ===', flush=True)
-            offsets, confidence = Stack.burst_offset(intfs, method=method, debug=debug)
-            all_results.append((offsets, confidence))
-            if debug:
-                print(flush=True)
+        def circ_mean(phases):
+            """Circular mean"""
+            return np.arctan2(np.mean(np.sin(phases)), np.mean(np.cos(phases)))
         
-        # Get all burst IDs (sorted)
-        ids = list(all_results[0][0].keys())
+        # Collect burst extents
+        ids = sorted(intfs.keys())
         
-        # Filter out results with NaN offsets (insufficient data)
-        valid_results = []
-        for idx, (offsets, confidence) in enumerate(all_results):
-            has_nan = any(np.isnan(offsets[burst_id]) for burst_id in ids)
-            if not has_nan:
-                valid_results.append((idx, offsets, confidence))
+        extents = {}
+        for bid in ids:
+            ds = intfs[bid]
+            pol = list(ds.data_vars)[0] if hasattr(ds, 'data_vars') else None
+            da = ds[pol] if pol else ds
+            if 'pair' in da.dims:
+                da = da.isel(pair=0)
+            y_coords = da.coords['y'].values
+            x_coords = da.coords['x'].values
+            extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
         
-        if not valid_results:
-            # All results have NaN, return the first one
-            best_offsets, best_confidence = all_results[0]
-            best_idx = 0
-        elif len(valid_results) == 1:
-            # Only one valid result
-            best_idx, best_offsets, best_confidence = valid_results[0]
-        else:
-            # Use median voting: for each burst, take median offset across all valid thresholds
-            # This is robust to outliers from both too-low and too-high coherence thresholds
-            median_offsets = {ids[0]: 0.0}
-            median_confidence = {ids[0]: 0.0}
-            
-            for burst_id in ids[1:]:
-                # Collect offsets from all valid thresholds
-                offsets_list = [offsets[burst_id] for _, offsets, _ in valid_results]
-                # Collect corresponding MADs
-                mads_list = [confidence[burst_id] for _, _, confidence in valid_results]
+        def extents_overlap(e1, e2):
+            y1_min, y1_max, x1_min, x1_max = e1
+            y2_min, y2_max, x2_min, x2_max = e2
+            y_overlap = not (y1_max < y2_min or y2_max < y1_min)
+            x_overlap = not (x1_max < x2_min or x2_max < x1_min)
+            return y_overlap and x_overlap
+        
+        # Compute weighted mean absolute phase difference across all overlaps
+        total_weight = 0.0
+        weighted_discrepancy_sum = 0.0
+        
+        analyzed = set()
+        for i, id1 in enumerate(ids):
+            e1 = extents[id1]
+            for j, id2 in enumerate(ids):
+                if i >= j:
+                    continue
+                pair_key = (id1, id2)
+                if pair_key in analyzed:
+                    continue
+                analyzed.add(pair_key)
                 
-                # Use median offset
-                median_offsets[burst_id] = float(np.median(offsets_list))
-                # Use median MAD as confidence
-                median_confidence[burst_id] = round(float(np.median(mads_list)), 2)
-            
-            best_offsets = median_offsets
-            best_confidence = median_confidence
-            best_idx = -1  # Indicates median voting was used
+                e2 = extents[id2]
+                if not extents_overlap(e1, e2):
+                    continue
+                
+                # Get phase difference in overlap
+                i1 = intfs[id1]
+                i2 = intfs[id2]
+                pol = list(i1.data_vars)[0] if hasattr(i1, 'data_vars') else None
+                if pol:
+                    i1 = i1[pol]
+                    i2 = i2[pol]
+                if 'pair' in i1.dims:
+                    i1 = i1.isel(pair=0)
+                if 'pair' in i2.dims:
+                    i2 = i2.isel(pair=0)
+                
+                phase_diff = i2 - i1
+                if hasattr(phase_diff, 'compute'):
+                    phase_diff = phase_diff.compute()
+                
+                valid = phase_diff.values.ravel()
+                valid = valid[np.isfinite(valid)]
+                
+                if len(valid) == 0:
+                    continue
+                
+                # Wrap to [-π, π)
+                valid = circ_wrap(valid)
+                
+                # median phase difference is the offset estimation
+                median_diff = np.median(valid)
+                abs_discrepancy = np.abs(circ_wrap(median_diff))
+                weight = len(valid)
+                
+                weighted_discrepancy_sum += abs_discrepancy * weight
+                total_weight += weight
+                
+                if debug:
+                    print(f'{id1} <-> {id2}: median_diff={median_diff:.3f} rad, weight={weight}', flush=True)
         
-        # Compute total MAD for reporting
-        total_mads = []
-        for offsets, confidence in all_results:
-            mads = [confidence[burst_id] for burst_id in ids[1:]]
-            valid_mads = [m for m in mads if not np.isnan(m)]
-            total = np.sum(valid_mads) if valid_mads else np.inf
-            total_mads.append(total)
+        if total_weight == 0:
+            return 0.0
+        
+        discrepancy = weighted_discrepancy_sum / total_weight
         
         if debug:
-            print(f'=== Summary ===', flush=True)
-            print(f'Total MAD per threshold: {[f"{m:.2f}" for m in total_mads]}', flush=True)
-            print(f'Valid thresholds (no NaN): {[i+1 for i, _, _ in valid_results]}', flush=True)
-            for idx, (offsets, confidence) in enumerate(all_results):
-                marker = ' <-- SELECTED' if idx == best_idx else ''
-                print(f'Threshold {idx + 1}{marker}:', flush=True)
-                for burst_id in ids:
-                    off = offsets[burst_id]
-                    mad = confidence[burst_id]
-                    off_str = f'{off:.3f}' if not np.isnan(off) else 'nan'
-                    print(f'  {burst_id}: offset={off_str}, MAD={mad}', flush=True)
-            if best_idx == -1:
-                print(f'MEDIAN VOTING result:', flush=True)
-                for burst_id in ids:
-                    print(f'  {burst_id}: offset={best_offsets[burst_id]:.3f}, MAD={best_confidence[burst_id]}', flush=True)
+            print(f'Total discrepancy: {discrepancy:.4f} rad (from {total_weight:.0f} pixels)', flush=True)
         
-        return best_offsets, best_confidence
+        return round(discrepancy, 3)
