@@ -660,6 +660,21 @@ class Stack_plot(Stack_export):
         if debug:
             print(f'burst_polyfit(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s)', flush=True)
 
+        # Extract pathNumber and subswath attributes for each burst (required for degree=1)
+        # Use pathNumber + subswath as track key to prevent inter-path same-subswath overlaps
+        # in near-polar regions from being used for ramp estimation
+        burst_track = {}  # pathNumber + subswath (e.g., '33IW3')
+        burst_subswath = {}  # just subswath for debug output
+        for bid in ids:
+            ds = intfs[bid]
+            if degree == 1:
+                if 'subswath' not in ds.attrs:
+                    raise ValueError(f"Burst '{bid}' missing required 'subswath' attribute for ramp estimation")
+                if 'pathNumber' not in ds.attrs:
+                    raise ValueError(f"Burst '{bid}' missing required 'pathNumber' attribute for ramp estimation")
+                burst_track[bid] = f"{ds.attrs['pathNumber']}{ds.attrs['subswath']}"
+                burst_subswath[bid] = ds.attrs['subswath']
+
         extents = {}
         x_centers = {}
 
@@ -758,17 +773,29 @@ class Stack_plot(Stack_export):
             return (id1, id2, pair_idx, circ_wrap(offset), ramp_val, x_centroid, n_valid)
 
         # Find overlapping burst pairs
+        # For degree=1 (ramp), only use same-subswath overlaps (along-track)
+        # For degree=0 (offset), use all overlaps including cross-subswath
         all_overlap_pairs = []
+        cross_subswath_skipped = 0
         for i, id1 in enumerate(ids):
             e1 = extents[id1]
             for j, id2 in enumerate(ids):
                 if i >= j:
                     continue
                 if extents_overlap(e1, extents[id2]):
+                    if degree == 1:
+                        # For ramp estimation, only use same-track overlaps (same path + subswath)
+                        # This prevents inter-path same-subswath overlaps in near-polar regions
+                        track1, track2 = burst_track[id1], burst_track[id2]
+                        if track1 != track2:
+                            cross_subswath_skipped += 1
+                            continue
                     all_overlap_pairs.append((id1, id2))
 
         if debug:
             print(f'Found {len(all_overlap_pairs)} overlapping burst pairs', flush=True)
+            if degree == 1 and cross_subswath_skipped > 0:
+                print(f'  (skipped {cross_subswath_skipped} cross-track pairs for ramp estimation)', flush=True)
 
         # Build all lazy phase differences (dask graphs)
         jobs = []
@@ -1043,6 +1070,18 @@ class Stack_plot(Stack_export):
         n_pairs = sample_da.sizes.get('pair', 1)
         has_pair_dim = 'pair' in sample_da.dims
 
+        # Extract pathNumber and subswath attributes for each burst (required for stats)
+        burst_subswath = {}
+        burst_track = {}  # pathNumber + subswath for detailed debug output
+        for bid in ids:
+            ds = intfs[bid]
+            if 'subswath' not in ds.attrs:
+                raise ValueError(f"Burst '{bid}' missing required 'subswath' attribute")
+            if 'pathNumber' not in ds.attrs:
+                raise ValueError(f"Burst '{bid}' missing required 'pathNumber' attribute")
+            burst_subswath[bid] = ds.attrs['subswath']
+            burst_track[bid] = f"{ds.attrs['pathNumber']}{ds.attrs['subswath']}"
+
         extents = {}
         for bid in ids:
             ds = intfs[bid]
@@ -1123,7 +1162,8 @@ class Stack_plot(Stack_export):
         weighted_sums = [0.0] * n_pairs
 
         # Per-subswath tracking for debug
-        subswath_stats = {}  # {(subswath, pair_idx): {'sum': float, 'weight': float, 'count': int}}
+        subswath_stats = {}  # {(subswath, pair_idx): {'sum': float, 'weight': float, 'count': int, 'values': []}}
+        per_overlap_discrepancies = {p: [] for p in range(n_pairs)}  # For computing std
 
         for result in results:
             if result is None:
@@ -1131,28 +1171,26 @@ class Stack_plot(Stack_export):
             pair_idx, abs_discrepancy, weight, id1, id2, median_diff = result
             weighted_sums[pair_idx] += abs_discrepancy * weight
             total_weights[pair_idx] += weight
+            per_overlap_discrepancies[pair_idx].append(abs_discrepancy)
 
-            # Extract subswath info for debug stats
+            # Extract track info for debug stats
             if debug:
-                # Determine subswath from burst IDs
-                sw1 = sw2 = 'unknown'
-                if '_IW' in id1:
-                    sw1 = 'IW' + id1.split('_IW')[1][0]
-                if '_IW' in id2:
-                    sw2 = 'IW' + id2.split('_IW')[1][0]
+                track1 = burst_track[id1]
+                track2 = burst_track[id2]
 
-                # Categorize: same subswath or cross-subswath
-                if sw1 == sw2:
-                    sw_key = sw1
+                # Categorize: same track or cross-track
+                if track1 == track2:
+                    track_key = track1
                 else:
-                    sw_key = f'{sw1}-{sw2}'
+                    track_key = f'{track1}-{track2}'
 
-                key = (sw_key, pair_idx)
+                key = (track_key, pair_idx)
                 if key not in subswath_stats:
-                    subswath_stats[key] = {'sum': 0.0, 'weight': 0.0, 'count': 0}
+                    subswath_stats[key] = {'sum': 0.0, 'weight': 0.0, 'count': 0, 'values': []}
                 subswath_stats[key]['sum'] += abs_discrepancy * weight
                 subswath_stats[key]['weight'] += weight
                 subswath_stats[key]['count'] += 1
+                subswath_stats[key]['values'].append(abs_discrepancy)
 
         discrepancies = []
         for p in range(n_pairs):
@@ -1162,15 +1200,157 @@ class Stack_plot(Stack_export):
                 discrepancies.append(round(weighted_sums[p] / total_weights[p], 3))
 
         if debug:
-            print(f'Overall discrepancy: {discrepancies}', flush=True)
-            # Print per-subswath stats (only for pair_idx=0 to avoid clutter)
-            print('Per-subswath discrepancy (pair 0):', flush=True)
-            for (sw, pair_idx), stats in sorted(subswath_stats.items()):
+            # Compute std for overall discrepancy
+            for p in range(n_pairs):
+                vals = per_overlap_discrepancies[p]
+                if len(vals) > 1:
+                    std = np.std(vals)
+                    print(f'Pair {p} discrepancy: {discrepancies[p]:.3f} ± {std:.3f} rad ({len(vals)} overlaps)', flush=True)
+                else:
+                    print(f'Pair {p} discrepancy: {discrepancies[p]:.3f} rad ({len(vals)} overlaps)', flush=True)
+
+            # Print per-track stats (only for pair_idx=0 to avoid clutter)
+            print('Per-track discrepancy (pair 0):', flush=True)
+            for (track, pair_idx), stats in sorted(subswath_stats.items()):
                 if pair_idx == 0 and stats['weight'] > 0:
-                    sw_disc = stats['sum'] / stats['weight']
-                    print(f'  {sw}: {sw_disc:.3f} rad ({stats["count"]} overlaps)', flush=True)
+                    track_disc = stats['sum'] / stats['weight']
+                    vals = stats['values']
+                    if len(vals) > 1:
+                        track_std = np.std(vals)
+                        print(f'  {track}: {track_disc:.3f} ± {track_std:.3f} rad ({stats["count"]} overlaps)', flush=True)
+                    else:
+                        print(f'  {track}: {track_disc:.3f} rad ({stats["count"]} overlaps)', flush=True)
 
         # Return single value for single pair, list for multiple
         if n_pairs == 1 and not has_pair_dim:
             return discrepancies[0]
         return discrepancies
+
+    @staticmethod
+    def burst_align(intfs: 'BatchWrap',
+                    degree: int = 1,
+                    method: str = 'median',
+                    debug: bool = False) -> 'BatchWrap':
+        """
+        Align burst interferograms by removing phase offsets and optionally ionospheric ramps.
+
+        Uses a multi-step approach for optimal alignment:
+        - degree=0: Single-step offset correction
+        - degree=1: 3-step correction (offset → ramp → re-offset) for ionospheric ramp removal
+
+        The 3-step approach produces consistent fringes across bursts by removing
+        per-track ionospheric ramps, which is essential for deformation analysis.
+
+        Parameters
+        ----------
+        intfs : BatchWrap
+            Batch of wrapped interferograms, optionally pre-filtered by coherence.
+            Must have 'subswath' and 'pathNumber' attributes on each burst dataset.
+            Can have multiple pairs (pair dimension).
+        degree : int, optional
+            Correction degree:
+            - 0: Offset-only correction (faster, good overlap alignment)
+            - 1 (default): Offset + linear ramp correction (better fringe continuity)
+        method : str, optional
+            Estimation method: 'median' (robust, default) or 'mean' (faster).
+        debug : bool, optional
+            Print debug information. Default is False.
+
+        Returns
+        -------
+        BatchWrap
+            Aligned interferograms with phase corrections applied.
+
+        Examples
+        --------
+        >>> # Simple alignment with ramp correction (recommended)
+        >>> aligned = Stack.burst_align(intfs)
+        >>>
+        >>> # Offset-only alignment
+        >>> aligned = Stack.burst_align(intfs, degree=0)
+        >>>
+        >>> # With coherence filtering
+        >>> aligned = Stack.burst_align(intfs.where(corr >= 0.3))
+        >>>
+        >>> # Check alignment quality
+        >>> print('Discrepancy:', Stack.burst_discrepancy(aligned))
+
+        Notes
+        -----
+        For degree=1, the function performs:
+        1. Estimate and remove offsets
+        2. Estimate and remove ramps (using same-track overlaps only)
+        3. Re-estimate offsets on ramp-corrected data
+        4. Combine into final [ramp, offset] coefficients
+
+        This 3-step approach achieves better fringe continuity than single-step
+        methods because it separates the offset and ramp estimation, avoiding
+        cross-contamination between the two.
+        """
+        from . import Stack
+
+        if degree == 0:
+            # Single-step offset correction
+            if debug:
+                print('burst_align(degree=0): single-step offset correction', flush=True)
+
+            offsets = Stack.burst_polyfit(intfs, degree=0, method=method, debug=debug)
+            aligned = intfs - offsets
+
+            if debug:
+                disc = Stack.burst_discrepancy(aligned, debug=True)
+                print(f'Final discrepancy: {disc}', flush=True)
+
+            return aligned
+
+        elif degree == 1:
+            # 3-step offset-ramp-offset correction
+            if debug:
+                print('burst_align(degree=1): 3-step offset-ramp-offset correction', flush=True)
+
+            # Step 1: Estimate offsets
+            if debug:
+                print('\nStep 1: Estimate offsets...', flush=True)
+            offsets1 = Stack.burst_polyfit(intfs, degree=0, method=method, debug=debug)
+            intfs1 = intfs - offsets1
+
+            # Step 2: Estimate ramps (uses same-track overlaps only)
+            if debug:
+                print('\nStep 2: Estimate ramps...', flush=True)
+            ramps = Stack.burst_polyfit(intfs1, degree=1, method=method, debug=debug)
+            intfs2 = intfs1 - intfs1.polyval(ramps)
+
+            # Step 3: Re-estimate offsets
+            if debug:
+                print('\nStep 3: Re-estimate offsets...', flush=True)
+            offsets2 = Stack.burst_polyfit(intfs2, degree=0, method=method, debug=debug)
+
+            # Combine coefficients: [ramp, offset1 + ramp_intercept + offset2]
+            # Detect if multi-pair
+            sample_bid = list(offsets1.keys())[0]
+            is_multi_pair = isinstance(offsets1[sample_bid], list)
+
+            if is_multi_pair:
+                n_pairs = len(offsets1[sample_bid])
+                coeffs = {
+                    b: [[ramps[b][p][0], ramps[b][p][1] + offsets1[b][p] + offsets2[b][p]]
+                        for p in range(n_pairs)]
+                    for b in offsets1
+                }
+            else:
+                coeffs = {
+                    b: [ramps[b][0], ramps[b][1] + offsets1[b] + offsets2[b]]
+                    for b in offsets1
+                }
+
+            aligned = intfs - intfs.polyval(coeffs)
+
+            if debug:
+                print('\nFinal alignment:', flush=True)
+                disc = Stack.burst_discrepancy(aligned, debug=True)
+                print(f'Final discrepancy: {disc}', flush=True)
+
+            return aligned
+
+        else:
+            raise ValueError(f"degree must be 0 or 1, got {degree}")
