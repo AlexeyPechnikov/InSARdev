@@ -8,14 +8,216 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_unwrap_snaphu import Stack_unwrap_snaphu
-from insardev_toolkit import progressbar
+from .Stack_multilooking import Stack_multilooking
 # required for function decorators
 from numba import jit
 # import directive is not compatible to numba
 import numpy as np
 
-class Stack_unwrap(Stack_unwrap_snaphu):
+class Stack_unwrap(Stack_multilooking):
+
+    @staticmethod
+    def _get_2d_edges(shape):
+        """
+        Construct edges for a 2D grid graph with 4-connectivity.
+
+        Parameters
+        ----------
+        shape : tuple
+            Shape of the 2D grid (height, width).
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape (n_edges, 2) containing pairs of connected node indices.
+        """
+        nodes = np.arange(np.prod(shape)).reshape(shape)
+        edges = np.concatenate(
+            (
+                np.stack([nodes[:, :-1].ravel(), nodes[:, 1:].ravel()], axis=1),
+                np.stack([nodes[:-1, :].ravel(), nodes[1:, :].ravel()], axis=1),
+            ),
+            axis=0,
+        )
+        return edges
+
+    @staticmethod
+    def _branch_cut(phase, correlation=None, max_jump=1, norm=1, scale=2**16 - 1, max_iters=100):
+        """
+        Phase unwrapping using branch-cut algorithm with max-flow optimization.
+
+        This algorithm minimizes the total weighted phase discontinuities by finding
+        optimal branch cuts using Google OR-Tools max-flow solver.
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            2D array of wrapped phase values in radians.
+        correlation : np.ndarray, optional
+            2D array of correlation values for weighting edges.
+        max_jump : int, optional
+            Maximum phase jump step. Default is 1.
+        norm : float, optional
+            P-norm for energy calculation. Default is 1.
+        scale : float, optional
+            Scaling factor for integer conversion. Default is 2**16 - 1.
+        max_iters : int, optional
+            Maximum iterations per jump step. Default is 100.
+
+        Returns
+        -------
+        np.ndarray
+            2D array of unwrapped phase values in radians.
+        """
+        from ortools.graph.python import max_flow
+
+        shape = phase.shape
+        # flatten and normalize phase to cycles (divide by 2π)
+        # so that jumps of 1 correspond to one cycle
+        phase_flat = (phase.ravel().astype(np.float64)) / (2 * np.pi)
+
+        # handle NaN values - create mask for valid pixels
+        valid_mask = ~np.isnan(phase_flat)
+        if not np.any(valid_mask):
+            return np.full(shape, np.nan, dtype=np.float32)
+
+        # get edges for valid pixels only
+        all_edges = Stack_unwrap._get_2d_edges(shape)
+
+        # filter edges to include only those between valid pixels
+        valid_edges_mask = valid_mask[all_edges[:, 0]] & valid_mask[all_edges[:, 1]]
+        edges = all_edges[valid_edges_mask]
+
+        if len(edges) == 0:
+            return np.full(shape, np.nan, dtype=np.float32)
+
+        # prepare correlation weights if provided
+        corr_flat = None
+        if correlation is not None:
+            corr_flat = correlation.ravel().astype(np.float64)
+
+        def scale_phase(x):
+            return np.round(scale * x).astype(np.int64)
+
+        def p_norm(x):
+            return np.abs(x) ** norm
+
+        def safe_log(x, epsilon=1e-10):
+            return np.log(np.maximum(x, epsilon))
+
+        nodes = phase_flat.size
+        source = nodes
+        sink = nodes + 1
+        jumps = np.zeros(nodes + 2, dtype=np.int64)
+
+        def energy_estimate(jumps, phase_flat, i, j):
+            return np.sum(p_norm(jumps[j] - jumps[i] - phase_flat[i] + phase_flat[j]))
+
+        energy_prev = energy_estimate(jumps, phase_flat, edges[:, 0], edges[:, 1])
+        jump_step = max_jump
+
+        while jump_step >= 1:
+            iter_count = 0
+            while iter_count < max_iters:
+                max_flow_solver = max_flow.SimpleMaxFlow()
+
+                i, j = edges[:, 0], edges[:, 1]
+                phase_diff = phase_flat[i] - phase_flat[j]
+                phase_res = (jumps[j] - jumps[i]) - phase_diff
+                energy_res = p_norm(phase_res)
+                energy_res_down = p_norm(phase_res - jump_step)
+                energy_res_up = p_norm(phase_res + jump_step)
+                weight = np.maximum(0, (energy_res_up - energy_res) + (energy_res_down - energy_res))
+
+                if corr_flat is not None:
+                    correlation_ij = (corr_flat[i] + corr_flat[j]) / 2
+                    # avoid division by zero for low correlation
+                    weight = weight / np.maximum(-safe_log(correlation_ij), 0.1)
+
+                # add forward and backward edges
+                max_flow_solver.add_arcs_with_capacity(
+                    edges[:, 0].astype(np.int32),
+                    edges[:, 1].astype(np.int32),
+                    scale_phase(weight)
+                )
+                max_flow_solver.add_arcs_with_capacity(
+                    edges[:, 1].astype(np.int32),
+                    edges[:, 0].astype(np.int32),
+                    np.zeros(len(weight), dtype=np.int64)
+                )
+
+                # compute source/sink weights
+                weight_source = np.zeros(nodes)
+                weight_sink = np.zeros(nodes)
+
+                diff_up_down = energy_res_up - energy_res
+                diff_down_up = energy_res - energy_res_up
+                positive_diff_up_down = np.maximum(0, diff_up_down)
+                negative_diff_up_down = np.minimum(0, diff_up_down)
+                positive_diff_down_up = np.maximum(0, diff_down_up)
+                negative_diff_down_up = np.minimum(0, diff_down_up)
+
+                np.add.at(weight_source, i, positive_diff_up_down)
+                np.add.at(weight_source, j, positive_diff_down_up)
+                np.add.at(weight_sink, i, -negative_diff_up_down)
+                np.add.at(weight_sink, j, -negative_diff_down_up)
+
+                # add source and sink edges
+                node_indices = np.arange(nodes, dtype=np.int32)
+                source_nodes = np.full(nodes, source, dtype=np.int32)
+                sink_nodes = np.full(nodes, sink, dtype=np.int32)
+
+                max_flow_solver.add_arcs_with_capacity(source_nodes, node_indices, scale_phase(weight_source))
+                max_flow_solver.add_arcs_with_capacity(node_indices, sink_nodes, scale_phase(weight_sink))
+
+                status = max_flow_solver.solve(source, sink)
+                if status != max_flow.SimpleMaxFlow.OPTIMAL:
+                    break
+
+                source_nodes_cut = max_flow_solver.get_source_side_min_cut()
+                jumps[source_nodes_cut] += jump_step
+
+                energy = energy_estimate(jumps, phase_flat, edges[:, 0], edges[:, 1])
+
+                if energy < energy_prev:
+                    energy_prev = energy
+                    iter_count += 1
+                else:
+                    jumps[source_nodes_cut] -= jump_step
+                    break
+
+            jump_step //= 2
+
+        # compute unwrapped phase: original phase + jumps converted to radians
+        # jumps are integer cycles, multiply by 2π to get radians
+        unwrapped = phase.ravel() + jumps[:-2] * (2 * np.pi)
+        unwrapped = unwrapped.reshape(shape).astype(np.float32)
+
+        # restore NaN values
+        unwrapped[np.isnan(phase)] = np.nan
+
+        return unwrapped
+
+    @staticmethod
+    def _conncomp_2d(phase):
+        """
+        Compute connected components for a 2D phase array.
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            2D array of phase values (NaN indicates invalid pixels).
+
+        Returns
+        -------
+        np.ndarray
+            2D array of connected component labels (0 for invalid pixels).
+        """
+        from scipy.ndimage import label
+
+        valid_mask = ~np.isnan(phase)
+        labeled_array, num_features = label(valid_mask)
+        return labeled_array.astype(np.int32)
 
     @staticmethod
     def wrap(data_pairs):
@@ -463,177 +665,149 @@ class Stack_unwrap(Stack_unwrap_snaphu):
     
         return model.rename('unwrap')
 
-    def _unwrap_snaphu(self, phase, weight=None, conf=None, conncomp=False):
+    def _unwrap_2d(self, phase_da, weight_da=None, conncomp_flag=False):
         """
-        Limit number of processes for tiled multicore SNAPHU configuration:
-        with dask.config.set(scheduler='single-threaded'):
-            stack.unwrap2d_snaphu()...).phase.compute()
-        or
-        with dask.config.set(scheduler='threads', num_workers=2):
-            stack.unwrap2d_snaphu()...).phase.plot.imshow()
-        See for reference: https://docs.dask.org/en/stable/scheduler-overview.html
-        """
-        import xarray as xr
-        import numpy as np
-        import dask
-
-        #print ('_unwrap_snaphu', phase, weight, conf, conncomp)
-
-        #assert isinstance(phase, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: phase should be a list or tuple or Dataset or DataArray'
-        assert isinstance(phase, xr.DataArray), 'ERROR: phase should be a DataArray'
-        assert len(list(phase.shape)) == 2 or len(list(phase.shape)) == 3, 'ERROR: phase should be 2D or 3D array'
-        assert weight is None or isinstance(weight, xr.DataArray), 'ERROR: optional weight should be a DataArray'
-        assert weight is None or len(list(weight.shape)) == 2 or len(list(weight.shape)) == 3, 'ERROR: optional weight should be 2D or 3D array'
-        assert weight is None or phase.shape == weight.shape, 'ERROR: phase and optional weight variables should have the same shape'
-
-        if len(phase.dims) == 2:
-            stackvar = None
-        else:
-            stackvar = phase.dims[0]
-
-        def _snaphu(ind):
-            ds = self.snaphu(self.wrap(phase.isel({stackvar: ind}) if stackvar is not None else phase),
-                             weight.isel({stackvar: ind})  if stackvar is not None and weight is not None else weight,
-                             conf=conf, conncomp=conncomp)
-            if conncomp:
-                # # select the largest connected component
-#                 hist = np.unique(ds.conncomp.values, return_counts=True)
-#                 idxmax = np.argmax(hist[1])
-#                 valmax = hist[0][idxmax]
-#                 # select unwrap phase for the largest connected area
-#                 return np.stack([ds.phase.where(ds.conncomp==valmax).values, ds.conncomp.values])
-                return np.stack([ds.phase.values, ds.conncomp.values])
-            return ds.phase.values[None,]
-
-        stack =[]
-        for ind in range(len(phase) if stackvar is not None else 1):
-            block = dask.array.from_delayed(dask.delayed(_snaphu)(ind),
-                        shape=(2 if conncomp else 1, *(phase.shape[1:] if stackvar is not None else phase.shape)),
-                        dtype=np.float32)
-            stack.append(block)
-            del block
-        dask_block = dask.array.concatenate(stack)
-        del stack
-        if stackvar is not None:
-            dss = [xr.DataArray(dask_block[idx::2 if conncomp else 1], coords=phase.coords).rename(phase.name)
-                               for idx in range(2 if conncomp else 1)]
-        else:
-            dss = [xr.DataArray(block, coords=phase.coords).rename(phase.name)
-                           for idx, block in enumerate(dask_block)]
-        del dask_block
-        # unify the output
-        return dss if len(dss) > 1 else [dss[0], None]
-
-
-    def unwrap_snaphu(self, datas, weights=None, conf=None, conncomp=False, polarizations=None, compute=False, debug=False):
-        import xarray as xr
-        import numpy as np
-        import dask
-
-        assert datas is None or isinstance(datas, (list, tuple, xr.Dataset, xr.DataArray)), 'ERROR: optional datas should be a list or tuple or Dataset or DataArray'
-
-        datas_iterable = isinstance(datas, (list, tuple))
-        #print ('datas_iterable', datas_iterable)
-        datas_dataset = isinstance(datas[0], xr.Dataset) if datas_iterable else isinstance(datas, xr.Dataset)
-        #print ('datas_dataset', datas_dataset)
-
-        if not isinstance(datas, (list, tuple)):
-            assert weights is None or not isinstance(weights, (list, tuple)), 'ERROR: optional weights should be an iterable as datas'
-            if isinstance(datas, xr.Dataset):
-                assert weights is None or isinstance(weights, xr.Dataset), 'ERROR: optional weights should be a Dataset as datas'
-                datas = [datas]
-                weights = [weights] if weights is not None else None
-            elif isinstance(datas, xr.DataArray):
-                assert weights is None or isinstance(weights, xr.DataArray), 'ERROR: optional weights should be a DataArray as datas'
-                datas = [datas.to_dataset()]
-                weights = [weights.to_dataset()] if weights is not None else None
-            else:
-                raise ValueError(f'ERROR: datas is not a Dataset and DataArray or list or tuple of them: {type(datas)}')
-        else:
-            if isinstance(datas[0], xr.Dataset):
-                assert weights is None or isinstance(weights[0], xr.Dataset), 'ERROR: optional weights should be an iterable of Dataset as datas'
-                pass
-            elif isinstance(datas[0], xr.DataArray):
-                assert weights is None or isinstance(weights[0], xr.DataArray), 'ERROR: optional weights should be an iterable of DataArray as datas'
-                datas = [ds.to_dataset() for ds in datas]
-                weights = [weights.to_dataset() for weights in weights] if weights is not None else None
-            else:
-                raise ValueError('ERROR: datas is not a DataArray or Dataset or iterable of them')
-        
-        # copy id from the data to the result
-        ids = [ds.attrs.get('id', None) for ds in datas]
-
-        if polarizations is None:
-            polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in datas[0].data_vars]
-        elif isinstance(polarizations, str):
-            polarizations = [polarizations]
-        #print ('polarizations', polarizations)
-        
-        total_unwraps = []
-        total_comps = []
-        for idx in range(len(datas)):
-            data = datas[idx]
-            weight = weights[idx] if weights is not None else None
-            unwraps = []
-            comps = []
-            for pol in polarizations:
-                unwrap, comp = self._unwrap_snaphu(phase=data[pol],
-                                                weight=weight[pol] if weight is not None else None,
-                                                conncomp=conncomp,
-                                                conf=conf)
-                unwraps.append(unwrap)
-                comps.append(comp)
-            unwraps = xr.merge(unwraps).assign_attrs(id=ids[idx])
-            comps = xr.merge(comps).assign_attrs(id=ids[idx]) if conncomp else None
-            total_unwraps.append(unwraps)
-            total_comps.append(comps)
-
-        if compute:
-            progressbar(result := dask.persist(total_unwraps, total_comps), desc=f'Compute Unwrapping'.ljust(25))
-            unwraps, comps = result
-        else:
-            unwraps, comps = total_unwraps, total_comps
-        del total_unwraps, total_comps
-
-        if datas_dataset:
-            return (unwraps, comps if conncomp else None) if datas_iterable else (unwraps[0], comps[0] if conncomp else None)
-        
-        if datas_iterable:
-            return ([ds[polarizations[0]] for ds in unwraps], [ds[polarizations[0]] for ds in comps] if conncomp else None)
-        else:
-            return (unwraps[0][polarizations[0]], comps[0][polarizations[0]] if conncomp else None)
-
-    def interpolate_nearest(self, data, search_radius_pixels=None):
-        """
-        Perform nearest neighbor interpolation on each 2D grid in a 3D grid stack.
+        Process a single 3D DataArray (pair, y, x) for unwrapping.
 
         Parameters
         ----------
-        data : xarray.DataArray
-            The input 3D grid stack to be interpolated, with dimensions (pair, y, x).
-        search_radius_pixels : int, optional
-            The interpolation distance in pixels. If not provided, the default is set to the chunksize of the Stack object.
+        phase_da : xr.DataArray
+            3D DataArray with dimensions (pair, y, x).
+        weight_da : xr.DataArray, optional
+            3D DataArray of correlation weights.
+        conncomp_flag : bool
+            Whether to compute connected components.
 
         Returns
         -------
-        xarray.DataArray
-            The interpolated 3D grid stack.
+        tuple
+            (unwrapped DataArray, conncomp DataArray or None)
+        """
+        import xarray as xr
+        import dask
+
+        # store original chunks for output rechunking
+        original_chunks = phase_da.chunks
+        stackvar = phase_da.dims[0]  # 'pair'
+        n_pairs = phase_da.sizes[stackvar]
+        shape_2d = (phase_da.shape[1], phase_da.shape[2])
+
+        def _process_pair(ind):
+            """Process a single pair by index - computes the slice inside the delayed call."""
+            # compute the actual numpy arrays inside the delayed function
+            phase_2d = phase_da.isel({stackvar: ind}).values
+            corr_2d = weight_da.isel({stackvar: ind}).values if weight_da is not None else None
+
+            unwrapped = Stack_unwrap._branch_cut(phase_2d, correlation=corr_2d)
+
+            if conncomp_flag:
+                comp = Stack_unwrap._conncomp_2d(unwrapped)
+                return np.stack([unwrapped, comp.astype(np.float32)])
+            return unwrapped[None, ...]
+
+        # build lazy stack using dask.delayed
+        stack_list = []
+        for ind in range(n_pairs):
+            block = dask.array.from_delayed(
+                dask.delayed(_process_pair)(ind),
+                shape=(2 if conncomp_flag else 1, *shape_2d),
+                dtype=np.float32
+            )
+            stack_list.append(block)
+
+        dask_block = dask.array.concatenate(stack_list)
+
+        def _make_dataarray(data, coords, dims, name):
+            """Helper to create DataArray with rechunking."""
+            da = xr.DataArray(data, coords=coords, dims=dims, name=name)
+            if original_chunks is not None:
+                chunks_dict = {dim: original_chunks[i] for i, dim in enumerate(dims)}
+                da = da.chunk(chunks_dict)
+            return da
+
+        # create output DataArrays
+        if conncomp_flag:
+            # unwrapped is at indices 0, 2, 4, ... and conncomp at 1, 3, 5, ...
+            unwrap_da = _make_dataarray(dask_block[::2], phase_da.coords, phase_da.dims, phase_da.name)
+            comp_da = _make_dataarray(dask_block[1::2], phase_da.coords, phase_da.dims, 'conncomp')
+            return unwrap_da, comp_da
+        else:
+            unwrap_da = _make_dataarray(dask_block, phase_da.coords, phase_da.dims, phase_da.name)
+            return unwrap_da, None
+
+    def unwrap(self, phase, weight=None, conncomp=False):
+        """
+        Unwrap phase using branch-cut algorithm with max-flow optimization.
+
+        This method processes BatchWrap phase data (and optional BatchUnit correlation)
+        using a graph-based branch-cut algorithm. Unlike SNAPHU, it handles NaN values
+        naturally without requiring interpolation.
+
+        Parameters
+        ----------
+        phase : BatchWrap
+            Batch of wrapped phase datasets with 'pair' dimension.
+        weight : BatchUnit, optional
+            Batch of correlation values for weighting. If provided, edges with
+            lower correlation receive higher costs in the optimization.
+        conncomp : bool, optional
+            If True, also return connected components. Default is False.
+
+        Returns
+        -------
+        Batch or tuple
+            If conncomp is False: Batch of unwrapped phase.
+            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp).
 
         Examples
         --------
-        Fill gaps in the specified grid stack using nearest neighbor interpolation:
-        stack.interpolate_nearest(intf)
+        Unwrap phase without correlation weighting:
+        >>> unwrapped = stack.unwrap(intfs)
 
-        Notes
-        -----
-        This method performs nearest neighbor interpolation on each 2D grid (y, x) in a 3D grid stack (pair, y, x). It replaces the NaN values in each 2D grid with the nearest non-NaN values. The interpolation is performed within a specified search radius in pixels for each grid. If a search radius is not provided, the default search radius is set to the chunksize of the Stack object.
+        Unwrap phase with correlation weighting:
+        >>> unwrapped = stack.unwrap(intfs, corr)
+
+        Unwrap with connected components:
+        >>> unwrapped, conncomp = stack.unwrap(intfs, corr, conncomp=True)
         """
         import xarray as xr
+        from .Batch import Batch, BatchWrap, BatchUnit
 
-        assert data.dims == ('pair', 'y', 'x'), 'Input data must have dimensions (pair, y, x)'
+        assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
+        assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
 
-        interpolated = [self.fill_nan_nearest(data.sel(pair=pair), search_radius_pixels) for pair in data.pair]
-        return xr.concat(interpolated, dim='pair')
+        # process each burst in the batch
+        unwrap_result = {}
+        conncomp_result = {}
+
+        for key in phase.keys():
+            phase_ds = phase[key]
+            weight_ds = weight[key] if weight is not None and key in weight else None
+
+            # get data variables (typically polarization like 'VV')
+            data_vars = list(phase_ds.data_vars)
+
+            unwrap_vars = {}
+            comp_vars = {}
+
+            for var in data_vars:
+                phase_da = phase_ds[var]
+                weight_da = weight_ds[var] if weight_ds is not None and var in weight_ds else None
+
+                unwrap_da, comp_da = self._unwrap_2d(phase_da, weight_da, conncomp)
+
+                unwrap_vars[var] = unwrap_da
+                if conncomp and comp_da is not None:
+                    comp_vars[var] = comp_da
+
+            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
+            if conncomp:
+                conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+
+        # use Batch (not BatchWrap) to avoid re-wrapping the unwrapped phase
+        if conncomp:
+            return Batch(unwrap_result), BatchUnit(conncomp_result)
+        return Batch(unwrap_result)
 
     @staticmethod
     def conncomp_main(data, start=0):
