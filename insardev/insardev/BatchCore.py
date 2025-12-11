@@ -251,7 +251,35 @@ class BatchCore(dict):
 
     def __sub__(self, other: Batch):
         keys = self.keys()
-        return type(self)({k: (self[k] - other[k] if k in other else self[k]) for k in keys})
+        result = {}
+        for k in keys:
+            if k not in other:
+                result[k] = self[k]
+            else:
+                val = other[k]
+                ds = self[k]
+                # Handle per-pair coefficients from burst_polyfit
+                if isinstance(val, (list, tuple)):
+                    sample_var = list(ds.data_vars)[0]
+                    sample_da = ds[sample_var]
+                    has_pair_dim = 'pair' in sample_da.dims
+                    n_pairs = sample_da.sizes.get('pair', 1)
+
+                    if len(val) > 0 and isinstance(val[0], (list, tuple)):
+                        # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
+                        # Use polyval for this case
+                        result[k] = ds - self[[k]].polyval({k: val})[k]
+                    elif has_pair_dim and len(val) == n_pairs:
+                        # Multi-pair degree=0: [off0, off1, ...]
+                        offsets = xr.DataArray(val, dims=['pair'],
+                                               coords={'pair': sample_da.coords['pair']})
+                        result[k] = ds - offsets
+                    else:
+                        # Single pair degree=1: [ramp, offset] or other
+                        result[k] = ds - val
+                else:
+                    result[k] = ds - val
+        return type(self)(result)
 
     def __mul__(self, other: Batch):
         keys = self.keys()
@@ -872,6 +900,117 @@ class BatchCore(dict):
     def var(self, dim=None, **kwargs):
         return self._agg("var", dim=dim, **kwargs)
 
+    def polyval(self, coeffs: dict[str, list | xr.DataArray], dim: str = 'x') -> BatchCore:
+        """
+        Evaluate polynomial coefficients for each burst.
+
+        Applies xarray.polyval to evaluate polynomial corrections at each position
+        along the specified dimension. Designed to work with polynomial coefficients
+        returned by Stack.burst_polyfit.
+
+        Parameters
+        ----------
+        coeffs : dict[str, list | xr.DataArray]
+            Polynomial coefficients per burst. Can be either:
+            - list[float]: [ramp, offset] for linear polynomial ramp*x + offset (single pair)
+            - list[list[float]]: [[ramp0, offset0], [ramp1, offset1], ...] (multiple pairs)
+            - list[float]: [offset0, offset1, ...] for degree=0 with multiple pairs
+            - xr.DataArray: with 'degree' dimension [1, 0] (xarray.polyfit format)
+            Following xarray.polyfit convention: highest degree first.
+        dim : str, optional
+            Coordinate dimension to evaluate polynomial on. Default is 'x' for range
+            direction corrections.
+
+        Returns
+        -------
+        BatchCore (or subclass)
+            New batch with polynomial evaluated at each position. The result has
+            the same structure as self, with polynomial values broadcast to match
+            each dataset's shape.
+
+        Examples
+        --------
+        >>> # Single pair: Estimate offsets and ramps
+        >>> coeffs = Stack.burst_polyfit(intfs, degree=1)
+        >>> corrections = intfs.polyval(coeffs, dim='x')
+        >>> intfs_aligned = intfs - corrections
+
+        >>> # Multiple pairs: coefficients are lists per pair
+        >>> offsets = Stack.burst_polyfit(intfs_multi, degree=0)
+        >>> # offsets = {'burst1': [off0, off1], 'burst2': [off0, off1]}
+        >>> intfs_aligned = intfs_multi - offsets
+
+        See Also
+        --------
+        xarray.polyval : Underlying polynomial evaluation function
+        Stack.burst_polyfit : Function that produces compatible coefficients
+        """
+        result = {}
+        for bid, ds in self.items():
+            if bid not in coeffs:
+                # No coefficients for this burst - zero correction
+                sample_var = list(ds.data_vars)[0]
+                result[bid] = xr.zeros_like(ds[sample_var]).to_dataset(name=sample_var)
+                continue
+
+            # Get coordinate for evaluation
+            coord = ds.coords[dim]
+            sample_var = list(ds.data_vars)[0]
+            sample_da = ds[sample_var]
+
+            coeff = coeffs[bid]
+
+            # Check if we have per-pair coefficients (list of lists or list of scalars for multiple pairs)
+            has_pair_dim = 'pair' in sample_da.dims
+            n_pairs = sample_da.sizes.get('pair', 1)
+
+            if isinstance(coeff, (list, tuple)) and len(coeff) > 0:
+                first_elem = coeff[0]
+
+                # Detect format:
+                # - Single pair degree=1: [ramp, offset] where both are scalars
+                # - Single pair degree=0: scalar (but wrapped in list by caller)
+                # - Multi pair degree=0: [off0, off1, ...] list of scalars
+                # - Multi pair degree=1: [[ramp0, off0], [ramp1, off1], ...] list of lists
+
+                if isinstance(first_elem, (list, tuple)):
+                    # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
+                    corrections = []
+                    for pair_coeff in coeff:
+                        corr = pair_coeff[0] * coord + pair_coeff[1]
+                        corrections.append(corr)
+                    # Stack along pair dimension
+                    correction = xr.concat(corrections, dim='pair')
+                    if has_pair_dim:
+                        correction = correction.assign_coords(pair=sample_da.coords['pair'])
+
+                elif has_pair_dim and len(coeff) == n_pairs and not isinstance(first_elem, (list, tuple)):
+                    # Multi-pair degree=0: [off0, off1, ...] - all scalars matching pair count
+                    # Check if it looks like [ramp, offset] for single pair (2 elements, no pair dim wouldn't reach here)
+                    if len(coeff) == 2 and not has_pair_dim:
+                        # Single pair degree=1: [ramp, offset]
+                        correction = coeff[0] * coord + coeff[1]
+                    else:
+                        # Multi-pair degree=0
+                        corrections = [xr.full_like(coord, off, dtype=float) for off in coeff]
+                        correction = xr.concat(corrections, dim='pair')
+                        correction = correction.assign_coords(pair=sample_da.coords['pair'])
+
+                else:
+                    # Single pair degree=1: [ramp, offset]
+                    correction = coeff[0] * coord + coeff[1]
+
+            elif isinstance(coeff, xr.DataArray):
+                # General case using xr.polyval
+                correction = xr.polyval(coord, coeff)
+            else:
+                # Single scalar (degree=0, single pair)
+                correction = xr.full_like(coord, float(coeff), dtype=float)
+
+            result[bid] = correction.to_dataset(name=sample_var)
+
+        return type(self)(result)
+
     # def coarsen(self, window: dict[str,int], **kwargs):
     #     """
     #     intfs.coarsen({'y':2, 'x':8}, boundary='trim').mean().isel(0)
@@ -1101,8 +1240,10 @@ class BatchCore(dict):
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
-        self.save(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
-        return self.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
+        # Only save if this batch has data; otherwise just open existing store
+        if len(self) > 0:
+            self.save(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+        return utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
 
     def to_dataset(self, polarization=None, dissolve=True, compute: bool = False):
         """
@@ -1147,7 +1288,8 @@ class BatchCore(dict):
             # find all variables in the first dataset related to polarizations
             # TODO
             #polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
-            polarizations = list(sample.data_vars)
+            # exclude spatial_ref as it's a metadata variable, not a data variable
+            polarizations = [v for v in sample.data_vars if v != 'spatial_ref']
             #print ('polarizations', polarizations)
 
             # process list of datasets with one or multiple polarizations

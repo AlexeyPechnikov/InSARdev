@@ -82,8 +82,40 @@ class BatchWrap(BatchCore):
         return type(self)({k: self[k] + other[k] if k in other else self[k] for k in keys})
 
     def __sub__(self, other: Batch):
+        import xarray as xr
         keys = self.keys()
-        return type(self)({k: self[k] - other[k] if k in other else self[k] for k in keys})
+        result = {}
+        for k in keys:
+            if k not in other:
+                result[k] = self[k]
+            else:
+                val = other[k]
+                ds = self[k]
+                # Handle per-pair coefficients from burst_polyfit
+                if isinstance(val, (list, tuple)) and len(val) > 0:
+                    sample_var = list(ds.data_vars)[0]
+                    sample_da = ds[sample_var]
+                    has_pair_dim = 'pair' in sample_da.dims
+                    n_pairs = sample_da.sizes.get('pair', 1)
+                    first_elem = val[0]
+
+                    if isinstance(first_elem, (list, tuple)):
+                        # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
+                        result[k] = ds - self[[k]].polyval({k: val})[k]
+                    elif has_pair_dim and len(val) == n_pairs:
+                        # Multi-pair degree=0: [off0, off1, ...]
+                        offsets = xr.DataArray(val, dims=['pair'],
+                                               coords={'pair': sample_da.coords['pair']})
+                        result[k] = ds - offsets
+                    elif len(val) == 1:
+                        # Single value wrapped in list: [offset]
+                        result[k] = ds - val[0]
+                    else:
+                        # Single pair degree=1: [ramp, offset]
+                        result[k] = ds - self[[k]].polyval({k: val})[k]
+                else:
+                    result[k] = ds - val
+        return type(self)(result)
 
     def __mul__(self, other: Batch):
         keys = self.keys()

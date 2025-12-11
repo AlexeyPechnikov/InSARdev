@@ -209,11 +209,25 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
 
     def _load_grp(grp):
         import cf_xarray
+        import rioxarray
         #ds = xr.open_zarr(store, group=grp, consolidated=True, zarr_format=3)
         ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
         if 'pair' in ds.coords:
             # decode multiindex pair
             ds = cf_xarray.decode_compress_to_multi_index(ds, 'pair')
+        # restore rioxarray CRS from spatial_ref coordinate/variable if present
+        if ds.rio.crs is None:
+            # check both coords and data_vars for spatial_ref
+            spatial_ref_var = None
+            if 'spatial_ref' in ds.coords:
+                spatial_ref_var = ds.coords['spatial_ref']
+            elif 'spatial_ref' in ds.data_vars:
+                spatial_ref_var = ds.data_vars['spatial_ref']
+            if spatial_ref_var is not None:
+                spatial_ref_attrs = spatial_ref_var.attrs
+                crs_wkt = spatial_ref_attrs.get('crs_wkt') or spatial_ref_attrs.get('spatial_ref')
+                if crs_wkt:
+                    ds = ds.rio.write_crs(crs_wkt)
         return grp, ds
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
         results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp) for grp in groups)
