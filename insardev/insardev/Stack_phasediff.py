@@ -34,8 +34,11 @@ class Stack_phasediff(Stack_base):
         """
         import numpy as np
 
-        if wavelength is None:
-            raise ValueError('wavelength is required to define spatial correlation')
+        # if wavelength is None:
+        #     raise ValueError('wavelength is required to define spatial correlation')
+
+        if goldstein is not None and wavelength is None:
+            raise ValueError('wavelength is required to define spatial correlation for Goldstein filtering')
 
         pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
         print ('pairs', pairs)
@@ -51,19 +54,22 @@ class Stack_phasediff(Stack_base):
         phasediff = data1.drop_vars('pair') * data2.drop_vars('pair').conj()
         if phase is not None:
             phasediff = phasediff * (phase.iexp(-1) if not isinstance(phase, BatchComplex) else phase)
-        # Gaussian filtering with cut-off wavelength on phase difference
-        phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
 
-        # Gaussian filtering with cut-off wavelength on amplitudes
-        intensity_look = data.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
-        intensity_look1 = intensity_look.isel(date=ref_dates).drop_vars('date').rename(date='pair')
-        intensity_look2 = intensity_look.isel(date=rep_dates).drop_vars('date').rename(date='pair')
+        corr_look = None
+        if wavelength is not None:
+            # Gaussian filtering with cut-off wavelength on phase difference
+            phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
 
-        # correlation requires multilooking to detect influence between pixels
-        corr_look = (phasediff_look.abs() / (intensity_look1 * intensity_look2).sqrt()).clip(0, 1)
+            # Gaussian filtering with cut-off wavelength on amplitudes
+            intensity_look = data.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+            intensity_look1 = intensity_look.isel(date=ref_dates).drop_vars('date').rename(date='pair')
+            intensity_look2 = intensity_look.isel(date=rep_dates).drop_vars('date').rename(date='pair')
+
+            # correlation requires multilooking to detect influence between pixels
+            corr_look = (phasediff_look.abs() / (intensity_look1 * intensity_look2).sqrt()).clip(0, 1)
 
         # keep phase difference without multilooking if multilook=False
-        if not multilook:
+        if not multilook or wavelength is None:
             phasediff_look = phasediff
         if goldstein is not None:
             phasediff_look = phasediff_look.goldstein(corr_look, goldstein)
@@ -71,15 +77,20 @@ class Stack_phasediff(Stack_base):
         # filter out not valid pixels
         if weight is not None:
             phasediff_look = phasediff_look.where(np.isfinite(weight))
-            corr_look = corr_look.where(np.isfinite(weight))
+            corr_look = corr_look.where(np.isfinite(weight)) if corr_look is not None else None
         
         if not complex:
             phasediff_look = phasediff_look.angle()
 
-        return [da.assign_coords(
-            ref=('pair', data1.coords['pair']),
-            rep=('pair', data2.coords['pair'])
-        ).set_index(pair=['ref', 'rep']) for da in [phasediff_look, corr_look]]
+        def as_xarray(da):
+            return da.assign_coords(
+                ref=('pair', data1.coords['pair']),
+                rep=('pair', data2.coords['pair'])
+            ).set_index(pair=['ref', 'rep'])
+        
+        if corr_look is None:
+            return as_xarray(phasediff_look)
+        return (as_xarray(da) for da in [phasediff_look, corr_look])
 
     def phasediff_singlelook(self, **kwarg):
         from .Batch import BatchComplex
