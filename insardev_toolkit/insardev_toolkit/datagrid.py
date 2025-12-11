@@ -148,12 +148,31 @@ class datagrid:
 
         # extract EPSG from target xarray object or use provided EPSG
         if isinstance(target, (xr.DataArray, xr.Dataset)):
-            if target.rio.crs is None:
-                print('WARNING: Target xarray object has no CRS defined.')
-                return da
-            epsg = target.rio.crs.to_epsg()
+            epsg = None
+            # first try rioxarray CRS
+            if target.rio.crs is not None:
+                epsg = target.rio.crs.to_epsg()
+            else:
+                # fallback: try to get EPSG from spatial_ref (check both coords and data_vars)
+                spatial_ref_var = None
+                if 'spatial_ref' in target.coords:
+                    spatial_ref_var = target.coords['spatial_ref']
+                elif isinstance(target, xr.Dataset) and 'spatial_ref' in target.data_vars:
+                    spatial_ref_var = target.data_vars['spatial_ref']
+                
+                if spatial_ref_var is not None:
+                    spatial_ref_attrs = spatial_ref_var.attrs
+                    # try crs_wkt first, then spatial_ref attr
+                    crs_wkt = spatial_ref_attrs.get('crs_wkt') or spatial_ref_attrs.get('spatial_ref')
+                    if crs_wkt:
+                        from rasterio.crs import CRS
+                        try:
+                            epsg = CRS.from_wkt(crs_wkt).to_epsg()
+                        except Exception:
+                            epsg = None
+            
             if epsg is None:
-                print('WARNING: Target CRS is not an EPSG code, consider using PROJ string.')
+                print('WARNING: Target xarray object has no CRS defined.')
                 return da
         else:
             epsg = target
