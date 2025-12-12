@@ -689,15 +689,13 @@ class Stack_unwrap(Stack_multilooking):
 
         # save original chunks for restoring after processing (None for numpy-backed data)
         original_chunks = phase_da.chunks
-        if original_chunks is None:
-            # always chunk output for future Dask processing
-            original_chunks = {'pair':1, 'y': -1, 'x': -1}
 
         # rechunk to single chunk per y,x for processing
         # this also converts numpy-backed data to dask-backed data
-        phase_da = phase_da.chunk({stackvar: 1, 'y': -1, 'x': -1})
+        chunk_single = {stackvar: 1, 'y': -1, 'x': -1}
+        phase_da = phase_da.chunk(chunk_single)
         if weight_da is not None:
-            weight_da = weight_da.chunk({stackvar: 1, 'y': -1, 'x': -1})
+            weight_da = weight_da.chunk(chunk_single)
 
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array."""
@@ -708,30 +706,18 @@ class Stack_unwrap(Stack_multilooking):
             return Stack_unwrap._conncomp_2d(phase_2d).astype(np.float32)
 
         # use xr.apply_ufunc for parallel dask processing
-        if weight_da is not None:
-            unwrap_da = xr.apply_ufunc(
-                _unwrap_single,
-                phase_da,
-                weight_da,
-                input_core_dims=[['y', 'x'], ['y', 'x']],
-                output_core_dims=[['y', 'x']],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[np.float32],
-            )
-        else:
-            unwrap_da = xr.apply_ufunc(
-                _unwrap_single,
-                phase_da,
-                input_core_dims=[['y', 'x']],
-                output_core_dims=[['y', 'x']],
-                vectorize=True,
-                dask='parallelized',
-                output_dtypes=[np.float32],
-            )
+        unwrap_da = xr.apply_ufunc(
+            _unwrap_single,
+            *([phase_da, weight_da] if weight_da is not None else [phase_da]),
+            input_core_dims=([['y', 'x'], ['y', 'x']]) if weight_da is not None else [['y', 'x']],
+            output_core_dims=[['y', 'x']],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=[np.float32],
+        )
 
         # restore original chunks
-        unwrap_da = unwrap_da.chunk(original_chunks)
+        unwrap_da = unwrap_da.chunk(original_chunks if original_chunks is not None else phase_da.chunks)
 
         if conncomp_flag:
             comp_da = xr.apply_ufunc(
@@ -744,7 +730,7 @@ class Stack_unwrap(Stack_multilooking):
                 output_dtypes=[np.float32],
             )
             # restore original chunks
-            comp_da = comp_da.chunk(original_chunks)
+            comp_da = comp_da.chunk(original_chunks if original_chunks is not None else phase_da.chunks)
             return unwrap_da, comp_da
 
         return unwrap_da, None
