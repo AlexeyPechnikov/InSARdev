@@ -684,56 +684,70 @@ class Stack_unwrap(Stack_multilooking):
             (unwrapped DataArray, conncomp DataArray or None)
         """
         import xarray as xr
-        import dask
 
-        # store original chunks for output rechunking
-        original_chunks = phase_da.chunks
         stackvar = phase_da.dims[0]  # 'pair'
-        n_pairs = phase_da.sizes[stackvar]
-        shape_2d = (phase_da.shape[1], phase_da.shape[2])
 
-        def _process_pair(ind):
-            """Process a single pair by index - computes the slice inside the delayed call."""
-            # compute the actual numpy arrays inside the delayed function
-            phase_2d = phase_da.isel({stackvar: ind}).values
-            corr_2d = weight_da.isel({stackvar: ind}).values if weight_da is not None else None
+        # save original chunks for restoring after processing (None for numpy-backed data)
+        original_chunks = phase_da.chunks
+        if original_chunks is None:
+            # always chunk output for future Dask processing
+            original_chunks = {'pair':1, 'y': -1, 'x': -1}
 
-            unwrapped = Stack_unwrap._branch_cut(phase_2d, correlation=corr_2d)
+        # rechunk to single chunk per y,x for processing
+        # this also converts numpy-backed data to dask-backed data
+        phase_da = phase_da.chunk({stackvar: 1, 'y': -1, 'x': -1})
+        if weight_da is not None:
+            weight_da = weight_da.chunk({stackvar: 1, 'y': -1, 'x': -1})
 
-            if conncomp_flag:
-                comp = Stack_unwrap._conncomp_2d(unwrapped)
-                return np.stack([unwrapped, comp.astype(np.float32)])
-            return unwrapped[None, ...]
+        def _unwrap_single(phase_2d, corr_2d=None):
+            """Unwrap a single 2D phase array."""
+            return Stack_unwrap._branch_cut(phase_2d, correlation=corr_2d)
 
-        # build lazy stack using dask.delayed
-        stack_list = []
-        for ind in range(n_pairs):
-            block = dask.array.from_delayed(
-                dask.delayed(_process_pair)(ind),
-                shape=(2 if conncomp_flag else 1, *shape_2d),
-                dtype=np.float32
+        def _conncomp_single(phase_2d):
+            """Compute connected components for a single 2D array."""
+            return Stack_unwrap._conncomp_2d(phase_2d).astype(np.float32)
+
+        # use xr.apply_ufunc for parallel dask processing
+        if weight_da is not None:
+            unwrap_da = xr.apply_ufunc(
+                _unwrap_single,
+                phase_da,
+                weight_da,
+                input_core_dims=[['y', 'x'], ['y', 'x']],
+                output_core_dims=[['y', 'x']],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[np.float32],
             )
-            stack_list.append(block)
-
-        dask_block = dask.array.concatenate(stack_list)
-
-        def _make_dataarray(data, coords, dims, name):
-            """Helper to create DataArray with rechunking."""
-            da = xr.DataArray(data, coords=coords, dims=dims, name=name)
-            if original_chunks is not None:
-                chunks_dict = {dim: original_chunks[i] for i, dim in enumerate(dims)}
-                da = da.chunk(chunks_dict)
-            return da
-
-        # create output DataArrays
-        if conncomp_flag:
-            # unwrapped is at indices 0, 2, 4, ... and conncomp at 1, 3, 5, ...
-            unwrap_da = _make_dataarray(dask_block[::2], phase_da.coords, phase_da.dims, phase_da.name)
-            comp_da = _make_dataarray(dask_block[1::2], phase_da.coords, phase_da.dims, 'conncomp')
-            return unwrap_da, comp_da
         else:
-            unwrap_da = _make_dataarray(dask_block, phase_da.coords, phase_da.dims, phase_da.name)
-            return unwrap_da, None
+            unwrap_da = xr.apply_ufunc(
+                _unwrap_single,
+                phase_da,
+                input_core_dims=[['y', 'x']],
+                output_core_dims=[['y', 'x']],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[np.float32],
+            )
+
+        # restore original chunks
+        unwrap_da = unwrap_da.chunk(original_chunks)
+
+        if conncomp_flag:
+            comp_da = xr.apply_ufunc(
+                _conncomp_single,
+                unwrap_da,
+                input_core_dims=[['y', 'x']],
+                output_core_dims=[['y', 'x']],
+                vectorize=True,
+                dask='parallelized',
+                output_dtypes=[np.float32],
+            )
+            # restore original chunks
+            comp_da = comp_da.chunk(original_chunks)
+            return unwrap_da, comp_da
+
+        return unwrap_da, None
 
     def unwrap(self, phase, weight=None, conncomp=False):
         """
