@@ -1068,7 +1068,7 @@ class BatchCore(dict):
 
     def compute(self):
         import dask
-        from insardev_toolkit import progressbar
+        from insardev_toolkit.progressbar import progressbar
         progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
         return type(self)(result)
 
@@ -2518,7 +2518,7 @@ class BatchCore(dict):
         else:
             raise ValueError(f"degree must be 0 or 1, got {degree}")
 
-    def dissolve(self, extend: bool = True, weight: float = None, debug: bool = False):
+    def dissolve(self, extend: bool = False, weight: float = None, debug: bool = False):
         """
         Dissolve burst boundaries by averaging overlapping regions.
 
@@ -2531,9 +2531,9 @@ class BatchCore(dict):
         Parameters
         ----------
         extend : bool, optional
-            If True (default), NaN areas in current burst can be filled by overlapping
+            If True, NaN areas in current burst can be filled by overlapping
             bursts. Good for unwrapping consistency between bursts.
-            If False, only pixels valid in the current burst are kept (NaN areas remain NaN).
+            If False (default), only pixels valid in the current burst are kept (NaN areas remain NaN).
             Better for performance when you don't want to process same pixels in multiple bursts.
         weight : float, optional
             Normalized weight of the current burst in range [0, 1]. Default is None.
