@@ -145,7 +145,7 @@ class Stack_unwrap(Stack_multilooking):
         return components
 
     @staticmethod
-    def _branch_cut(phase, correlation=None, max_jump=1, norm=1, scale=2**16 - 1, max_iters=100, debug=False):
+    def _branch_cut(phase, correlation=None, conncomp_size=100, max_jump=1, norm=1, scale=2**16 - 1, max_iters=100, debug=False):
         """
         Phase unwrapping using branch-cut algorithm with max-flow optimization.
 
@@ -158,6 +158,9 @@ class Stack_unwrap(Stack_multilooking):
             2D array of wrapped phase values in radians.
         correlation : np.ndarray, optional
             2D array of correlation values for weighting edges.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_jump : int, optional
             Maximum phase jump step. Default is 1.
         norm : float, optional
@@ -175,7 +178,6 @@ class Stack_unwrap(Stack_multilooking):
             2D array of unwrapped phase values in radians.
         """
         import time
-        from ortools.graph.python import max_flow
 
         shape = phase.shape
 
@@ -192,12 +194,39 @@ class Stack_unwrap(Stack_multilooking):
         if debug:
             total_valid = np.sum(valid_mask_2d)
             comp_sizes = [np.sum(c) for c in components]
-            print(f'Maxflow: {shape} grid, {total_valid} valid pixels, {len(components)} components: {comp_sizes}')
+            sorted_sizes = sorted(comp_sizes, reverse=True)
+            n_tiny = sum(1 for s in comp_sizes if s < 10)
+            print(f'Maxflow: {shape} grid, {total_valid} valid pixels, {len(components)} components')
+            if len(components) <= 10:
+                print(f'  Component sizes: {sorted_sizes}')
+            else:
+                print(f'  Largest 5: {sorted_sizes[:5]}, smallest 5: {sorted_sizes[-5:]}, tiny(<10px): {n_tiny}')
 
         if len(components) > 1:
             # Multiple components - process each separately using bounding boxes
+            # Sort by size (largest first)
+            comp_sizes = [np.sum(c) for c in components]
+            sorted_indices = np.argsort(comp_sizes)[::-1]
+            min_size = max(conncomp_size, 4)
+            n_skipped = sum(1 for s in comp_sizes if s < min_size)
+
+            if debug and n_skipped > 0:
+                print(f'  Skipping {n_skipped} components with < {min_size} pixels')
+
             result = np.full(shape, np.nan, dtype=np.float32)
-            for i, comp_mask in enumerate(components):
+            n_to_process = len(components) - n_skipped
+            processed = 0
+
+            for rank, i in enumerate(sorted_indices):
+                comp_mask = components[i]
+                comp_size = comp_sizes[i]
+
+                # Skip small components
+                if comp_size < min_size:
+                    continue
+
+                processed += 1
+
                 # Find bounding box of this component
                 rows = np.any(comp_mask, axis=1)
                 cols = np.any(comp_mask, axis=0)
@@ -212,9 +241,8 @@ class Stack_unwrap(Stack_multilooking):
                 if sub_corr is not None:
                     sub_corr[~sub_mask] = np.nan
 
-                comp_size = np.sum(sub_mask)
                 if debug:
-                    print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
+                    print(f'  Component {processed}/{n_to_process}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
                     t0 = time.time()
 
                 # Unwrap this component's subgrid
@@ -230,14 +258,33 @@ class Stack_unwrap(Stack_multilooking):
                     print(f' -> {status} ({elapsed:.2f}s)')
             return result
 
-        # Single component - process directly
+        # Single component - use bounding box for consistency
+        comp_mask = components[0]
+        rows = np.any(comp_mask, axis=1)
+        cols = np.any(comp_mask, axis=0)
+        r_min, r_max = np.where(rows)[0][[0, -1]]
+        c_min, c_max = np.where(cols)[0][[0, -1]]
+
+        sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
+        sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
+        sub_phase[~sub_mask] = np.nan
+        sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
+        if sub_corr is not None:
+            sub_corr[~sub_mask] = np.nan
+
         if debug:
-            print(f'  Single component: {np.sum(valid_mask_2d)} pixels', end='', flush=True)
+            print(f'  Single component: {np.sum(comp_mask)} pixels, bbox {sub_phase.shape}', end='', flush=True)
             t0 = time.time()
-        result = Stack_unwrap._branch_cut_single(phase, correlation, max_jump, norm, scale, max_iters, debug)
+
+        sub_result = Stack_unwrap._branch_cut_single(sub_phase, sub_corr, max_jump, norm, scale, max_iters, debug)
+
+        # Merge back
+        result = np.full(shape, np.nan, dtype=np.float32)
+        result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
+
         if debug:
             elapsed = time.time() - t0
-            status = 'OK' if not np.all(np.isnan(result[valid_mask_2d])) else 'FAILED'
+            status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
             print(f' -> {status} ({elapsed:.2f}s)')
         return result
 
@@ -374,7 +421,7 @@ class Stack_unwrap(Stack_multilooking):
         return unwrapped
 
     @staticmethod
-    def _ilp_unwrap_2d(phase, correlation=None, max_time=300.0, search_workers=1, debug=False):
+    def _ilp_unwrap_2d(phase, correlation=None, conncomp_size=100, max_time=300.0, search_workers=1, debug=False):
         """
         Phase unwrapping using Integer Linear Programming (ILP) with OR-Tools CP-SAT.
 
@@ -405,6 +452,9 @@ class Stack_unwrap(Stack_multilooking):
             2D array of wrapped phase values in radians.
         correlation : np.ndarray, optional
             2D array of correlation values for weighting edges.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_time : float, optional
             Maximum solver time in seconds. Default is 300 (5 minutes).
             For complex cases, values up to 86400 (24 hours) may be useful.
@@ -442,6 +492,14 @@ class Stack_unwrap(Stack_multilooking):
             # Multiple components - process each separately using bounding boxes
             result = np.full(shape, np.nan, dtype=np.float32)
             for i, comp_mask in enumerate(components):
+                comp_size = np.sum(comp_mask)
+
+                # Skip small components
+                if comp_size < conncomp_size:
+                    if debug:
+                        print(f'  Component {i+1}/{len(components)}: {comp_size} pixels -> SKIPPED (< {conncomp_size})')
+                    continue
+
                 # Find bounding box of this component
                 rows = np.any(comp_mask, axis=1)
                 cols = np.any(comp_mask, axis=0)
@@ -456,7 +514,6 @@ class Stack_unwrap(Stack_multilooking):
                 if sub_corr is not None:
                     sub_corr[~sub_mask] = np.nan
 
-                comp_size = np.sum(sub_mask)
                 if debug:
                     print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
                     t0 = time.time()
@@ -472,9 +529,15 @@ class Stack_unwrap(Stack_multilooking):
                     print(f' -> {status} ({elapsed:.2f}s)')
             return result
 
-        # Single component - process directly
+        # Single component - check size and process directly
+        single_comp_size = np.sum(valid_mask_2d)
+        if single_comp_size < conncomp_size:
+            if debug:
+                print(f'  Single component: {single_comp_size} pixels -> SKIPPED (< {conncomp_size})')
+            return np.full(shape, np.nan, dtype=np.float32)
+
         if debug:
-            print(f'  Single component: {np.sum(valid_mask_2d)} pixels', end='', flush=True)
+            print(f'  Single component: {single_comp_size} pixels', end='', flush=True)
             t0 = time.time()
         result = Stack_unwrap._ilp_unwrap_2d_single(phase, correlation, max_time, search_workers, debug)
         if debug:
@@ -940,32 +1003,34 @@ class Stack_unwrap(Stack_multilooking):
         if not np.any(valid_mask_2d):
             return np.full(shape, np.nan, dtype=np.float32)
 
-        # Fill small interior holes to make domain more simply-connected
+        # Fill interior holes to make domain simply-connected
         # This prevents topological issues with multiply-connected domains
+        # The filled pixels are restored to NaN at the end (using original_nan_mask)
         hole_labels, n_holes = ndimage.label(~valid_mask_2d)
         if n_holes > 1:
             # Find the exterior (largest NaN region)
             hole_sizes = ndimage.sum(~valid_mask_2d, hole_labels, range(1, n_holes + 1))
             exterior_label = np.argmax(hole_sizes) + 1
-            # Fill small interior holes (< 100 pixels) with nearest neighbor interpolation
+            # Fill all interior holes with mean of boundary pixels
             phase_filled = phase.copy()
             n_filled = 0
+            n_holes_filled = 0
             for label_id in range(1, n_holes + 1):
                 if label_id == exterior_label:
                     continue
                 hole_mask = hole_labels == label_id
                 hole_size = hole_sizes[label_id - 1]
-                if hole_size < 100:  # Fill small holes
-                    # Find boundary pixels around the hole
-                    dilated = ndimage.binary_dilation(hole_mask)
-                    boundary = dilated & valid_mask_2d
-                    if np.any(boundary):
-                        # Use mean of boundary pixels
-                        boundary_mean = np.nanmean(phase[boundary])
-                        phase_filled[hole_mask] = boundary_mean
-                        n_filled += int(hole_size)
+                # Find boundary pixels around the hole
+                dilated = ndimage.binary_dilation(hole_mask)
+                boundary = dilated & valid_mask_2d
+                if np.any(boundary):
+                    # Use mean of boundary pixels
+                    boundary_mean = np.nanmean(phase[boundary])
+                    phase_filled[hole_mask] = boundary_mean
+                    n_filled += int(hole_size)
+                    n_holes_filled += 1
             if n_filled > 0 and debug:
-                print(f'    DEBUG: filled {n_filled} pixels in small interior holes')
+                print(f'    DEBUG: filled {n_holes_filled} interior holes ({n_filled} pixels)')
             phase = phase_filled
             valid_mask_2d = ~np.isnan(phase)
 
@@ -1925,7 +1990,7 @@ class Stack_unwrap(Stack_multilooking):
     
         return model.rename('unwrap')
 
-    def _unwrap_2d_maxflow(self, phase_da, weight_da=None, conncomp_flag=False,
+    def _unwrap_2d_maxflow(self, phase_da, weight_da=None, conncomp_flag=False, conncomp_size=100,
                            max_jump=1, norm=1, scale=2**16-1, max_iters=100, debug=False):
         """
         Process a single 3D DataArray (pair, y, x) for unwrapping.
@@ -1938,6 +2003,9 @@ class Stack_unwrap(Stack_multilooking):
             3D DataArray of correlation weights.
         conncomp_flag : bool
             Whether to compute connected components.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_jump : int, optional
             Maximum phase jump step. Default is 1.
         norm : float, optional
@@ -1971,8 +2039,8 @@ class Stack_unwrap(Stack_multilooking):
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array."""
             return Stack_unwrap._branch_cut(phase_2d, correlation=corr_2d,
-                                            max_jump=max_jump, norm=norm,
-                                            scale=scale, max_iters=max_iters, debug=debug)
+                                            conncomp_size=conncomp_size, max_jump=max_jump,
+                                            norm=norm, scale=scale, max_iters=max_iters, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
@@ -2008,7 +2076,7 @@ class Stack_unwrap(Stack_multilooking):
 
         return unwrap_da, None
 
-    def unwrap_maxflow(self, phase, weight=None, conncomp=False,
+    def unwrap_maxflow(self, phase, weight=None, conncomp=False, conncomp_size=100,
                        max_jump=1, norm=1, scale=2**16-1, max_iters=100, debug=False):
         """
         Unwrap phase using branch-cut algorithm with max-flow optimization.
@@ -2026,6 +2094,9 @@ class Stack_unwrap(Stack_multilooking):
             lower correlation receive higher costs in the optimization.
         conncomp : bool, optional
             If True, also return connected components. Default is False.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_jump : int, optional
             Maximum phase jump step. Higher values allow larger discontinuities
             but may be slower. Default is 1.
@@ -2060,6 +2131,9 @@ class Stack_unwrap(Stack_multilooking):
 
         Unwrap with custom parameters:
         >>> unwrapped = stack.unwrap_maxflow(intfs, max_jump=2, max_iters=200)
+
+        Skip small components (less than 500 pixels):
+        >>> unwrapped = stack.unwrap_maxflow(intfs, corr, conncomp_size=500)
         """
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
@@ -2086,6 +2160,7 @@ class Stack_unwrap(Stack_multilooking):
                 weight_da = weight_ds[var] if weight_ds is not None and var in weight_ds else None
 
                 unwrap_da, comp_da = self._unwrap_2d_maxflow(phase_da, weight_da, conncomp,
+                                                           conncomp_size=conncomp_size,
                                                            max_jump=max_jump, norm=norm,
                                                            scale=scale, max_iters=max_iters, debug=debug)
 
@@ -2102,7 +2177,8 @@ class Stack_unwrap(Stack_multilooking):
             return Batch(unwrap_result), BatchUnit(conncomp_result)
         return Batch(unwrap_result)
 
-    def _unwrap_2d_ilp(self, phase_da, weight_da=None, conncomp_flag=False, max_time=300.0, search_workers=1, debug=False):
+    def _unwrap_2d_ilp(self, phase_da, weight_da=None, conncomp_flag=False, conncomp_size=100,
+                       max_time=300.0, search_workers=1, debug=False):
         """
         Process a single 3D DataArray (pair, y, x) for ILP unwrapping.
 
@@ -2114,6 +2190,9 @@ class Stack_unwrap(Stack_multilooking):
             3D DataArray of correlation weights.
         conncomp_flag : bool
             Whether to compute connected components.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_time : float
             Maximum solver time in seconds.
         search_workers : int
@@ -2142,7 +2221,8 @@ class Stack_unwrap(Stack_multilooking):
 
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array using ILP."""
-            return Stack_unwrap._ilp_unwrap_2d(phase_2d, correlation=corr_2d, max_time=max_time, search_workers=search_workers, debug=debug)
+            return Stack_unwrap._ilp_unwrap_2d(phase_2d, correlation=corr_2d, conncomp_size=conncomp_size,
+                                               max_time=max_time, search_workers=search_workers, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
@@ -2178,7 +2258,8 @@ class Stack_unwrap(Stack_multilooking):
 
         return unwrap_da, None
 
-    def unwrap_ilp(self, phase, weight=None, conncomp=False, max_time=300.0, search_workers=1, debug=False):
+    def unwrap_ilp(self, phase, weight=None, conncomp=False, conncomp_size=100,
+                   max_time=300.0, search_workers=1, debug=False):
         """
         Unwrap phase using Integer Linear Programming (ILP) with OR-Tools CP-SAT solver.
 
@@ -2195,6 +2276,9 @@ class Stack_unwrap(Stack_multilooking):
             lower correlation receive higher costs in the optimization.
         conncomp : bool, optional
             If True, also return connected components. Default is False.
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
         max_time : float, optional
             Maximum solver time in seconds per 2D slice. Default is 300 (5 minutes).
         search_workers : int, optional
@@ -2229,6 +2313,9 @@ class Stack_unwrap(Stack_multilooking):
 
         Unwrap phase with correlation weighting:
         >>> unwrapped = stack.unwrap_ilp(intfs, corr)
+
+        Skip small components (less than 500 pixels):
+        >>> unwrapped = stack.unwrap_ilp(intfs, corr, conncomp_size=500)
         """
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
@@ -2254,7 +2341,9 @@ class Stack_unwrap(Stack_multilooking):
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None and var in weight_ds else None
 
-                unwrap_da, comp_da = self._unwrap_2d_ilp(phase_da, weight_da, conncomp, max_time, search_workers, debug)
+                unwrap_da, comp_da = self._unwrap_2d_ilp(phase_da, weight_da, conncomp,
+                                                       conncomp_size=conncomp_size,
+                                                       max_time=max_time, search_workers=search_workers, debug=debug)
 
                 unwrap_vars[var] = unwrap_da
                 if conncomp and comp_da is not None:
