@@ -1624,7 +1624,7 @@ class BatchCore(dict):
 
         return type(self)(out)
 
-    def residuals(self, debug: bool = False) -> float | list[float]:
+    def residuals(self, polarization: str = 'VV', debug: bool = False) -> float | list[float]:
         """
         Measure phase offset discrepancy across all burst overlaps.
 
@@ -1634,6 +1634,8 @@ class BatchCore(dict):
 
         Parameters
         ----------
+        polarization : str, optional
+            Polarization to use for residual computation (default 'VV').
         debug : bool, optional
             Print debug information for each overlap. Default is False.
 
@@ -1679,9 +1681,13 @@ class BatchCore(dict):
         # Collect burst extents and detect pair dimension
         ids = sorted(self.keys())
 
+        # Validate polarization exists
         sample_ds = self[ids[0]]
-        pol = list(sample_ds.data_vars)[0] if hasattr(sample_ds, 'data_vars') else None
-        sample_da = sample_ds[pol] if pol else sample_ds
+        available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        if polarization not in available_pols:
+            raise ValueError(f"Polarization '{polarization}' not found. Available: {available_pols}")
+
+        sample_da = sample_ds[polarization]
         n_pairs = sample_da.sizes.get('pair', 1)
         has_pair_dim = 'pair' in sample_da.dims
 
@@ -1700,8 +1706,7 @@ class BatchCore(dict):
         extents = {}
         for bid in ids:
             ds = self[bid]
-            pol = list(ds.data_vars)[0] if hasattr(ds, 'data_vars') else None
-            da = ds[pol] if pol else ds
+            da = ds[polarization]
             if 'pair' in da.dims:
                 da = da.isel(pair=0)
             y_coords = da.coords['y'].values
@@ -1736,13 +1741,8 @@ class BatchCore(dict):
         jobs = []
         lazy_diffs = []
         for id1, id2 in overlap_pairs:
-            i1 = self[id1]
-            i2 = self[id2]
-
-            pol = list(i1.data_vars)[0] if hasattr(i1, 'data_vars') else None
-            if pol:
-                i1 = i1[pol]
-                i2 = i2[pol]
+            i1 = self[id1][polarization]
+            i2 = self[id2][polarization]
 
             for pair_idx in range(n_pairs):
                 i1_p = i1.isel(pair=pair_idx) if 'pair' in i1.dims else i1
@@ -1844,6 +1844,7 @@ class BatchCore(dict):
     def fit(self,
             degree: int = 0,
             method: str = 'median',
+            polarization: str = 'VV',
             debug: bool = False,
             return_residuals: bool = False):
         """
@@ -1861,6 +1862,8 @@ class BatchCore(dict):
             - 1: Estimate linear ramp (in x/range direction).
         method : str, optional
             Estimation method: 'median' (robust) or 'mean' (faster).
+        polarization : str, optional
+            Polarization to use for coefficient estimation (default 'VV').
         debug : bool, optional
             Print debug information. Default is False.
         return_residuals : bool, optional
@@ -1944,21 +1947,25 @@ class BatchCore(dict):
         n_bursts = len(ids)
         id_to_idx = {bid: i for i, bid in enumerate(ids)}
 
-        # Detect number of pairs
+        # Validate polarization exists
         sample_ds = self[ids[0]]
-        pol = list(sample_ds.data_vars)[0] if hasattr(sample_ds, 'data_vars') else None
-        sample_da = sample_ds[pol] if pol else sample_ds
+        available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        if polarization not in available_pols:
+            raise ValueError(f"Polarization '{polarization}' not found. Available: {available_pols}")
+
+        # Detect number of pairs
+        sample_da = sample_ds[polarization]
         n_pairs = sample_da.sizes.get('pair', 1)
         has_pair_dim = 'pair' in sample_da.dims
 
         if debug:
-            print(f'fit(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s)', flush=True)
+            print(f'fit(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s), pol={polarization}', flush=True)
 
         # Extract pathNumber and subswath attributes for each burst (required for degree=1)
-        # Use pathNumber + subswath as track key to prevent inter-path same-subswath overlaps
-        # in near-polar regions from being used for ramp estimation
-        burst_track = {}  # pathNumber + subswath (e.g., '33IW3')
-        burst_subswath = {}  # just subswath for debug output
+        # Used to skip same-path different-subswath overlaps (small x-extent, diagonal connection)
+        # but allow cross-path overlaps which can have large x-extent with significant iono ramps
+        burst_path = {}  # pathNumber (e.g., '33')
+        burst_subswath = {}  # subswath (e.g., 'IW3')
         for bid in ids:
             ds = self[bid]
             if degree == 1:
@@ -1966,7 +1973,7 @@ class BatchCore(dict):
                     raise ValueError(f"Burst '{bid}' missing required 'subswath' attribute for ramp estimation")
                 if 'pathNumber' not in ds.attrs:
                     raise ValueError(f"Burst '{bid}' missing required 'pathNumber' attribute for ramp estimation")
-                burst_track[bid] = f"{ds.attrs['pathNumber']}{ds.attrs['subswath']}"
+                burst_path[bid] = ds.attrs['pathNumber']
                 burst_subswath[bid] = ds.attrs['subswath']
 
         extents = {}
@@ -1974,8 +1981,7 @@ class BatchCore(dict):
 
         for bid in ids:
             ds = self[bid]
-            pol = list(ds.data_vars)[0] if hasattr(ds, 'data_vars') else None
-            da = ds[pol] if pol else ds
+            da = ds[polarization]
             if 'pair' in da.dims:
                 da = da.isel(pair=0)
             y_coords = da.coords['y'].values
@@ -2071,7 +2077,8 @@ class BatchCore(dict):
             return (id1, id2, pair_idx, maybe_wrap(offset), ramp_val, x_centroid, n_valid)
 
         # Find overlapping burst pairs
-        # For degree=1 (ramp), only use same-subswath overlaps (along-track)
+        # For degree=1 (ramp), skip same-path cross-subswath overlaps (small x-extent, diagonal)
+        # but allow cross-path overlaps which have large x-extent with significant iono ramps
         # For degree=0 (offset), use all overlaps including cross-subswath
         all_overlap_pairs = []
         cross_subswath_skipped = 0
@@ -2082,30 +2089,28 @@ class BatchCore(dict):
                     continue
                 if extents_overlap(e1, extents[id2]):
                     if degree == 1:
-                        # For ramp estimation, only use same-track overlaps (same path + subswath)
-                        # This prevents inter-path same-subswath overlaps in near-polar regions
-                        track1, track2 = burst_track[id1], burst_track[id2]
-                        if track1 != track2:
+                        # For ramp estimation, skip same-path cross-subswath overlaps (diagonal, small x-extent)
+                        # but allow cross-path overlaps - they have large x-extent with iono ramp differences
+                        path1, path2 = burst_path[id1], burst_path[id2]
+                        sw1, sw2 = burst_subswath[id1], burst_subswath[id2]
+                        if path1 == path2 and sw1 != sw2:
+                            # Same path, different subswath: diagonal overlap, skip
                             cross_subswath_skipped += 1
                             continue
+                        # Same path + same subswath (along-track) or different paths: allow
                     all_overlap_pairs.append((id1, id2))
 
         if debug:
             print(f'Found {len(all_overlap_pairs)} overlapping burst pairs', flush=True)
             if degree == 1 and cross_subswath_skipped > 0:
-                print(f'  (skipped {cross_subswath_skipped} cross-track pairs for ramp estimation)', flush=True)
+                print(f'  (skipped {cross_subswath_skipped} same-path cross-subswath pairs for ramp estimation)', flush=True)
 
         # Build all lazy phase differences (dask graphs)
         jobs = []
         lazy_diffs = []
         for id1, id2 in all_overlap_pairs:
-            i1 = self[id1]
-            i2 = self[id2]
-
-            pol = list(i1.data_vars)[0] if hasattr(i1, 'data_vars') else None
-            if pol:
-                i1 = i1[pol]
-                i2 = i2[pol]
+            i1 = self[id1][polarization]
+            i2 = self[id2][polarization]
 
             for pair_idx in range(n_pairs):
                 i1_p = i1.isel(pair=pair_idx) if 'pair' in i1.dims else i1
@@ -2352,6 +2357,7 @@ class BatchCore(dict):
     def align(self,
               degree: int = 0,
               method: str = 'median',
+              polarization: str = 'VV',
               debug: bool = False,
               return_residuals: bool = False):
         """
@@ -2372,6 +2378,10 @@ class BatchCore(dict):
             - 1: Offset + linear ramp correction (better fringe continuity)
         method : str, optional
             Estimation method: 'median' (robust, default) or 'mean' (faster).
+        polarization : str, optional
+            Polarization to use for coefficient estimation (default 'VV').
+            Corrections are applied to all polarizations since phase offsets
+            are the same for all polarizations (same geometry).
         debug : bool, optional
             Print debug information. Default is False.
         return_residuals : bool, optional
@@ -2393,6 +2403,9 @@ class BatchCore(dict):
         >>> # Alignment with ramp correction
         >>> aligned = intfs.align(degree=1)
         >>>
+        >>> # Use VH polarization for estimation
+        >>> aligned = intfs.align(polarization='VH')
+        >>>
         >>> # With coherence filtering
         >>> aligned = intfs.where(corr >= 0.3).align()
         >>>
@@ -2404,17 +2417,19 @@ class BatchCore(dict):
         -----
         For degree=1, the function performs:
         1. Estimate and remove offsets
-        2. Estimate and remove ramps (using same-track overlaps only)
+        2. Estimate and remove ramps (using along-track and cross-path overlaps)
         3. Re-estimate offsets on ramp-corrected data
         4. Combine into final [ramp, offset] coefficients
+
+        Ramp estimation uses:
+        - Same-path, same-subswath overlaps (along-track, y-direction)
+        - Cross-path overlaps (can have large x-extent with significant iono ramps)
+
+        It skips same-path, cross-subswath overlaps (diagonal, small x-extent).
 
         This 3-step approach achieves better fringe continuity than single-step
         methods because it separates the offset and ramp estimation, avoiding
         cross-contamination between the two.
-
-        Use ``align(degree=0)`` (offset-only) when cross-subswath consistency
-        matters most. Use ``align(degree=1)`` when per-track fringe continuity
-        is more important than cross-subswath boundaries.
         """
         from .Batch import Batch, BatchWrap
 
@@ -2426,14 +2441,14 @@ class BatchCore(dict):
             # Single-step offset correction
             if debug:
                 print('align(degree=0): single-step offset correction', flush=True)
-                res_in = self.residuals()
+                res_in = self.residuals(polarization=polarization)
                 print(f'Input residuals: {res_in}', flush=True)
 
-            offsets = self.fit(degree=0, method=method, debug=debug)
+            offsets = self.fit(degree=0, method=method, polarization=polarization, debug=debug)
             aligned = self - offsets
 
             if debug or return_residuals:
-                res_out = aligned.residuals()
+                res_out = aligned.residuals(polarization=polarization)
                 if debug:
                     print(f'Output residuals: {res_out}', flush=True)
 
@@ -2445,31 +2460,31 @@ class BatchCore(dict):
             # 3-step offset-ramp-offset correction
             if debug:
                 print('align(degree=1): 3-step offset-ramp-offset correction', flush=True)
-                res_in = self.residuals()
+                res_in = self.residuals(polarization=polarization)
                 print(f'Input residuals: {res_in}', flush=True)
 
             # Step 1: Estimate offsets
             if debug:
                 print('\nStep 1: Estimate offsets...', flush=True)
-            offsets1 = self.fit(degree=0, method=method, debug=debug)
+            offsets1 = self.fit(degree=0, method=method, polarization=polarization, debug=debug)
             intfs1 = self - offsets1
             if debug:
-                res1 = intfs1.residuals()
+                res1 = intfs1.residuals(polarization=polarization)
                 print(f'Residuals after step 1: {res1}', flush=True)
 
             # Step 2: Estimate ramps (uses same-track overlaps only)
             if debug:
                 print('\nStep 2: Estimate ramps...', flush=True)
-            ramps = intfs1.fit(degree=1, method=method, debug=debug)
+            ramps = intfs1.fit(degree=1, method=method, polarization=polarization, debug=debug)
             intfs2 = intfs1 - intfs1.polyval(ramps)
             if debug:
-                res2 = intfs2.residuals()
+                res2 = intfs2.residuals(polarization=polarization)
                 print(f'Residuals after step 2: {res2}', flush=True)
 
             # Step 3: Re-estimate offsets
             if debug:
                 print('\nStep 3: Re-estimate offsets...', flush=True)
-            offsets2 = intfs2.fit(degree=0, method=method, debug=debug)
+            offsets2 = intfs2.fit(degree=0, method=method, polarization=polarization, debug=debug)
 
             # Combine coefficients: [ramp, offset1 + ramp_intercept + offset2]
             # Detect if multi-pair
@@ -2492,7 +2507,7 @@ class BatchCore(dict):
             aligned = self - self.polyval(coeffs)
 
             if debug or return_residuals:
-                res_out = aligned.residuals()
+                res_out = aligned.residuals(polarization=polarization)
                 if debug:
                     print(f'Final residuals: {res_out}', flush=True)
 
@@ -2503,211 +2518,162 @@ class BatchCore(dict):
         else:
             raise ValueError(f"degree must be 0 or 1, got {degree}")
 
-    def dissolve(self, fast: bool = False, debug: bool = False):
+    def dissolve(self, extend: bool = True, weight: float = None, debug: bool = False):
         """
-        Dissolve burst boundaries by combining overlapping regions.
+        Dissolve burst boundaries by averaging overlapping regions.
 
         For each burst, this method computes a merged product covering that burst's
-        extent, combining values from all overlapping bursts. Uses the same
-        block-wise pattern as to_dataset().
+        extent, averaging values from all overlapping bursts.
+
+        For wrapped phase data (BatchWrap), circular mean is used.
+        For unwrapped phase or other data (Batch, BatchUnit), arithmetic mean is used.
 
         Parameters
         ----------
-        fast : bool, optional
-            If True, use forward-fill (ffill) to propagate valid values in order
-            (faster, no averaging). If False (default), use averaging for smooth
-            transitions. For wrapped phase, averaging uses circular mean.
+        extend : bool, optional
+            If True (default), NaN areas in current burst can be filled by overlapping
+            bursts. Good for unwrapping consistency between bursts.
+            If False, only pixels valid in the current burst are kept (NaN areas remain NaN).
+            Better for performance when you don't want to process same pixels in multiple bursts.
+        weight : float, optional
+            Normalized weight of the current burst in range [0, 1]. Default is None.
+            weight=None: equal weights for all bursts (simple average)
+            weight=1: only current burst used, overlapping bursts ignored
+            weight=0: only overlapping bursts used, current burst ignored
+            weight=0.5: current burst has same weight as sum of all overlapping bursts
         debug : bool, optional
             Print debug information. Default is False.
 
         Returns
         -------
         BatchCore
-            New batch with dissolved overlap regions (lazy).
+            New batch with dissolved (averaged) overlap regions (lazy).
 
         Examples
         --------
-        >>> # Dissolve with averaging (smooth transitions)
+        >>> # Dissolve with equal weights (default)
         >>> intfs_dissolved = intfs.dissolve()
         >>>
-        >>> # Dissolve with ffill (fast, just propagate valid values)
-        >>> intfs_dissolved = intfs.dissolve(fast=True)
+        >>> # Dissolve without extension (keep original burst footprint)
+        >>> intfs_dissolved = intfs.dissolve(extend=False)
+        >>>
+        >>> # Dissolve with current burst having 70% weight
+        >>> intfs_dissolved = intfs.dissolve(weight=0.7)
 
         Notes
         -----
-        - fast=False: For BatchWrap uses circular mean, for Batch/BatchUnit uses arithmetic mean
-        - fast=True: Uses forward-fill to propagate valid values in burst order
-        - Returns lazy data using dask.array.blockwise
+        - For BatchWrap (wrapped phase): uses circular mean via exp(1j*phase)
+        - For Batch/BatchUnit (unwrapped phase, correlation): uses arithmetic mean
+        - Returns lazy data, processes per burst replacing polarization variables
         """
-        import xarray as xr
+        import warnings
         import dask
-        import dask.array
+        import dask.array as da
+        from shapely import box, STRtree
         from .Batch import BatchWrap
 
         if len(self) <= 1:
             return type(self)(self)
 
-        # Determine if we need circular mean (wrapped phase) or arithmetic mean
-        wrap = None if fast else isinstance(self, BatchWrap)
-
-        if debug:
-            import time
-            t0 = time.time()
-            print(f'dissolve: {len(self)} bursts, fast={fast}, wrap={wrap}', flush=True)
-
+        wrap = isinstance(self, BatchWrap)
         burst_ids = list(self.keys())
         sample = self[burst_ids[0]]
         polarizations = [v for v in sample.data_vars if v != 'spatial_ref']
 
-        # Process each polarization separately (like to_dataset)
-        result = {bid: {} for bid in burst_ids}
+        if debug:
+            import time
+            t0 = time.time()
+            print(f'dissolve: {len(self)} bursts, wrap={wrap}, extend={extend}, weight={weight}', flush=True)
 
-        # Block function - defined once outside loops to avoid re-creation overhead
-        def block_dask(stack, y_chunk, x_chunk, fill_dtype, wrap,
-                       datas, extents, burst_coords, stackvar, current_burst_idx):
-            """Process a single output chunk by averaging current burst with overlapping bursts."""
-            import xarray as xr
-            import dask
-            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
+        # Build STRtree for fast spatial queries
+        first_pol = polarizations[0]
+        burst_extents = tuple(
+            (float(self[bid][first_pol].y.min()), float(self[bid][first_pol].y.max()),
+             float(self[bid][first_pol].x.min()), float(self[bid][first_pol].x.max()))
+            for bid in burst_ids
+        )
+        burst_boxes = [box(xmin, ymin, xmax, ymax) for ymin, ymax, xmin, xmax in burst_extents]
+        tree = STRtree(burst_boxes)
 
-            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
-            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
+        overlapping_map = {
+            burst_idx: tuple(int(idx) for idx in tree.query(burst_boxes[burst_idx]) if idx != burst_idx)
+            for burst_idx in range(len(burst_ids))
+        }
 
-            # Get current burst's coordinates for this chunk
-            current_y, current_x = burst_coords[current_burst_idx]
-            current_y_set = set(current_y.tolist())
-            current_x_set = set(current_x.tolist())
+        if debug:
+            total_overlaps = sum(len(v) for v in overlapping_map.values())
+            print(f'dissolve: STRtree found {total_overlaps} burst overlaps', flush=True)
 
-            # Find OTHER bursts that share coordinates with current burst in this chunk region
-            y_chunk_set = set(y_chunk.tolist())
-            x_chunk_set = set(x_chunk.tolist())
+        def dissolve_pol(da_current, das_others, wrap, extend, weight):
+            """Dissolve one polarization - returns numpy array."""
+            ys, xs = da_current.y.values, da_current.x.values
+            n_others = len(das_others)
 
-            overlapping = [current_burst_idx]  # always include current burst
-            for idx, (ymin, ymax, xmin, xmax) in enumerate(extents):
-                if idx == current_burst_idx:
-                    continue  # skip current burst
-                if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin:
-                    burst_y, burst_x = burst_coords[idx]
-                    burst_y_set = set(burst_y.tolist())
-                    burst_x_set = set(burst_x.tolist())
-                    # check if this burst shares coordinates with current burst
-                    common_y = current_y_set & burst_y_set & y_chunk_set
-                    common_x = current_x_set & burst_x_set & x_chunk_set
-                    if common_y and common_x:
-                        overlapping.append(idx)
-
-            # Only current burst - no averaging needed
-            if len(overlapping) == 1:
-                da_block = datas[current_burst_idx].isel({stackvar: stack})\
-                    .sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                da_block = dask.compute(da_block)[0]
-                return da_block.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False).values
-
-            # fetch data from overlapping bursts
-            das_block = [datas[idx].isel({stackvar: stack}).sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                        for idx in overlapping]
-            das_block = dask.compute(*das_block)
-            das_block = [da.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False) for da in das_block]
-
-            if len(das_block) == 1:
-                return das_block[0].values
-
-            # combine multiple bursts
-            if wrap is None:
-                # fast mode: ffill to propagate valid values in order
-                das_block_concat = xr.concat(das_block, dim='stack_dim', join='inner')
-                if np.issubdtype(das_block_concat.dtype, np.complexfloating):
-                    return (das_block_concat.real.ffill('stack_dim').isel(stack_dim=-1)
-                            + 1j * das_block_concat.imag.ffill('stack_dim').isel(stack_dim=-1)).values
-                else:
-                    return das_block_concat.ffill('stack_dim').isel(stack_dim=-1).values
-            elif wrap:
-                # circular mean for wrapped phase
-                das_block_concat = xr.concat([np.exp(1j * da) for da in das_block], dim='stack_dim')
-                block_complex = das_block_concat.mean('stack_dim', skipna=True).values
-                return np.arctan2(block_complex.imag, block_complex.real).astype(fill_dtype)
+            if weight is None:
+                w_current, w_other = 1.0, 1.0
             else:
-                # arithmetic mean for unwrapped phase and correlation
-                das_block_concat = xr.concat(das_block, dim='stack_dim', join='outer')
-                return das_block_concat.mean('stack_dim', skipna=True).reindex(
-                    {'y': y_chunk, 'x': x_chunk}, fill_value=fill_nan, copy=False).values
+                w_current = weight
+                w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
 
-        import warnings
-        from dask.array.core import PerformanceWarning
-        warnings.filterwarnings('ignore', category=PerformanceWarning)
+            das_reindexed = [d.reindex(y=ys, x=xs, fill_value=np.nan, copy=False) for d in das_others]
+            current_vals = da_current.values
+            current_valid = np.isfinite(current_vals)
 
-        for polarization in polarizations:
-            # Get all burst data for this polarization
-            datas = [self[bid][polarization] for bid in burst_ids]
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
 
-            dims = datas[0].dims
-            stackvar = dims[0] if len(dims) > 2 else None
-
-            if stackvar == 'pair':
-                stackval = [(str(ref)[:10] + ' ' + str(rep)[:10]) for ref, rep in datas[0][stackvar].values]
-            elif stackvar is not None:
-                stackval = datas[0][stackvar].astype(str)
-            else:
-                stackvar = 'fake'
-                stackval = [0]
-                datas = [da.expand_dims({stackvar: [0]}) for da in datas]
-
-            stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
-            stackidx_chunked = stackidx.chunk(1)
-
-            # Extract extents and coords for all bursts (materialized coordinates)
-            extents = tuple((float(da.y.min()), float(da.y.max()),
-                             float(da.x.min()), float(da.x.max())) for da in datas)
-            burst_coords = tuple((da.y.values, da.x.values) for da in datas)
-            datas_tuple = tuple(datas)
-
-            for burst_idx, bid in enumerate(burst_ids):
-                da_orig = self[bid][polarization]
-                if stackvar == 'fake':
-                    da_orig = da_orig.expand_dims({stackvar: [0]})
-
-                ys = da_orig.y.values
-                xs = da_orig.x.values
-                fill_dtype = da_orig.dtype
-                chunks = dask.array.core.normalize_chunks('auto', (len(ys), len(xs), 16), dtype=fill_dtype)
-
-                dissolved = dask.array.blockwise(
-                    block_dask, 'zyx',
-                    stackidx_chunked, 'z',
-                    xr.DataArray(ys, dims=['y']).chunk({'y': chunks[0]}), 'y',
-                    xr.DataArray(xs, dims=['x']).chunk({'x': chunks[1]}), 'x',
-                    meta=np.empty((0, 0, 0), dtype=fill_dtype),
-                    fill_dtype=fill_dtype,
-                    wrap=wrap,
-                    datas=datas_tuple,
-                    extents=extents,
-                    burst_coords=burst_coords,
-                    stackvar=stackvar,
-                    current_burst_idx=burst_idx,
-                )
-
-                if stackvar != 'fake':
-                    result[bid][polarization] = xr.DataArray(
-                        dissolved,
-                        dims=(stackvar, 'y', 'x'),
-                        coords={stackvar: da_orig[stackvar].values, 'y': ys, 'x': xs},
-                        name=da_orig.name
-                    ).assign_attrs(da_orig.attrs)
+                if wrap:
+                    weighted_sum = np.where(current_valid, np.exp(1j * current_vals) * w_current, 0.0)
+                    weight_sum = np.where(current_valid, w_current, 0.0)
+                    for d in das_reindexed:
+                        vals = d.values
+                        valid = np.isfinite(vals)
+                        weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
+                        weight_sum += np.where(valid, w_other, 0.0)
+                    weight_sum = np.where(weight_sum > 0, weight_sum, np.nan)
+                    out = np.arctan2((weighted_sum / weight_sum).imag, (weighted_sum / weight_sum).real)
                 else:
-                    result[bid][polarization] = xr.DataArray(
-                        dissolved[0], dims=('y', 'x'),
-                        coords={'y': ys, 'x': xs},
-                        name=da_orig.name
-                    ).assign_attrs(da_orig.attrs)
+                    weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
+                    weight_sum = np.where(current_valid, w_current, 0.0)
+                    for d in das_reindexed:
+                        vals = d.values
+                        valid = np.isfinite(vals)
+                        weighted_sum += np.where(valid, vals * w_other, 0.0)
+                        weight_sum += np.where(valid, w_other, 0.0)
+                    weight_sum = np.where(weight_sum > 0, weight_sum, np.nan)
+                    out = weighted_sum / weight_sum
 
-        # Build output datasets
+                if not extend:
+                    out = np.where(current_valid, out, np.nan)
+
+            return out.astype(da_current.dtype)
+
+        # Build output - per burst, replace pol variables with lazy arrays
         output = {}
-        for bid in burst_ids:
-            ds = self[bid]
-            new_vars = dict(result[bid])
-            if 'spatial_ref' in ds.data_vars:
-                new_vars['spatial_ref'] = ds['spatial_ref']
-            output[bid] = xr.Dataset(new_vars, attrs=ds.attrs)
+        for burst_idx, bid in enumerate(burst_ids):
+            overlapping_indices = overlapping_map[burst_idx]
+            ds_current = self[bid]
+
+            if not overlapping_indices:
+                output[bid] = ds_current
+                continue
+
+            ds_others = [self[burst_ids[idx]] for idx in overlapping_indices]
+
+            # Copy dataset and replace each pol with lazy dissolved version
+            new_ds = ds_current.copy()
+            for pol in polarizations:
+                da_current = ds_current[pol]
+                das_others = [ds[pol] for ds in ds_others]
+
+                delayed_array = da.from_delayed(
+                    dask.delayed(dissolve_pol)(da_current, das_others, wrap, extend, weight),
+                    shape=da_current.shape,
+                    dtype=da_current.dtype
+                )
+                new_ds[pol] = da_current.copy(data=delayed_array)
+
+            output[bid] = new_ds
 
         if debug:
             print(f'dissolve: preparation done in {time.time() - t0:.1f}s', flush=True)
