@@ -145,6 +145,413 @@ class Stack_unwrap(Stack_multilooking):
         return components
 
     @staticmethod
+    def _line_crosses_mask(p1, p2, mask):
+        """
+        Check if the line segment from p1 to p2 crosses any True pixels in mask.
+
+        Uses Bresenham-like sampling along the line.
+
+        Parameters
+        ----------
+        p1, p2 : tuple
+            (row, col) endpoints of the line segment.
+        mask : np.ndarray
+            2D boolean array to check against.
+
+        Returns
+        -------
+        bool
+            True if the line crosses any True pixels in mask.
+        """
+        r1, c1 = p1
+        r2, c2 = p2
+
+        # Number of steps (at least the max of row/col difference)
+        n_steps = max(abs(r2 - r1), abs(c2 - c1), 1)
+
+        for step in range(1, n_steps):  # Skip endpoints
+            t = step / n_steps
+            r = int(round(r1 + t * (r2 - r1)))
+            c = int(round(c1 + t * (c2 - c1)))
+
+            if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1]:
+                if mask[r, c]:
+                    return True
+
+        return False
+
+    @staticmethod
+    def _find_component_connections(components, conncomp_gap=None, max_neighbors=30):
+        """
+        Find direct connections between components based on minimum distance.
+
+        Uses a size-weighted approach: prioritizes connections to larger components
+        to ensure small components connect to the main component network.
+
+        Parameters
+        ----------
+        components : list of np.ndarray
+            List of boolean masks, one per connected component.
+        conncomp_gap : int or None, optional
+            Maximum pixel distance to consider components as connectable.
+            If None (default), no distance limit is applied.
+        max_neighbors : int, optional
+            Maximum number of nearest neighbors to check for each component.
+            Default is 30.
+
+        Returns
+        -------
+        list of tuple
+            List of (comp_i, comp_j, closest_i, closest_j, distance) where:
+            - comp_i, comp_j: component indices
+            - closest_i: (row, col) of closest pixel in component i
+            - closest_j: (row, col) of closest pixel in component j
+            - distance: Euclidean distance between closest pixels
+        """
+        n_comps = len(components)
+        if n_comps < 2:
+            return []
+
+        # Create combined mask of all components for intersection checking
+        all_comps_mask = np.zeros_like(components[0], dtype=bool)
+        for comp_mask in components:
+            all_comps_mask |= comp_mask
+
+        # Get pixel coordinates, centroids, and sizes for each component
+        comp_coords = []
+        centroids = []
+        comp_sizes = []
+        for comp_mask in components:
+            rows, cols = np.where(comp_mask)
+            comp_coords.append(np.column_stack([rows, cols]))
+            centroids.append((np.mean(rows), np.mean(cols)))
+            comp_sizes.append(len(rows))
+
+        centroids = np.array(centroids)
+        comp_sizes = np.array(comp_sizes)
+
+        # Sort components by size (largest first) for prioritized connection
+        size_order = np.argsort(comp_sizes)[::-1]
+
+        # For each component, find candidate neighbors using size-weighted scoring
+        # Score = size_weight / (distance + 1), prefer larger and closer components
+        candidate_pairs = set()
+        for i in range(n_comps):
+            # Compute distances from this centroid to all others
+            dists = np.sqrt(np.sum((centroids - centroids[i]) ** 2, axis=1))
+            dists[i] = np.inf  # Exclude self
+
+            # Size-weighted score: larger components get higher priority
+            # Use log(size) to avoid extreme weighting
+            size_weights = np.log1p(comp_sizes)
+            scores = size_weights / (dists + 1)
+            scores[i] = -np.inf  # Exclude self
+
+            # Get indices of best candidates (highest scores)
+            n_neighbors = min(max_neighbors, n_comps - 1)
+            best_candidates = np.argpartition(scores, -n_neighbors)[-n_neighbors:]
+
+            for j in best_candidates:
+                if scores[j] > -np.inf:
+                    # Add as sorted tuple to avoid duplicates
+                    pair = (min(i, j), max(i, j))
+                    candidate_pairs.add(pair)
+
+        # Also ensure every component considers connecting to the largest components
+        # This guarantees small isolated components can reach the main network
+        n_largest = min(5, n_comps)
+        largest_indices = size_order[:n_largest]
+        for i in range(n_comps):
+            if i not in largest_indices:
+                for j in largest_indices:
+                    pair = (min(i, j), max(i, j))
+                    candidate_pairs.add(pair)
+
+        connections = []
+
+        # Check only candidate pairs
+        for i, j in candidate_pairs:
+            coords_i = comp_coords[i]
+            coords_j = comp_coords[j]
+
+            # For large components, subsample to speed up initial search
+            max_sample = 500  # Reduced from 1000 to save memory
+            if len(coords_i) > max_sample:
+                idx_i = np.random.choice(len(coords_i), max_sample, replace=False)
+                sample_i = coords_i[idx_i]
+            else:
+                sample_i = coords_i
+
+            if len(coords_j) > max_sample:
+                idx_j = np.random.choice(len(coords_j), max_sample, replace=False)
+                sample_j = coords_j[idx_j]
+            else:
+                sample_j = coords_j
+
+            # Compute pairwise distances efficiently using scipy
+            from scipy.spatial.distance import cdist
+            dists = cdist(sample_i, sample_j, metric='euclidean')
+
+            min_dist = np.min(dists)
+
+            # Check distance limit if specified
+            if conncomp_gap is not None and min_dist > conncomp_gap:
+                continue
+
+            # Find the actual closest pair (in full set if we subsampled)
+            search_radius = max(min_dist * 2, 100)  # Search radius for refinement
+
+            if len(coords_i) > max_sample or len(coords_j) > max_sample:
+                # Refine: find closest in full set near the approximate closest
+                approx_idx = np.unravel_index(np.argmin(dists), dists.shape)
+                approx_i = sample_i[approx_idx[0]]
+                approx_j = sample_j[approx_idx[1]]
+
+                # Search in neighborhood
+                dist_to_approx_i = np.sqrt(np.sum((coords_i - approx_i) ** 2, axis=1))
+                near_i = coords_i[dist_to_approx_i < search_radius]
+
+                dist_to_approx_j = np.sqrt(np.sum((coords_j - approx_j) ** 2, axis=1))
+                near_j = coords_j[dist_to_approx_j < search_radius]
+
+                if len(near_i) == 0 or len(near_j) == 0:
+                    continue
+
+                # Limit to avoid memory explosion with large refinement sets
+                max_refine = 1000
+                if len(near_i) > max_refine:
+                    sort_idx = np.argsort(dist_to_approx_i[dist_to_approx_i < search_radius])[:max_refine]
+                    near_i = near_i[sort_idx]
+                if len(near_j) > max_refine:
+                    sort_idx = np.argsort(dist_to_approx_j[dist_to_approx_j < search_radius])[:max_refine]
+                    near_j = near_j[sort_idx]
+
+                dists = cdist(near_i, near_j, metric='euclidean')
+
+                min_idx = np.unravel_index(np.argmin(dists), dists.shape)
+                closest_i = tuple(near_i[min_idx[0]])
+                closest_j = tuple(near_j[min_idx[1]])
+                min_dist = dists[min_idx]
+            else:
+                min_idx = np.unravel_index(np.argmin(dists), dists.shape)
+                closest_i = tuple(coords_i[min_idx[0]])
+                closest_j = tuple(coords_j[min_idx[1]])
+
+            # Check if connection is direct (doesn't cross other components)
+            # Instead of creating a full mask copy, check crossing inline
+            def crosses_other_components(p1, p2, skip_i, skip_j):
+                """Check if line crosses any component other than skip_i and skip_j."""
+                r1, c1 = p1
+                r2, c2 = p2
+                n_steps = max(abs(r2 - r1), abs(c2 - c1), 1)
+                for step in range(1, n_steps):
+                    t = step / n_steps
+                    r = int(round(r1 + t * (r2 - r1)))
+                    c = int(round(c1 + t * (c2 - c1)))
+                    if 0 <= r < all_comps_mask.shape[0] and 0 <= c < all_comps_mask.shape[1]:
+                        if all_comps_mask[r, c] and not components[skip_i][r, c] and not components[skip_j][r, c]:
+                            return True
+                return False
+
+            if crosses_other_components(closest_i, closest_j, i, j):
+                # Connection crosses another component - skip it
+                continue
+
+            connections.append((i, j, closest_i, closest_j, min_dist))
+
+        return connections
+
+    @staticmethod
+    def _estimate_component_offset(unwrapped, comp_mask_i, comp_mask_j, closest_i, closest_j, n_neighbors=5):
+        """
+        Estimate the integer 2π offset between two components.
+
+        Uses N pixels closest to the connection point on each side,
+        which includes interior pixels (less noisy than border-only).
+        Uses median for robustness to outliers.
+
+        Parameters
+        ----------
+        unwrapped : np.ndarray
+            2D array of unwrapped phase values.
+        comp_mask_i, comp_mask_j : np.ndarray
+            Boolean masks for the two components.
+        closest_i, closest_j : tuple
+            (row, col) of the closest pixels defining the connection.
+        n_neighbors : int, optional
+            Number of pixels to use on each side. Default is 5.
+
+        Returns
+        -------
+        tuple
+            (k_offset, confidence) where:
+            - k_offset: integer number of 2π cycles to add to component j
+            - confidence: measure of how reliable the estimate is (0-1)
+        """
+        # Get coordinates of pixels in each component
+        rows_i, cols_i = np.where(comp_mask_i)
+        rows_j, cols_j = np.where(comp_mask_j)
+
+        # Find N closest pixels to the connection point on each side
+        dist_i = np.sqrt((rows_i - closest_i[0])**2 + (cols_i - closest_i[1])**2)
+        dist_j = np.sqrt((rows_j - closest_j[0])**2 + (cols_j - closest_j[1])**2)
+
+        # Get indices of N closest pixels
+        n_i = min(n_neighbors, len(dist_i))
+        n_j = min(n_neighbors, len(dist_j))
+
+        if n_i < 3 or n_j < 3:
+            return 0, 0.0
+
+        idx_i = np.argpartition(dist_i, n_i - 1)[:n_i]
+        idx_j = np.argpartition(dist_j, n_j - 1)[:n_j]
+
+        # Get phase values at these pixels
+        phase_i = unwrapped[rows_i[idx_i], cols_i[idx_i]]
+        phase_j = unwrapped[rows_j[idx_j], cols_j[idx_j]]
+
+        # Filter out NaN values
+        valid_i = ~np.isnan(phase_i)
+        valid_j = ~np.isnan(phase_j)
+
+        if np.sum(valid_i) < 3 or np.sum(valid_j) < 3:
+            return 0, 0.0
+
+        # Use median for robustness to outliers
+        median_phase_i = np.median(phase_i[valid_i])
+        median_phase_j = np.median(phase_j[valid_j])
+
+        # Phase difference and integer offset
+        delta_phase = median_phase_i - median_phase_j
+        k_offset = int(np.round(delta_phase / (2 * np.pi)))
+
+        # Confidence based on:
+        # 1. How close the fractional part is to an integer
+        # 2. Standard deviation of the phase values (lower = more confident)
+        fractional = (delta_phase / (2 * np.pi)) - k_offset
+        frac_confidence = 1.0 - 2 * abs(fractional)  # 1.0 if exactly integer, 0.0 if halfway
+
+        # Check consistency: std of phase values should be small relative to 2π
+        std_i = np.std(phase_i[valid_i])
+        std_j = np.std(phase_j[valid_j])
+        std_confidence = max(0, 1.0 - (std_i + std_j) / (2 * np.pi))
+
+        confidence = frac_confidence * std_confidence
+
+        return k_offset, confidence
+
+    @staticmethod
+    def _connect_components_ilp(unwrapped, components, connections, n_neighbors=5, max_time=60.0, debug=False):
+        """
+        Connect separately-unwrapped components using ILP optimization.
+
+        Finds optimal integer 2π offsets for each component to minimize
+        phase discontinuities at connection points.
+
+        Parameters
+        ----------
+        unwrapped : np.ndarray
+            2D array with separately unwrapped components.
+        components : list of np.ndarray
+            List of boolean masks for each component.
+        connections : list of tuple
+            Output from _find_component_connections.
+        n_neighbors : int, optional
+            Number of pixels to use for offset estimation at each connection.
+            Default is 50.
+        max_time : float, optional
+            Maximum solver time in seconds. Default is 60.
+        debug : bool, optional
+            If True, print diagnostic information.
+
+        Returns
+        -------
+        np.ndarray
+            2D array with connected unwrapped phase.
+        """
+        from ortools.sat.python import cp_model
+
+        n_comps = len(components)
+        if n_comps < 2 or len(connections) == 0:
+            return unwrapped.copy()
+
+        # Estimate offsets and weights for each connection
+        edge_data = []
+        for comp_i, comp_j, closest_i, closest_j, distance in connections:
+            k_offset, confidence = Stack_unwrap._estimate_component_offset(
+                unwrapped, components[comp_i], components[comp_j],
+                closest_i, closest_j, n_neighbors=n_neighbors
+            )
+            # Weight by confidence and inverse distance
+            weight = confidence / (distance + 1.0)
+            edge_data.append((comp_i, comp_j, k_offset, weight))
+
+            if debug:
+                print(f'  Connection {comp_i}-{comp_j}: dist={distance:.1f}, '
+                      f'k_offset={k_offset}, confidence={confidence:.3f}')
+
+        # Build ILP model
+        model = cp_model.CpModel()
+
+        # Variables: k_i = integer offset for component i
+        # Range: reasonable bounds (±100 cycles should be enough)
+        k_vars = [model.NewIntVar(-100, 100, f'k_{i}') for i in range(n_comps)]
+
+        # Fix component 0 as reference
+        model.Add(k_vars[0] == 0)
+
+        # Objective: minimize weighted sum of |measured_offset - (k_i - k_j)|
+        # We use absolute value linearization: |x| = max(x, -x)
+        scale = 1000  # Scale weights to integers for CP-SAT
+        abs_vars = []
+
+        for idx, (comp_i, comp_j, k_offset, weight) in enumerate(edge_data):
+            # k_offset = round((phase_i - phase_j) / 2π)
+            # To align: phase_j + k_offset*2π ≈ phase_i
+            # After offsets: (phase_i + k_i*2π) ≈ (phase_j + k_j*2π)
+            # So: phase_i - phase_j ≈ (k_j - k_i)*2π
+            # Thus: k_offset ≈ k_j - k_i
+            # Minimize: |k_offset - (k_j - k_i)| = |k_offset - k_j + k_i|
+
+            # Create auxiliary variable for the difference
+            diff_var = model.NewIntVar(-200, 200, f'diff_{idx}')
+            model.Add(diff_var == k_offset - k_vars[comp_j] + k_vars[comp_i])
+
+            # Absolute value
+            abs_var = model.NewIntVar(0, 200, f'abs_{idx}')
+            model.AddAbsEquality(abs_var, diff_var)
+
+            abs_vars.append((abs_var, int(weight * scale)))
+
+        # Objective: minimize weighted sum of absolute differences
+        model.Minimize(sum(w * v for v, w in abs_vars))
+
+        # Solve
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max_time
+
+        status = solver.Solve(model)
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            if debug:
+                print(f'  ILP solver failed with status {status}')
+            return unwrapped.copy()
+
+        # Extract solution
+        k_offsets = [solver.Value(k_vars[i]) for i in range(n_comps)]
+
+        if debug:
+            print(f'  ILP solution: k_offsets = {k_offsets}')
+
+        # Apply offsets to create connected result
+        result = unwrapped.copy()
+        for i, comp_mask in enumerate(components):
+            if k_offsets[i] != 0:
+                result[comp_mask] += k_offsets[i] * 2 * np.pi
+
+        return result
+
+    @staticmethod
     def _branch_cut(phase, correlation=None, conncomp_size=100, max_jump=1, norm=1, scale=2**16 - 1, max_iters=100, debug=False):
         """
         Phase unwrapping using branch-cut algorithm with max-flow optimization.
@@ -951,6 +1358,7 @@ class Stack_unwrap(Stack_multilooking):
                     elapsed = time.time() - t0
                     status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
                     print(f' -> {status} ({elapsed:.2f}s)')
+
             return result
 
         # Single component - use bounding box like multi-component case for consistency
@@ -1188,11 +1596,18 @@ class Stack_unwrap(Stack_multilooking):
                 # Boundary connections: connect each valid dual node to boundary
                 # A dual node at (r, c) is on the boundary of the valid region if any
                 # of its 4 neighbors is not a valid dual node
-                # Track which pixel edges have been connected to boundary to avoid duplicates
+                # Track which pixel edges AND which node pairs have been connected
+                # to avoid duplicate arcs (parallel arcs between same node pair cause issues)
                 boundary_edges_connected = set()
+                boundary_node_pairs = set()  # Track (dual_idx, boundary_node) pairs
 
                 for r, c in valid_dual_nodes:
                     dual_idx = dual_to_idx[(r, c)]
+
+                    # Only allow one boundary connection per dual node
+                    # (corner nodes would otherwise get multiple connections)
+                    if dual_idx in boundary_node_pairs:
+                        continue
 
                     # Check top boundary (r == 0 or (r-1, c) not valid)
                     if r == 0 or (r - 1, c) not in dual_to_idx:
@@ -1203,6 +1618,8 @@ class Stack_unwrap(Stack_multilooking):
                             if e_idx not in boundary_edges_connected:
                                 add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), e_dir)
                                 boundary_edges_connected.add(e_idx)
+                                boundary_node_pairs.add(dual_idx)
+                                continue  # Only one boundary connection per dual node
 
                     # Check bottom boundary (r == dual_height-1 or (r+1, c) not valid)
                     # Boundary is BELOW the cell - use -e_dir (reverse of interior vertical arc)
@@ -1214,6 +1631,8 @@ class Stack_unwrap(Stack_multilooking):
                             if e_idx not in boundary_edges_connected:
                                 add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), -e_dir)
                                 boundary_edges_connected.add(e_idx)
+                                boundary_node_pairs.add(dual_idx)
+                                continue  # Only one boundary connection per dual node
 
                     # Check left boundary (c == 0 or (r, c-1) not valid)
                     # This is a vertical edge - use -e_dir like interior horizontal arcs
@@ -1225,6 +1644,8 @@ class Stack_unwrap(Stack_multilooking):
                             if e_idx not in boundary_edges_connected:
                                 add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), -e_dir)
                                 boundary_edges_connected.add(e_idx)
+                                boundary_node_pairs.add(dual_idx)
+                                continue  # Only one boundary connection per dual node
 
                     # Check right boundary (c == dual_width-1 or (r, c+1) not valid)
                     # Boundary is to the RIGHT of cell - use +e_dir (opposite of left boundary)
@@ -1236,6 +1657,7 @@ class Stack_unwrap(Stack_multilooking):
                             if e_idx not in boundary_edges_connected:
                                 add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), e_dir)
                                 boundary_edges_connected.add(e_idx)
+                                boundary_node_pairs.add(dual_idx)
 
                 if debug:
                     print(f'    DEBUG: {len(boundary_edges_connected)} unique boundary edges connected')
@@ -2369,7 +2791,7 @@ class Stack_unwrap(Stack_multilooking):
         weight_da : xr.DataArray, optional
             3D DataArray of correlation weights.
         conncomp_flag : bool
-            Whether to compute connected components.
+            Whether to compute and return connected components.
         conncomp_size : int
             Minimum component size to process.
         debug : bool
@@ -2395,7 +2817,8 @@ class Stack_unwrap(Stack_multilooking):
 
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array using minflow."""
-            return Stack_unwrap._minflow_unwrap_2d(phase_2d, correlation=corr_2d, conncomp_size=conncomp_size, debug=debug)
+            return Stack_unwrap._minflow_unwrap_2d(phase_2d, correlation=corr_2d,
+                                                   conncomp_size=conncomp_size, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
@@ -2448,8 +2871,7 @@ class Stack_unwrap(Stack_multilooking):
             If True, also return connected components. Default is False.
         conncomp_size : int, optional
             Minimum number of pixels for a connected component to be processed.
-            Components smaller than this are left as NaN. Must be >= 2 since
-            single pixels cannot be unwrapped. Default is 100.
+            Components smaller than this are left as NaN. Default is 100.
         debug : bool, optional
             If True, print diagnostic information about connected components
             and processing times. Default is False.
@@ -2469,15 +2891,19 @@ class Stack_unwrap(Stack_multilooking):
         For higher noise, maxflow typically produces lower phase error because
         it optimizes a different objective (greedy nearest-residue matching).
 
+        Note: This method unwraps each connected component separately. Components
+        are NOT automatically linked - each has an independent phase reference.
+        Use unwrap() with conncomp_link=True to automatically link components.
+
         Examples
         --------
-        Unwrap phase without correlation weighting:
+        Unwrap phase:
         >>> unwrapped = stack.unwrap_minflow(intfs)
 
         Unwrap phase with correlation weighting:
         >>> unwrapped = stack.unwrap_minflow(intfs, corr)
 
-        Unwrap with connected components:
+        Return connected component labels:
         >>> unwrapped, conncomp = stack.unwrap_minflow(intfs, corr, conncomp=True)
 
         Skip small components (less than 500 pixels):
@@ -2507,7 +2933,9 @@ class Stack_unwrap(Stack_multilooking):
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None and var in weight_ds else None
 
-                unwrap_da, comp_da = self._unwrap_2d_minflow(phase_da, weight_da, conncomp, conncomp_size, debug)
+                unwrap_da, comp_da = self._unwrap_2d_minflow(phase_da, weight_da, conncomp,
+                                                           conncomp_size=conncomp_size,
+                                                           debug=debug)
 
                 unwrap_vars[var] = unwrap_da
                 if conncomp and comp_da is not None:
@@ -2522,12 +2950,201 @@ class Stack_unwrap(Stack_multilooking):
             return Batch(unwrap_result), BatchUnit(conncomp_result)
         return Batch(unwrap_result)
 
-    def unwrap(self, phase, weight=None, conncomp=False, method='maxflow', *args, **kwargs):
+    def _reorder_conncomp_by_size(self, conncomp_labels):
+        """
+        Reorder connected component labels by size (largest=1, smallest=max).
+
+        Parameters
+        ----------
+        conncomp_labels : BatchUnit
+            Batch of connected component labels.
+
+        Returns
+        -------
+        BatchUnit
+            Batch with reordered labels (1=largest, 2=second largest, etc.).
+        """
+        import xarray as xr
+        from .Batch import BatchUnit
+
+        def _reorder_2d(labels_2d):
+            """Reorder labels in a single 2D array."""
+            # Get unique labels (excluding 0 and NaN)
+            valid_mask = ~np.isnan(labels_2d) & (labels_2d > 0)
+            if not np.any(valid_mask):
+                return labels_2d
+
+            unique_labels = np.unique(labels_2d[valid_mask])
+            if len(unique_labels) == 0:
+                return labels_2d
+
+            # Count pixels per label
+            sizes = []
+            for label in unique_labels:
+                sizes.append(np.sum(labels_2d == label))
+
+            # Sort by size (descending) and create mapping
+            sorted_indices = np.argsort(sizes)[::-1]
+            label_mapping = {}
+            for new_label, idx in enumerate(sorted_indices, start=1):
+                old_label = unique_labels[idx]
+                label_mapping[old_label] = new_label
+
+            # Apply mapping
+            result = np.zeros_like(labels_2d)
+            result[~valid_mask] = np.nan
+            for old_label, new_label in label_mapping.items():
+                result[labels_2d == old_label] = new_label
+
+            return result.astype(np.float32)
+
+        # Process each dataset in the batch
+        result = {}
+        for key in conncomp_labels.keys():
+            ds = conncomp_labels[key]
+            data_vars = list(ds.data_vars)
+
+            reordered_vars = {}
+            for var in data_vars:
+                da = ds[var]
+
+                # Apply reordering to each 2D slice
+                reordered_da = xr.apply_ufunc(
+                    _reorder_2d,
+                    da,
+                    input_core_dims=[['y', 'x']],
+                    output_core_dims=[['y', 'x']],
+                    vectorize=True,
+                    dask='parallelized',
+                    output_dtypes=[np.float32],
+                )
+
+                reordered_vars[var] = reordered_da
+
+            result[key] = xr.Dataset(reordered_vars, attrs=ds.attrs)
+
+        return BatchUnit(result)
+
+    def _link_components(self, unwrapped, conncomp_size=100, conncomp_gap=None,
+                         conncomp_linksize=5, conncomp_linkcount=30, debug=False):
+        """
+        Link disconnected components in unwrapped phase by finding optimal 2π offsets.
+
+        Parameters
+        ----------
+        unwrapped : Batch
+            Batch of unwrapped phase datasets.
+        conncomp_size : int
+            Minimum component size to process.
+        conncomp_gap : int or None
+            Maximum pixel distance for connections.
+        conncomp_linksize : int
+            Number of pixels for offset estimation.
+        conncomp_linkcount : int
+            Maximum neighbor components to consider.
+        debug : bool
+            If True, print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Batch of unwrapped phase with linked components.
+        """
+        import xarray as xr
+        from .Batch import Batch
+
+        def _link_2d(phase_2d):
+            """Link components in a single 2D array."""
+            import time
+
+            # Find connected components
+            valid_mask = ~np.isnan(phase_2d)
+            if not np.any(valid_mask):
+                return phase_2d
+
+            components = Stack_unwrap._find_connected_components(valid_mask)
+
+            if len(components) < 2:
+                return phase_2d  # Nothing to link
+
+            # Filter by size
+            min_size = max(conncomp_size, 4)
+            comp_sizes = [np.sum(c) for c in components]
+            processed_components = [c for c, s in zip(components, comp_sizes) if s >= min_size]
+
+            if len(processed_components) < 2:
+                return phase_2d  # Not enough components to link
+
+            if debug:
+                gap_str = 'unlimited' if conncomp_gap is None else str(conncomp_gap)
+                print(f'  Linking {len(processed_components)} components (conncomp_gap={gap_str})...')
+                t0 = time.time()
+
+            # Find connections
+            connections = Stack_unwrap._find_component_connections(
+                processed_components, conncomp_gap=conncomp_gap, max_neighbors=conncomp_linkcount
+            )
+
+            if debug:
+                print(f'    Found {len(connections)} connections')
+
+            if len(connections) == 0:
+                return phase_2d  # No connections found
+
+            # Apply ILP to find optimal offsets
+            result = Stack_unwrap._connect_components_ilp(
+                phase_2d, processed_components, connections,
+                n_neighbors=conncomp_linksize, max_time=60.0, debug=debug
+            )
+
+            if debug:
+                elapsed = time.time() - t0
+                print(f'  Component linking done ({elapsed:.2f}s)')
+
+            return result
+
+        # Process each dataset in the batch
+        result = {}
+        for key in unwrapped.keys():
+            ds = unwrapped[key]
+            data_vars = list(ds.data_vars)
+
+            linked_vars = {}
+            for var in data_vars:
+                da = ds[var]
+                stackvar = da.dims[0]  # 'pair'
+
+                # Apply linking to each 2D slice
+                linked_da = xr.apply_ufunc(
+                    _link_2d,
+                    da,
+                    input_core_dims=[['y', 'x']],
+                    output_core_dims=[['y', 'x']],
+                    vectorize=True,
+                    dask='parallelized',
+                    output_dtypes=[np.float32],
+                )
+
+                linked_vars[var] = linked_da
+
+            result[key] = xr.Dataset(linked_vars, attrs=ds.attrs)
+
+        return Batch(result)
+
+    def unwrap(self, phase, weight=None, conncomp=False, method='maxflow',
+                conncomp_size=100, conncomp_gap=None,
+                conncomp_linksize=5, conncomp_linkcount=30, debug=False, **kwargs):
         """
         Unwrap phase using the specified method.
 
         This is a convenience wrapper that dispatches to unwrap_maxflow(),
         unwrap_minflow(), or unwrap_ilp() based on the method parameter.
+
+        When conncomp=False (default), disconnected components are automatically
+        linked using ILP optimization to find optimal 2π offsets.
+
+        When conncomp=True, components are kept separate and returned with
+        size-ordered labels (1=largest, 2=second largest, etc.).
 
         Parameters
         ----------
@@ -2536,23 +3153,45 @@ class Stack_unwrap(Stack_multilooking):
         weight : BatchUnit, optional
             Batch of correlation values for weighting.
         conncomp : bool, optional
-            If True, also return connected components. Default is False.
+            If False (default), link disconnected components using ILP to find
+            optimal 2π offsets, returning a single merged result.
+            If True, keep components separate and return conncomp labels
+            (1=largest component, 2=second largest, etc., 0=invalid).
         method : str, optional
             Unwrapping method to use. Options are:
             - 'maxflow': Branch-cut algorithm with max-flow optimization (default).
             - 'minflow': Minimum Cost Flow (Costantini algorithm) - scalable.
             - 'ilp': Integer Linear Programming - optimal but slow.
-        *args, **kwargs
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be processed.
+            Components smaller than this are left as NaN. Default is 100.
+        conncomp_gap : int or None, optional
+            Maximum pixel distance between components to consider them connectable.
+            If None (default), no distance limit - all direct connections are used.
+            Only used when conncomp=False.
+        conncomp_linksize : int, optional
+            Number of pixels to use on each side of a connection point for
+            estimating the phase offset between components. Uses median for
+            robustness - 5 pixels is sufficient to tolerate 2 outliers (40%).
+            Default is 5. Only used when conncomp=False.
+        conncomp_linkcount : int, optional
+            Maximum number of nearest neighbor components to consider for
+            connections from each component. Higher values find more potential
+            connections but increase computation. Default is 30.
+            Only used when conncomp=False.
+        debug : bool, optional
+            If True, print diagnostic information. Default is False.
+        **kwargs
             Additional arguments passed to the underlying method.
             For 'maxflow': max_jump, norm, scale, max_iters.
-            For 'ilp': max_time.
-            For 'minflow': none.
+            For 'ilp': max_time, search_workers.
 
         Returns
         -------
         Batch or tuple
-            If conncomp is False: Batch of unwrapped phase.
-            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp).
+            If conncomp is False: Batch of unwrapped phase (components linked).
+            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp)
+            where conncomp labels are ordered by size (1=largest).
 
         Notes
         -----
@@ -2568,60 +3207,56 @@ class Stack_unwrap(Stack_multilooking):
                                         optimum needed
         ========  =======  ===========  =====================================
 
+        Component Linking (when conncomp=False):
+        1. Unwraps each connected component separately
+        2. Finds direct connections between components (not crossing others)
+        3. Estimates phase offsets using conncomp_linksize pixels per connection
+        4. Uses ILP to find globally optimal integer 2π offsets
+
         Examples
         --------
-        Unwrap phase with default max-flow method:
+        Unwrap phase with component linking (default):
         >>> unwrapped = stack.unwrap(intfs, corr)
 
-        Unwrap phase with minflow method (Costantini):
+        Unwrap with minflow method:
         >>> unwrapped = stack.unwrap(intfs, corr, method='minflow')
 
-        Unwrap phase with ILP method (optimal but slow):
+        Keep components separate (no linking), get labels:
+        >>> unwrapped, conncomp = stack.unwrap(intfs, corr, conncomp=True)
+        >>> main_component = unwrapped.where(conncomp == 1)  # largest component
+
+        Unwrap with ILP method (optimal but slow):
         >>> unwrapped = stack.unwrap(intfs, corr, method='ilp', max_time=3600)
         """
+        # Validate parameters
+        if not conncomp and conncomp_linksize > conncomp_size:
+            raise ValueError(
+                f'conncomp_linksize ({conncomp_linksize}) cannot be greater than conncomp_size ({conncomp_size}). '
+                f'Components must have at least conncomp_linksize pixels for reliable offset estimation.'
+            )
+
+        # Call the appropriate unwrapping method (always get conncomp for internal use)
         if method == 'maxflow':
-            return self.unwrap_maxflow(phase, weight, conncomp, *args, **kwargs)
+            unwrapped, conncomp_labels = self.unwrap_maxflow(phase, weight, conncomp=True,
+                                                             conncomp_size=conncomp_size, debug=debug, **kwargs)
         elif method == 'minflow':
-            return self.unwrap_minflow(phase, weight, conncomp, *args, **kwargs)
+            unwrapped, conncomp_labels = self.unwrap_minflow(phase, weight, conncomp=True,
+                                                             conncomp_size=conncomp_size, debug=debug, **kwargs)
         elif method == 'ilp':
-            return self.unwrap_ilp(phase, weight, conncomp, *args, **kwargs)
+            unwrapped, conncomp_labels = self.unwrap_ilp(phase, weight, conncomp=True,
+                                                          conncomp_size=conncomp_size, debug=debug, **kwargs)
         else:
             raise ValueError(f"Unknown unwrapping method: '{method}'. Use 'maxflow', 'minflow', or 'ilp'.")
 
-    @staticmethod
-    def conncomp_main(data, start=0):
-        import xarray as xr
-        import numpy as np
-        from scipy.ndimage import label
-
-        if isinstance(data, xr.Dataset):
-            conncomp = data.conncomp
+        if conncomp:
+            # Return separate components with size-ordered labels
+            conncomp_labels = self._reorder_conncomp_by_size(conncomp_labels)
+            return unwrapped, conncomp_labels
         else:
-            # 2D array expected for landmask, etc.
-            labeled_array, num_features = label(data)
-            conncomp = xr.DataArray(labeled_array, coords=data.coords).where(data)
-
-        # Function to find the mode (most frequent value)
-        def find_mode(array):
-            values, counts = np.unique(array[~np.isnan(array)&(array>=start)], return_counts=True)
-            max_count_index = np.argmax(counts)
-            return values[max_count_index] if counts.size > 0 else np.nan
-
-        # Apply the function along the 'pair' dimension
-        maincomps =  xr.apply_ufunc(find_mode, conncomp.chunk(dict(y=-1, x=-1)), input_core_dims=[['y', 'x']],
-                                    vectorize=True, dask='parallelized', output_dtypes=[int])
-        return data.where(conncomp==maincomps)
-
-    def plot_conncomps(self, data, caption='Connected Components', cols=4, size=4, nbins=5, aspect=1.2, y=1.05,
-                       vmin=0, vmax=10, cmap='tab10_r'):
-        import matplotlib.pyplot as plt
-
-        # multi-plots ineffective for linked lazy data
-        fg = data.plot.imshow(
-            col='pair',
-            col_wrap=cols, size=size, aspect=aspect,
-            cmap=cmap, vmin=0, vmax=10
-        )
-        #fg.set_axis_labels('Range', 'Azimuth')
-        fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-        fg.fig.suptitle(caption, y=y)
+            # Link components
+            unwrapped = self._link_components(
+                unwrapped, conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
+                conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
+                debug=debug
+            )
+            return unwrapped
