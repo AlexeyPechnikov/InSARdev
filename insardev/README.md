@@ -1,20 +1,42 @@
-# insardev
+# InSAR.dev (Python InSAR)
 
-Core interferometric processing and analysis tools for the InSAR.dev ecosystem.
+Interferometric Synthetic Aperture Radar (InSAR) processing library for Python.
+
+## Features
+
+- Geocoded SLC processing - works with geocoded SLCs from pygmtsar
+- Interferogram and correlation generation - core InSAR products
+- Phase Goldstein filtering - noise reduction
+- Phase multilooking - resolution/noise tradeoff
+- Phase detrending - atmospheric/orbital corrections
+- Phase aligning between bursts - burst stitching
+- Phase unwrapping - 1D and 2D unwrapping
+- Time series analysis (in progress) - SBAS/PSI
 
 ## License
 
-See [LICENSE](./LICENSE) for full terms.  
+This software is released under the **InSAR.dev Source-Available License**.
+See [LICENSE](./LICENSE) for full terms.
 
-## No Warranty
+**Free for:**
+- Students, educators, and classroom teaching
+- Personal learning and hobby projects
+- Unfunded academic coursework, thesis, or dissertation work
+- Non-commercial workshops and community education
 
-This software is provided “as is”, without warranty of any kind, express or implied,  
-including but not limited to the warranties of merchantability, fitness for a particular  
-purpose, and non-infringement. In no event shall the authors or copyright holders be  
-liable for any claim, damages or other liability, whether in an action of contract, tort  
-or otherwise, arising from, out of or in connection with the software or the use or other  
-dealings in the software.
+**Subscription required for:**
+- University or institutional research (including grant-funded)
+- Business, consulting, or professional use
+- Government or corporate projects
 
-## Support
+See [SUBSCRIBE](./SUBSCRIBE) for subscription options.
 
-Official support and priority issue handling are available exclusively to **InSAR.dev Professional** members on [Patreon](https://www.patreon.com/pechnikov/).
+## Contact
+
+- Author: Aleksei Pechnikov
+- Email: alexey@pechnikov.dev
+- ORCID: https://orcid.org/0000-0001-9626-8615
+
+## Bug Reports
+
+Bug reports and suggestions are welcome via the project's issue tracker.

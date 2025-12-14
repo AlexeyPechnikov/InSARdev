@@ -1,4 +1,37 @@
-## InSAR.dev Professional
+# InSAR.dev (Python InSAR)
 
-This is a proof of concept and it works. The complete bursts are available and while in the example bursts averaged for overlapped areas, we can use the overlaps to calculate inter-bursts interferograms and detect bursts phase offsets for precise phase shift between them. Different orbital path bursts can be merged as well and we can create continuous interferograms covering more than common 3 Sentinel-1 subswaths. Ascending and descending interferograms are calculated in the same coordinates and no computational expensive data interpolation is needed with accuracy lost. The projected coordinate system can be selected to cover large areas like the whole USA without reprojecting related precision degradation. Geocoded corrected SLC resolution is user-specified and can be selected as 10x2.5 meters for mountain areas or 15x5 for flat areas (by default). Furthermore, the corrected SLCs are 2 times smaller than the original ones! That seems fantastic but we have so many benefits without downsides.
+Interferometric Synthetic Aperture Radar (InSAR) processing ecosystem for Python.
 
+## Components
+
+| Package | Description | License |
+|---------|-------------|---------|
+| [insardev](./insardev/) | Core interferometric processing and analysis | InSARdev-SAL-1.0 |
+| [insardev_pygmtsar](./insardev_pygmtsar/) | GMTSAR-based Sentinel-1 SLC preprocessing | BSD 3-Clause |
+| [insardev_toolkit](./insardev_toolkit/) | Utility functions and helper tools | BSD 3-Clause |
+
+## Features
+
+- Sentinel-1 SLC bursts processing pipeline
+- Interferogram generation, filtering, detrending, unwrapping
+- Time series analysis (SBAS, PSI)
+
+## License
+
+This repository contains components with different licenses:
+
+- **insardev/** - InSAR.dev Source-Available License (see [insardev/LICENSE](./insardev/LICENSE))
+- **insardev_pygmtsar/** - BSD 3-Clause License (see [insardev_pygmtsar/LICENSE](./insardev_pygmtsar/LICENSE))
+- **insardev_toolkit/** - BSD 3-Clause License (see [insardev_toolkit/LICENSE](./insardev_toolkit/LICENSE))
+
+For Commercial Use of the insardev package, see [insardev/SUBSCRIBE](./insardev/SUBSCRIBE).
+
+## Contact
+
+- Author: Aleksei Pechnikov
+- Email: alexey@pechnikov.dev
+- ORCID: https://orcid.org/0000-0001-9626-8615
+
+## Bug Reports
+
+Bug reports and suggestions are welcome via the project's issue tracker.

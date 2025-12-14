@@ -1,20 +1,29 @@
-# insardev_toolkit
+# InSAR.dev Toolkit
 
-A collection of helper functions and utilities for the InSAR.dev ecosystem.
+Utility functions and helper tools for the InSAR.dev ecosystem.
+
+## Features
+
+- DEM downloading (Copernicus GLO-30/GLO-90, NASA SRTM, JAXA ALOS)
+- Sentinel-1 orbit file (EOF) downloading
+- Sentinel-1 SLC downloading from ASF (Alaska Satellite Facility)
+- Map tile downloading (XYZ, OpenStreetMap, Google Maps)
+- Progress bars with parallel processing support
+- NetCDF and xarray data grid operations
+- 3D visualization export (VTK format)
+- HTTP utilities for downloading and extraction
 
 ## License
 
-See [LICENSE](./LICENSE) for full terms.  
+This software is released under the **BSD 3-Clause License**.
+See [LICENSE](./LICENSE) for full terms.
 
-## No Warranty
+## Contact
 
-This software is provided “as is”, without warranty of any kind, express or implied,  
-including but not limited to the warranties of merchantability, fitness for a particular  
-purpose, and non-infringement. In no event shall the authors or copyright holders be  
-liable for any claim, damages or other liability, whether in an action of contract, tort  
-or otherwise, arising from, out of or in connection with the software or the use or other  
-dealings in the software.
+- Author: Aleksei Pechnikov
+- Email: alexey@pechnikov.dev
+- ORCID: https://orcid.org/0000-0001-9626-8615
 
-## Support
+## Bug Reports
 
-Official support and priority issue handling are available exclusively to **InSAR.dev Professional** members on [Patreon](https://www.patreon.com/pechnikov/).
+Bug reports and suggestions are welcome via the project's issue tracker.

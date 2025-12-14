@@ -1,20 +1,28 @@
-# insardev_pygmtsar
+# InSAR.dev PyGMTSAR
 
-GMTSAR-based Sentinel-1 SLC preprocessing for the InSAR.dev ecosystem.
+GMTSAR-based Sentinel-1 SLC preprocessing library for Python.
+
+## Features
+
+- Sentinel-1 SLC burst processing
+- Precise orbit file integration
+- DEM preparation and coregistration
+- Burst alignment and coregistration
+- Topographic phase computation
+- Geocoding and coordinate transformations
+- GMTSAR wrapper
 
 ## License
 
-See [LICENSE](./LICENSE) for full terms.  
+This software is released under the **BSD 3-Clause License**.
+See [LICENSE](./LICENSE) for full terms.
 
-## No Warranty
+## Contact
 
-This software is provided “as is”, without warranty of any kind, express or implied,  
-including but not limited to the warranties of merchantability, fitness for a particular  
-purpose, and non-infringement. In no event shall the authors or copyright holders be  
-liable for any claim, damages or other liability, whether in an action of contract, tort  
-or otherwise, arising from, out of or in connection with the software or the use or other  
-dealings in the software.
+- Author: Aleksei Pechnikov
+- Email: alexey@pechnikov.dev
+- ORCID: https://orcid.org/0000-0001-9626-8615
 
-## Support
+## Bug Reports
 
-Official support and priority issue handling are available exclusively to **InSAR.dev Professional** members on [Patreon](https://www.patreon.com/pechnikov/).
+Bug reports and suggestions are welcome via the project's issue tracker.
