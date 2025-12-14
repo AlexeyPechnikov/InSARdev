@@ -1,25 +1,237 @@
 InSAR.dev Source-Available License
+Version 1.0
 
-You are free to use, modify, and share this software for non-commercial personal, educational, or individual open-source purposes, including:
+SPDX-License-Identifier: InSARdev-SAL-1.0
 
-✅ Use by students, educators, and independent researchers  
-✅ Personal exploration, hobby projects, and contributions to public open-source projects by individuals or students
+This is a source-available license and is not an OSI-approved open source license.
 
-You may also use this software for professional, academic, or institutionally funded purposes if you have an active per-seat subscription through:  
-https://www.patreon.com/pechnikov
+Copyright (c) 2025 Aleksei Pechnikov (Alexey Pechnikov)
+ORCID: https://orcid.org/0000-0001-9626-8615
+Contact: alexey@pechnikov.dev
 
-This includes:
+1. DEFINITIONS
 
-✅ Research funded by universities, public grants, private corporations, or government contracts  
-✅ Use in businesses, consultancies, research groups, or paid professional projects  
-✅ Internal use by teams or individuals affiliated with research labs or institutions
+"Copyright Holder" means Aleksei Pechnikov (Alexey Pechnikov), as identified
+in the copyright notice above.
 
-You may NOT use this software for:
+"Software" means the source code, object code, documentation, and any
+accompanying materials provided under this license.
 
-❌ Offering it as part of any Cloud, SaaS, or managed service platform (e.g., AWS, GCP, Azure) without a cloud license  
-❌ Reselling, sublicensing, or integrating this software into any product or service without explicit agreement
+"Derivative Works" means modifications to, or works based on, the Software.
 
-If you are regularly using this software and have the means to support its continued development — whether for professional, academic, or personal projects — please consider purchasing a per-seat license:  
-https://www.patreon.com/pechnikov
+"Non-Commercial Use" means use by individuals exclusively for:
+  - Personal learning and self-education
+  - Academic coursework, thesis, or dissertation work without external funding
+  - Hobby projects with no commercial intent or funding
+  - Teaching and classroom instruction at educational institutions (not
+    commercial training services)
+  - Non-commercial workshops or community education
 
-For cloud, redistribution, or enterprise licensing, contact: alexey@pechnikov.dev
+Non-Commercial Use explicitly excludes any use where the Software or its
+outputs contribute to funded research, commercial projects, consulting work,
+or revenue-generating activities.
+
+"Commercial Use" means any use that does not qualify as Non-Commercial Use,
+including but not limited to:
+  - Any use in connection with employment or business activities
+  - Any use in grant-funded, institutionally funded, or government-funded research
+  - Any use by or on behalf of a corporation, organization, or institution
+  - Any use in consulting, contracted work, or paid professional services
+  - Academic work where the researcher receives funding related to the work
+
+"Cloud Service" means offering the Software's functionality to third parties
+as a hosted service, including but not limited to:
+  - SaaS, PaaS, or managed service platforms
+  - API wrappers or endpoints exposing the Software's functionality
+  - Hosted notebooks, computing environments, or processing pipelines
+  - Any service where users interact with the Software over a network
+    without obtaining their own license
+
+"Active Subscription" means a paid subscription through an Authorized Subscription
+Channel that is active and has not been canceled. Commercial Use rights are
+granted only while the subscription remains active. If the subscription is
+canceled or becomes inactive (including due to nonpayment, chargeback, fraud
+flags, or account suspension by the channel), Commercial Use rights terminate
+immediately. Individuals requiring subscriptions include both employees and
+contractors.
+
+"Authorized Subscription Channel" means Patreon (https://www.patreon.com/pechnikov)
+or any other subscription method listed in the SUBSCRIBE file (the "Subscription
+Page"). The Copyright Holder may add or remove Authorized Subscription Channels
+by updating the Subscription Page. Such changes do not modify other terms of
+this license. Removal of an Authorized Subscription Channel does not affect
+subscriptions already paid and active through that channel until the end of the
+Paid Period.
+
+"Paid Period" means the billing period already paid for through an Authorized
+Subscription Channel.
+
+"Integrate" means embedding or bundling the Software into a product or service
+that is distributed, licensed, or made available to third parties. Internal use
+(such as internal Docker images or research pipelines not exposed to third
+parties) does not constitute integration.
+
+2. GRANT OF RIGHTS
+
+Subject to the terms of this license, you are granted a non-exclusive,
+non-transferable, revocable license to use, copy, and modify the Software
+as follows:
+
+(a) Non-Commercial Use: You may use, copy, and modify the Software at no
+    cost for Non-Commercial Use.
+
+(b) Commercial Use: You may use the Software for Commercial Use only if you
+    maintain an Active Subscription. Each individual using the Software for
+    Commercial Use requires their own Active Subscription. Access to or use of
+    the Software for Commercial Use is permitted only for individuals with their
+    own Active Subscription. This grants internal use rights only; integration
+    into products or services requires a separate agreement (see Section 3(c)).
+
+(c) Cloud Service Use: You may NOT offer the Software as a Cloud Service
+    without a separate cloud license agreement. Contact: alexey@pechnikov.dev
+
+3. RESTRICTIONS
+
+You may NOT:
+
+(a) Remove or alter any copyright notices, license terms, or attribution
+    from the Software.
+
+(b) Redistribute the Software or Derivative Works except as permitted under
+    Section 4.
+
+(c) Integrate the Software into any commercial product or service without
+    a separate written agreement.
+
+(d) Sublicense, sell, or resell the Software.
+
+(e) Represent that you have any ownership rights in the Software.
+
+4. PERMITTED REDISTRIBUTION (NON-COMMERCIAL ONLY)
+
+(a) Unmodified Source: You may redistribute unmodified copies of the Software
+    for Non-Commercial purposes, provided you include all copyright notices,
+    this license, and attribution to the original author.
+
+(b) Modified Source: You may redistribute modified versions of the Software
+    for Non-Commercial purposes, provided you:
+    - Include all original copyright notices and this license
+    - License the modified source under this same license
+    - Clearly mark your modifications and indicate that changes were made
+    - Include attribution to the original author
+    - Do not misrepresent the modified version as the original Software
+
+(c) Binary Distribution: You may distribute compiled binaries (including wheels
+    or other packaged distributions) of the Software for Non-Commercial purposes
+    only if you also provide the complete corresponding source code under this
+    same license.
+
+(d) Commercial Redistribution: Any redistribution for Commercial purposes
+    requires a separate written agreement. Contact: alexey@pechnikov.dev
+
+5. NO EXTERNAL CONTRIBUTIONS
+
+This project does not accept code contributions from third parties.
+
+You may not submit pull requests, patches, or other modifications for inclusion
+in the Software unless you have a separate written agreement with the Copyright
+Holder.
+
+Any unsolicited contributions submitted without such an agreement are not
+licensed to the Copyright Holder and will not be used, merged, or distributed
+as part of the Software.
+
+Bug reports and suggestions are welcome via the project's issue tracker.
+
+6. TRADEMARKS AND ENDORSEMENT
+
+This license does not grant any rights to use the name "InSAR.dev", the
+InSAR.dev logo, or any other trademarks or trade names of the Copyright Holder,
+except as required for reasonable and customary attribution as permitted under
+Section 7.
+
+You may not use the Copyright Holder's name to endorse or promote products
+derived from the Software without prior written permission.
+
+7. ATTRIBUTION
+
+Any permitted redistribution of the Software or Derivative Works must include
+clear attribution to the original author and a copy of this license.
+
+Attribution is also requested (but not required) in publications, presentations,
+or other works describing results produced using the Software.
+
+8. TERMINATION
+
+This license is effective until terminated. If you fail to comply with any
+term of this license, you will be notified in writing and given 30 days to
+cure the violation. If the violation is not cured within 30 days, your rights
+under this license terminate automatically. Upon termination, you must cease
+all use and destroy all copies of the Software under your control, except
+archival backups kept in the ordinary course of business, which must not be
+restored or used except to comply with legal obligations.
+
+Notwithstanding the above, termination is immediate and without cure period
+for violations involving unauthorized Cloud Service use, unauthorized
+redistribution, or sublicensing.
+
+9. DISCLAIMER OF WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. THE ENTIRE RISK AS
+TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH YOU.
+
+10. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER (AS DEFINED ABOVE) BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+11. SEVERABILITY
+
+If any provision of this license is held to be unenforceable or invalid, that
+provision shall be modified to the minimum extent necessary to make it
+enforceable, and the remaining provisions shall continue in full force and effect.
+
+12. NO PATENT RIGHTS
+
+No patent rights are granted under this license. This license does not provide
+any express or implied rights to any patents owned or controlled by the
+Copyright Holder.
+
+13. ENTIRE AGREEMENT
+
+This license constitutes the entire agreement between you and the Copyright
+Holder concerning the Software and supersedes all prior agreements and
+understandings.
+
+---
+
+QUICK REFERENCE
+
+Free for:
+  - Students, educators, and classroom teaching
+  - Personal learning and hobby projects
+  - Unfunded academic coursework, thesis, or dissertation work
+  - Non-commercial workshops and community education
+
+Subscription required for:
+  - University or institutional research (including grant-funded)
+  - Business, consulting, or professional use
+  - Government or corporate projects
+  - Subscription grants internal use only; product integration and Cloud
+    Service require separate written permission
+
+  See SUBSCRIBE file for subscription options
+
+Not permitted without written permission:
+  - Cloud/SaaS/hosted service offerings
+  - Resale, sublicensing, or product integration
+  - Commercial redistribution
+
+  Contact: alexey@pechnikov.dev
