@@ -8,7 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from insardev_toolkit import progressbar_joblib
+from insardev_toolkit.progressbar_joblib import progressbar_joblib
 
 # import zarr
 # zarr_clevel: int = 0
