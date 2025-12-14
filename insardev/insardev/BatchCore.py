@@ -1220,11 +1220,17 @@ class BatchCore(dict):
         Like to coarsening but with cell size in meters instead of pixels:
         intfs.downsample(60)
         intfs.coarsen({'y':2, 'x':2}, boundary='trim').mean()
+
+        If the data is already at or finer than the requested spacing,
+        returns the input unchanged.
         """
         if isinstance(new_spacing, (int, float)):
             new_spacing = (new_spacing, new_spacing)
         dy, dx = self.spacing
-        yscale, xscale = int(np.round(new_spacing[0]/dy)), int(np.round(new_spacing[1]/dx))
+        yscale, xscale = max(1, int(np.round(new_spacing[0]/dy))), max(1, int(np.round(new_spacing[1]/dx)))
+        # If both scale factors are 1, no downsampling needed - return as is
+        if yscale == 1 and xscale == 1:
+            return self
         print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
         return self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
 
