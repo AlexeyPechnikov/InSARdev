@@ -1,0 +1,7 @@
+This repository contains multiple components with different licenses:
+
+- insardev/          - InSAR.dev Source-Available License (see insardev/LICENSE)
+- insardev_pygmtsar/ - BSD 3-Clause License (see insardev_pygmtsar/LICENSE)
+- insardev_toolkit/  - BSD 3-Clause License (see insardev_toolkit/LICENSE)
+
+See each component's LICENSE file for full terms.
