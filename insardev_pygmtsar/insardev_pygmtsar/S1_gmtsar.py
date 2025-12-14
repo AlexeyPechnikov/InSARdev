@@ -7,10 +7,10 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from .S1_prm import S1_prm
+from .S1_slc import S1_slc
 from .PRM import PRM
 
-class S1_gmtsar(S1_prm):
+class S1_gmtsar(S1_slc):
 
     def _ext_orb_s1a(self, burst: str, basedir: str, debug: bool=False):
         """

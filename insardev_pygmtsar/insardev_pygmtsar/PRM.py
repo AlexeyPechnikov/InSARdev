@@ -18,23 +18,6 @@ class PRM(datagrid, PRM_gmtsar):
     
     int_types = ['num_valid_az', 'num_rng_bins', 'num_patches', 'bytes_per_line', 'good_bytes_per_line', 'num_lines','SC_identity']
 
-#    @staticmethod
-#    def SC_timestamp(SC_clock):
-#        from datetime import datetime, timedelta
-#
-#        # extract year and Julian day with fractional part
-#        year = int(SC_clock // 1000)
-#        julian_day = SC_clock % 1000  # Keep fractional part of the day
-#
-#        # split integer Julian day and fractional day
-#        integer_julian_day = int(julian_day)
-#        fractional_day = julian_day - integer_julian_day
-#
-#        # convert integer and fraction parts of Julian day to datetime
-#        timestamp = datetime(year, 1, 1) + timedelta(days=integer_julian_day) + timedelta(days=fractional_day)
-#
-#        return timestamp
-
     @staticmethod
     def to_numeric_or_original(val: str|float|int) -> str|float|int:
         if isinstance(val, str):
@@ -395,61 +378,6 @@ class PRM(datagrid, PRM_gmtsar):
             return out[0]
         return out
 
-#    def shift_atime(self, lines, inplace=False):
-#        """
-#        Shift time in azimuth by a number of lines.
-#
-#        Parameters
-#        ----------
-#        lines : float
-#            The number of lines to shift by.
-#        inplace : bool, optional
-#            Whether to modify the PRM object in-place. Default is False.
-#
-#        Returns
-#        -------
-#        PRM
-#            The shifted PRM object or DataFrame. If 'inplace' is True, returns modified PRM object,
-#            otherwise, returns a new PRM with shifted times.
-#        """
-#        prm = self.sel('clock_start','clock_stop','SC_clock_start','SC_clock_stop') + lines/self.get('PRF')/86400.0
-#        if inplace:
-#            return self.set(prm)
-#        else:
-#            return prm
-
-#    def diff(self, other, gformat=True):
-#        """
-#        Compare the PRM object with another PRM object and return the differences.
-#
-#        Parameters
-#        ----------
-#        other : PRM
-#            The other PRM object to compare with.
-#        gformat : bool, optional
-#            Whether to use 'g' format for float values. Default is True.
-#
-#        Returns
-#        -------
-#        pd.DataFrame
-#            A DataFrame containing the differences between the two PRM objects.
-#        """
-#        import pandas as pd
-#        import numpy as np
-#
-#        if not isinstance(other, PRM):
-#            raise Exception('Argument should be PRM class instance')
-#
-#        df1 = self.df.copy()
-#        df2 = other.df.copy()
-#
-#        if gformat:
-#            fmt = lambda v: format(v, 'g') if type(v) in [float, np.float16, np.float32, np.float64] else v
-#            df1['value'] = [fmt(value) for value in df1['value']]
-#            df2['value'] = [fmt(value) for value in df2['value']]
-#
-#        return pd.concat([df1, df2]).drop_duplicates(keep=False)
-
     def fix_aligned(self) -> "PRM":
         """
         Correction for the range and azimuth shifts of the re-aligned SLC images (fix_prm_params() in GMTSAR)
@@ -505,54 +433,29 @@ class PRM(datagrid, PRM_gmtsar):
         """
         import xarray as xr
         import numpy as np
-        import dask
-        import dask.array as da
         import os
-        import warnings
-
-        @dask.delayed
-        def read_SLC_block(slc_filename, start, stop):
-            # Read a chunk of the SLC file
-            # [real_0, imag_0, real_1, imag_1, real_2, imag_2, ...]
-            # offset is measured in bytes
-            return np.memmap(slc_filename, dtype=np.int16, mode='r', offset=start*4, shape=(2*(stop-start),))
 
         prm = PRM.from_file(self.filename)
-        # num_patches multiplier is omitted
-        #slc_filename, xdim, ydim = prm.get('SLC_file', 'num_rng_bins', 'num_valid_az')
         slc_filename, xdim, ydim, rshift, ashift = prm.get('SLC_file', 'num_rng_bins', 'num_valid_az', 'rshift', 'ashift')
-                
+
         dirname = os.path.dirname(self.filename)
         slc_filename = os.path.join(dirname, slc_filename)
-        #print (slc_filename, ydim, xdim)
 
-        blocksize = self.netcdf_chunksize * xdim
-        blocks = int(np.ceil(ydim * xdim / blocksize))
-        #print ('chunks', chunks, 'chunksize', chunksize)
-        # create a lazy Dask array that reads chunks of the SLC file
-        res = []
-        ims = []
-        for i in range(blocks):
-            start = i * blocksize
-            stop = min((i+1) * blocksize, ydim * xdim)
-            # use proper output data type for complex data and intensity
-            block = da.from_delayed(read_SLC_block(slc_filename, start, stop),
-                shape=(2*(stop-start),), dtype=np.int16)
-            res.append(block[::2])
-            ims.append(block[1::2])
-            del block
-        # concatenate the chunks together
-        # data file can include additional data outside of the specified dimensions
-        re = da.concatenate(res).reshape((-1, xdim))[:ydim,:]
-        im = da.concatenate(ims).reshape((-1, xdim))[:ydim,:]
-        del res, ims
-        
+        # read entire SLC file using memory mapping
+        # SLC format: [real_0, imag_0, real_1, imag_1, real_2, imag_2, ...]
+        slc_data = np.memmap(slc_filename, dtype=np.int16, mode='r')
+
+        # extract real and imaginary parts
+        total_pixels = ydim * xdim
+        re = slc_data[0:2*total_pixels:2].reshape((ydim, xdim))
+        im = slc_data[1:2*total_pixels:2].reshape((ydim, xdim))
+
         assert re.shape == (ydim, xdim), f'Originated re shape ({ydim},{xdim}), but got {re.shape}'
         assert im.shape == (ydim, xdim), f'Originated im width ({ydim},{xdim}), but got {im.shape}'
 
         coords = {'a': np.arange(ydim) + 0.5, 'r': np.arange(xdim) + 0.5}
-        re = xr.DataArray(re, coords=coords).rename('re')
-        im = xr.DataArray(im, coords=coords).rename('im')
+        re = xr.DataArray(re, coords=coords, dims=['a', 'r']).rename('re')
+        im = xr.DataArray(im, coords=coords, dims=['a', 'r']).rename('im')
         return xr.merge([re, im])
 
     def read_LED(self) -> tuple[dict, pd.DataFrame]:
@@ -715,55 +618,6 @@ class PRM(datagrid, PRM_gmtsar):
 
         # get the slope and intercept of the line best fit
         return (coeffs[:rank])
-
-#     # standalone function is compatible but it is too slow while it should not be a problem
-#     @staticmethod
-#     def robust_trend2d(data, rank):
-#         import numpy as np
-#         import statsmodels.api as sm
-# 
-#         if rank not in [1, 2, 3]:
-#             raise Exception('Number of model parameters "rank" should be 1, 2, or 3')
-# 
-#         if rank in [2, 3]:
-#             x = data[:, 0]
-#             x = np.interp(x, (x.min(), x.max()), (-1, +1))
-#         if rank == 3:
-#             y = data[:, 1]
-#             y = np.interp(y, (y.min(), y.max()), (-1, +1))
-#         z = data[:, 2]
-# 
-#         if rank == 1:
-#             X = sm.add_constant(np.ones(z.shape))
-#         elif rank == 2:
-#             X = sm.add_constant(x)
-#         elif rank == 3:
-#             X = sm.add_constant(np.column_stack((x, y)))
-# 
-#         # Hampel weighting function looks the most accurate for noisy data
-#         rlm_model = sm.RLM(z, X, M=sm.robust.norms.Hampel())
-#         rlm_results = rlm_model.fit()
-# 
-#         return rlm_results.params[:rank]
-
-#     # calculate MSE (optional)
-#     @staticmethod
-#     def robust_trend2d_mse(data, coeffs, rank):
-#         import numpy as np
-# 
-#         x = data[:, 0]
-#         y = data[:, 1]
-#         z_actual = data[:, 2]
-# 
-#         if rank == 1:
-#             z_predicted = coeffs[0]
-#         elif rank == 2:
-#             z_predicted = coeffs[0] + coeffs[1] * x
-#         elif rank == 3:
-#             z_predicted = coeffs[0] + coeffs[1] * x + coeffs[2] * y
-# 
-#         mse = np.mean((z_actual - z_predicted) ** 2)
-#         return mse
 
     # fitoffset.csh 3 3 freq_xcorr.dat
     # PRM.fitoffset(3, 3, offset_dat)

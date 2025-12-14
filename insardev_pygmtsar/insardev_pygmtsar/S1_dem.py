@@ -19,51 +19,32 @@ class S1_dem(S1_tidal):
     def _interp2d_like(self, data, grid, method='cubic', **kwargs):
         import numpy as np
         import xarray as xr
-        import dask.array as da
-        import os
         import warnings
-        # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
         warnings.filterwarnings('ignore')
-        warnings.filterwarnings('ignore', module='dask')
-        warnings.filterwarnings('ignore', module='dask.core')
 
         # detect dimensions and coordinates for 2D or 3D grid
         dims = grid.dims[-2:]
         dim1, dim2 = dims
         coords = {dim1: grid[dim1], dim2: grid[dim2]}
-        #print (f'dims: {dims}, coords: {coords}')
 
-        # use outer variable data
-        def interpolate_chunk(out_chunk1, out_chunk2, dim1, dim2, method, **kwargs):
-            d1, d2 = float(data[dim1].diff(dim1)[0]), float(data[dim2].diff(dim2)[0])
-            #print ('d1, d2', d1, d2)
-            chunk = data.sel({
-                                dim1: slice(out_chunk1[0]-2*d1, out_chunk1[-1]+2*d1),
-                                dim2: slice(out_chunk2[0]-2*d2, out_chunk2[-1]+2*d2)
-                                }).compute(n_workers=1)
-            #print ('chunk', chunk)
-            out = chunk.interp({dim1: out_chunk1, dim2: out_chunk2}, method=method, **kwargs)
-            del chunk
-            return out
+        # get coordinate values
+        out_coords1 = grid[dim1].values
+        out_coords2 = grid[dim2].values
 
-        chunk_sizes = grid.chunks[-2:] if hasattr(grid, 'chunks') else (self.chunksize, self.chunksize)
-        # coordinates are numpy arrays
-        grid_y = da.from_array(grid[dim1].values, chunks=chunk_sizes[0])
-        grid_x = da.from_array(grid[dim2].values, chunks=chunk_sizes[1])
+        # add buffer around for interpolation
+        d1 = float(data[dim1].diff(dim1)[0])
+        d2 = float(data[dim2].diff(dim2)[0])
 
-        dask_out = da.blockwise(
-            interpolate_chunk,
-            'yx',
-            grid_y, 'y',
-            grid_x, 'x',
-            dtype=data.dtype,
-            dim1=dim1,
-            dim2=dim2,
-            method=method,
-            **kwargs
-        )
-        da_out = xr.DataArray(dask_out, coords=coords, dims=dims).rename(data.name).astype(np.float32)
-        del dask_out
+        # select data subset with buffer
+        data_subset = data.sel({
+            dim1: slice(out_coords1[0]-2*d1, out_coords1[-1]+2*d1),
+            dim2: slice(out_coords2[0]-2*d2, out_coords2[-1]+2*d2)
+        })
+
+        # interpolate
+        result = data_subset.interp({dim1: out_coords1, dim2: out_coords2}, method=method, **kwargs)
+
+        da_out = xr.DataArray(result.values, coords=coords, dims=dims).rename(data.name).astype(np.float32)
         # append all the input coordinates
         return da_out.assign_coords({k: v for k, v in data.coords.items() if k not in coords})
 
@@ -119,7 +100,6 @@ class S1_dem(S1_tidal):
         """
         import xarray as xr
         import numpy as np
-        import dask
         import rioxarray as rio
         import geopandas as gpd
         import pandas as pd
@@ -136,19 +116,19 @@ class S1_dem(S1_tidal):
         elif isinstance(self.DEM, (xr.DataArray)):
             ortho = self.DEM
         elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.tiff', '.tif', '.TIF']:
-            ortho = rio.open_rasterio(self.DEM, chunks=self.chunksize).squeeze(drop=True)\
+            ortho = rio.open_rasterio(self.DEM).squeeze(drop=True)\
                 .rename({'y': 'lat', 'x': 'lon'})\
                 .drop('spatial_ref')
             if ortho.lat.diff('lat')[0].item() < 0:
                 ortho = ortho.reindex(lat=ortho.lat[::-1])
         elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.nc', '.netcdf', '.grd']:
-            ortho = xr.open_dataarray(self.DEM, engine=self.netcdf_engine_read, chunks=self.chunksize)
+            ortho = xr.open_dataarray(self.DEM, engine=self.netcdf_engine_read)
         elif isinstance(self.DEM, str):
             print ('ERROR: filename extension is not recognized. Should be one from .tiff, .tif, .TIF, .nc, .netcdf, .grd')
         else:
             print ('ERROR: argument is not an Xarray object and it is not a file name')
         ortho = ortho.transpose('lat','lon')
-        
+
         # unique indices required for interpolation
         lat_index = pd.Index(ortho.coords['lat'])
         lon_index = pd.Index(ortho.coords['lon'])

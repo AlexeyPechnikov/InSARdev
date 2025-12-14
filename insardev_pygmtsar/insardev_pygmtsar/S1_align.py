@@ -70,14 +70,11 @@ class S1_align(S1_dem):
         import xarray as xr
         import numpy as np
         import warnings
-        # supress warnings "UserWarning: The specified chunks separate the stored chunks along dimension"
         warnings.filterwarnings('ignore')
 
         # add buffer around the cropped area for borders interpolation
         record = self.get_record(burst)
-        # materialize early to avoid "AttributeError: 'DataArray' object has no attribute 'reshape'" for z.values.ravel()
-        # the error raises only using the recent numpy (2.2.6)/xarray (2025.4.0)/dask (2025.5.1) and never before
-        dem_area = self.get_dem_wgs84ellipsoid(geometry=record.geometry).compute()
+        dem_area = self.get_dem_wgs84ellipsoid(geometry=record.geometry)
         
         ny = int(np.round(degrees/dem_area.lat.diff('lat')[0]))
         nx = int(np.round(degrees/dem_area.lon.diff('lon')[0]))
@@ -140,7 +137,6 @@ class S1_align(S1_dem):
         """
         import xarray as xr
         import numpy as np
-        import dask
         import os
         
         # temporary filenames to be removed

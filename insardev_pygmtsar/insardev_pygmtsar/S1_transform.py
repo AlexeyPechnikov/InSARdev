@@ -46,7 +46,7 @@ class S1_transform(S1_topo):
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
                   append: bool=False,
-                  n_jobs: int | None=None,
+                  n_jobs: int=-1,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -80,14 +80,13 @@ class S1_transform(S1_topo):
 
         Notes
         -----
-        The processing is parallelized internally using Dask. GMTSAR files are saved in the temp directory.
+        The processing is parallelized using joblib. GMTSAR files are saved in the temp directory.
         """
         from tqdm.auto import tqdm
         import joblib
         import os
         import tempfile
         import shutil
-        from distributed import get_client
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -196,18 +195,9 @@ class S1_transform(S1_topo):
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
         
-        # joblib_backend = 'threading' if not debug else 'sequential'
-        # for refrep in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-        #     # single worker is used to help Dask cleanup memory
-        #     joblib.Parallel(n_jobs=1, backend=joblib_backend)(
-        #         [joblib.delayed(process_refrep)(refrep, target, debug=debug)]
-        #     )
-
-        if n_jobs is None:
-            # use all available workers when every worker can parallelize the processing on multiple threads
-            n_jobs = get_client().scheduler_info()['n_workers']
+        joblib_backend = None if not debug else 'sequential'
         with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
-            joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
+            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
 
         # consolidate zarr metadata for the resolution directory
         self.consolidate_metadata(target, resolution=resolution)
@@ -315,14 +305,18 @@ class S1_transform(S1_topo):
 
         # use transfrom coordinates
         data_proj = data_proj.drop_vars(['x','y'])
+        # use a single chunk per burst for efficient storage
+        shape = data_proj.re.shape
+        encoding = {var: {'chunks': shape} for var in ['re', 'im']}
         data_proj.to_zarr(
             store=os.path.join(outdir, burst_rep),
             mode='w',
             zarr_format=3,
-            consolidated=True
+            consolidated=True,
+            encoding=encoding
         )
         slc.close()
         del data_proj, slc
 
-        for ext in ['SLC', 'LED', 'PRM']:                
-            self.get_burstfile(burst_rep, ext, clean=True)
+        for ext in ['SLC', 'LED', 'PRM']:
+            self.get_burstfile(burst_rep, basedir, ext=ext, clean=True)

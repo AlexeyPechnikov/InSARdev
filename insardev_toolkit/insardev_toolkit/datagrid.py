@@ -12,10 +12,6 @@ class datagrid:
     import numpy as np
 
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
-    # processing chunksize
-    #chunksize: int = 4*1280
-    chunksize: int|dict|str = {'y': 2*1280, 'x': 8*1280}
-
     netcdf_engine_read: str = 'h5netcdf'
     netcdf_engine_write: str = 'netcdf4'
     netcdf_format: str = 'NETCDF4'

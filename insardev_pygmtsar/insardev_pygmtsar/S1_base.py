@@ -9,6 +9,7 @@
 # ----------------------------------------------------------------------------
 from insardev_toolkit import progressbar_joblib
 from insardev_toolkit import datagrid
+from .PRM import PRM
 
 class S1_base(progressbar_joblib, datagrid):
     import pandas as pd
@@ -38,6 +39,30 @@ class S1_base(progressbar_joblib, datagrid):
             df = self.df[self.df.pathNumber==path_number[0]]
         return df.set_crs(4326).to_crs(crs)
 
+    def PRM(self, burst: str, basedir) -> PRM:
+        """
+        Open a PRM (Parameter) file.
+
+        Parameters
+        ----------
+        date : str, optional
+            The date of the PRM file. If None or equal to self.reference, return the reference PRM file. Default is None.
+        multi : bool, optional
+            If True, open a multistem PRM file. If False, open a stem PRM file. Default is True.
+        
+        Returns
+        -------
+        PRM
+            An instance of the PRM class representing the opened PRM file.
+        """
+        import os
+
+        #prefix = self.get_prefix(burst)
+        #print ('PRM prefix', prefix)
+        filename = os.path.join(basedir, f'{burst}.PRM')
+        #print ('PRM filename', filename)
+        return PRM.from_file(filename)
+
     def fullBurstId(self, burst: str) -> str:
         df = self.get_record(burst)
         return df.index.get_level_values(0)[0]
@@ -66,18 +91,6 @@ class S1_base(progressbar_joblib, datagrid):
             if not os.path.exists(filename):
                 assert os.path.exists(filename), f'ERROR: The file is missed: {filename}'
         return filename
-   
-    # def get_basename(self, workdir: str, burst: str) -> str:
-    #     import os
-    #     prefix = self.fullBurstId(burst)
-    #     basename = os.path.join(workdir, prefix, burst)
-    #     return basename
-    
-    # def get_dirname(self, workdir: str, burst: str) -> str:
-    #     import os
-    #     prefix = self.fullBurstId(burst)
-    #     dirname = os.path.join(workdir, prefix)
-    #     return dirname
 
     def get_record(self, burst: str) -> pd.DataFrame:
         """
