@@ -8,11 +8,11 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_unwrap import Stack_unwrap
+from .Stack_unwrap2d import Stack_unwrap2d
 from .utils_regression2d import regression2d
 from . import utils_xarray
 from .Batch import Batch, BatchWrap
-class Stack_detrend(Stack_unwrap):
+class Stack_detrend(Stack_unwrap2d):
     import numpy as np
     import xarray as xr
 
@@ -27,12 +27,12 @@ class Stack_detrend(Stack_unwrap):
             #if transform is None:
             #    # find nearest transform matrix values on the original grid for potentially multilooked data
             #    transform = self.dss[key][variables].reindex_like(data, method='nearest')
-            trend = regression2d(data.chunk({'y':-1, 'x':-1}),
-                                        variables=[transform[v] for v in transform.data_vars],
-                                        weight=weight,
-                                        **kwarg)
+            trend = regression2d(data,
+                                 variables=[transform[v] for v in transform.data_vars],
+                                 weight=weight,
+                                 **kwarg)
             #print ('trend', trend)
-            return trend.chunk(data.chunks)
+            return trend
         if transform is not None:
             # unify keys to datas
             transform = transform.sel(datas)
@@ -335,10 +335,6 @@ class Stack_detrend(Stack_unwrap):
         stackvar = data.dims[0] if len(data.dims) == 3 else 'stack'
         #print ('stackvar', stackvar)
 
-        # split coordinate grid to equal chunks and rest
-        ys_blocks = np.array_split(data.y, np.arange(0, data.y.size, self.chunksize)[1:])
-        xs_blocks = np.array_split(data.x, np.arange(0, data.x.size, self.chunksize)[1:])
-
         data_dec = self.multilooking(data, wavelength=resolution, coarsen=(yscale,xscale), debug=debug)
         data_dec_gauss = self.multilooking(data_dec, wavelength=wavelength_dec, debug=debug)
         del data_dec
@@ -346,7 +342,7 @@ class Stack_detrend(Stack_unwrap):
         stack = []
         for stackval in data[stackvar].values if len(data.dims) == 3 else [None]:
             data_in = data_dec_gauss.sel({stackvar: stackval}) if stackval is not None else data_dec_gauss
-            data_out = data_in.reindex({'y': data.y, 'x': data.x}, method='nearest').chunk(self.chunksize)
+            data_out = data_in.reindex({'y': data.y, 'x': data.x}, method='nearest')
             del data_in
             stack.append(data_out)
             del data_out

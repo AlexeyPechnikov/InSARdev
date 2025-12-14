@@ -135,7 +135,7 @@ class Stack(Stack_plot, BatchCore):
         
         return df.to_crs(crs) if crs is not None else df
 
-    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, chunksize: int|str = 'auto', attr_start:str='BPR', debug:bool=False):
+    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -199,7 +199,7 @@ class Stack(Stack_plot, BatchCore):
                 date=[np.datetime64(ds["startTime"].item(), 's')]
             )
 
-        def _bursts_transform_preprocess(bursts, transform, chunksize):
+        def _bursts_transform_preprocess(bursts, transform):
             import xarray as xr
             import numpy as np
             #print ('_bursts_transform_preprocess')
@@ -216,7 +216,7 @@ class Stack(Stack_plot, BatchCore):
                         v.replace(polarization, 'XX') for v in data.burst.values
                     ]
                     del data['polarization']
-                    datas.append(data.chunk(chunksize))
+                    datas.append(data.chunk(-1))
                 ds = xr.merge(datas)
                 del datas
             else:
@@ -224,7 +224,7 @@ class Stack(Stack_plot, BatchCore):
 
             for var in transform.data_vars:
                 #if var not in ['re', 'im']:
-                ds[var] = transform[var].chunk(chunksize)
+                ds[var] = transform[var].chunk(-1)
 
             ds.rio.write_crs(bursts.attrs['spatial_ref'], inplace=True)
             return ds
@@ -367,7 +367,7 @@ class Stack(Stack_plot, BatchCore):
                 # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
                 transform = xr.open_dataset(base, engine='zarr', zarr_format=3, consolidated=True, storage_options=storage_options).astype('float32')
 
-                ds = _bursts_transform_preprocess(bursts, transform, chunksize)
+                ds = _bursts_transform_preprocess(bursts, transform)
                 dss[fullBurstID] = ds
                 del ds, bursts, transform
 

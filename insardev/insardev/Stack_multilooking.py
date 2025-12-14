@@ -37,12 +37,6 @@ class Stack_multilooking(Stack_phasediff):
         else:
             dims = data.dims
 
-        # Set chunk size
-        #chunksizes = {'y': self.chunksize, 'x': self.chunksize}
-        y_chunksize = data.chunks[-2][0]
-        x_chunksize = data.chunks[-1][0]
-        #print ('data.chunks', y_chunksize, x_chunksize)
-
         if len(dims) == 2:
             stackvar = None
         else:
@@ -76,10 +70,9 @@ class Stack_multilooking(Stack_phasediff):
                 ({data.shape[1:]} vs {weight.shape})'
 
         # process a slice of dataarray
-        # rechunk here to prevent ref, rep coordinates to be chunked
         def process_slice(slice_data):
             conv = nanconvolve2d_gaussian(slice_data, weight, sigmas, threshold=gaussian_threshold)
-            return xr.DataArray(conv, dims=slice_data.dims, name=slice_data.name).chunk({'y': y_chunksize, 'x': x_chunksize})
+            return xr.DataArray(conv, dims=slice_data.dims, name=slice_data.name)
 
         # process stack of dataarray slices
         def process_slice_var(dataarray):    
