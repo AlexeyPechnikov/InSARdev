@@ -98,8 +98,70 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         return edges, compact_to_orig, orig_to_compact
 
+    # 4-connectivity structure for scipy.ndimage.label (no diagonals)
+    _STRUCTURE_4CONN = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
     @staticmethod
-    def _find_connected_components(valid_mask_2d):
+    def _get_connected_components(valid_mask_2d, min_size=4):
+        """
+        Find connected components with bounding boxes using scipy.ndimage.
+
+        Parameters
+        ----------
+        valid_mask_2d : np.ndarray
+            2D boolean array where True indicates valid pixels.
+        min_size : int, optional
+            Minimum component size to include in results. Default is 4.
+
+        Returns
+        -------
+        labeled_array : np.ndarray
+            2D int32 array with component labels (0 = invalid, 1+ = component labels).
+        components : list of dict
+            List of component info dicts sorted by size (largest first), each with:
+            - 'label': int, the component label in labeled_array
+            - 'size': int, number of pixels in the component
+            - 'slices': tuple of slices for bounding box
+        n_total : int
+            Total number of components found (before min_size filtering).
+        sizes : np.ndarray
+            Array of component sizes indexed by label (sizes[0] = 0, sizes[1] = size of label 1, etc.)
+        """
+        from scipy import ndimage
+
+        labeled_array, n_total = ndimage.label(valid_mask_2d, structure=Stack_unwrap2d._STRUCTURE_4CONN)
+
+        if n_total == 0:
+            return labeled_array, [], 0, np.array([0])
+
+        # Get sizes and bounding boxes efficiently
+        sizes = np.bincount(labeled_array.ravel(), minlength=n_total + 1)
+        slices = ndimage.find_objects(labeled_array)
+
+        # Build component list sorted by size (largest first), filtering by min_size
+        components = [
+            {'label': i + 1, 'size': sizes[i + 1], 'slices': slices[i]}
+            for i in np.argsort(sizes[1:])[::-1]
+            if sizes[i + 1] >= min_size and slices[i] is not None
+        ]
+
+        return labeled_array, components, n_total, sizes
+
+    @staticmethod
+    def _print_component_stats_debug(method_name, shape, n_valid, n_components, sizes):
+        """Print debug statistics about connected components."""
+        comp_sizes = sizes[1:n_components + 1] if n_components > 0 else []
+        sorted_sizes = np.sort(comp_sizes)[::-1]
+        n_tiny = np.sum(comp_sizes < 10) if len(comp_sizes) > 0 else 0
+
+        print(f'{method_name}: {shape} grid, {n_valid} valid pixels, {n_components} components')
+        if n_components <= 10:
+            print(f'  Component sizes: {list(sorted_sizes)}')
+        else:
+            print(f'  Largest 5: {list(sorted_sizes[:5])}, smallest 5: {list(sorted_sizes[-5:])}, tiny(<10px): {n_tiny}')
+
+    @staticmethod
+    def _find_connected_components(valid_mask_2d, min_size=None):
         """
         Find connected components in a 2D valid mask using 4-connectivity.
 
@@ -107,41 +169,18 @@ class Stack_unwrap2d(Stack_unwrap1d):
         ----------
         valid_mask_2d : np.ndarray
             2D boolean array where True indicates valid pixels.
+        min_size : int, optional
+            Minimum component size to include. If None, all components are returned.
 
         Returns
         -------
         list of np.ndarray
-            List of boolean masks, one per connected component.
+            List of boolean masks, one per connected component (sorted by size, largest first).
         """
-        from collections import deque
-
-        height, width = valid_mask_2d.shape
-        visited = np.zeros_like(valid_mask_2d, dtype=bool)
-        components = []
-
-        for start_r in range(height):
-            for start_c in range(width):
-                if valid_mask_2d[start_r, start_c] and not visited[start_r, start_c]:
-                    # BFS to find all connected pixels
-                    component_mask = np.zeros_like(valid_mask_2d, dtype=bool)
-                    queue = deque([(start_r, start_c)])
-                    visited[start_r, start_c] = True
-                    component_mask[start_r, start_c] = True
-
-                    while queue:
-                        r, c = queue.popleft()
-                        # 4-connectivity neighbors
-                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < height and 0 <= nc < width:
-                                if valid_mask_2d[nr, nc] and not visited[nr, nc]:
-                                    visited[nr, nc] = True
-                                    component_mask[nr, nc] = True
-                                    queue.append((nr, nc))
-
-                    components.append(component_mask)
-
-        return components
+        labeled_array, components, n_total, _ = Stack_unwrap2d._get_connected_components(
+            valid_mask_2d, min_size=min_size or 1
+        )
+        return [(labeled_array == c['label']) for c in components]
 
     @staticmethod
     def _line_crosses_mask(p1, p2, mask):
@@ -594,104 +633,47 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'Maxflow: no valid pixels in {shape} grid')
             return np.full(shape, np.nan, dtype=np.float32)
 
-        # Find connected components and process each separately
-        components = Stack_unwrap2d._find_connected_components(valid_mask_2d)
+        # Find connected components - use efficient scipy labeling
+        min_size = max(conncomp_size, 4)
+        labeled, components, n_total, sizes = Stack_unwrap2d._get_connected_components(valid_mask_2d, min_size)
 
         if debug:
-            total_valid = np.sum(valid_mask_2d)
-            comp_sizes = [np.sum(c) for c in components]
-            sorted_sizes = sorted(comp_sizes, reverse=True)
-            n_tiny = sum(1 for s in comp_sizes if s < 10)
-            print(f'Maxflow: {shape} grid, {total_valid} valid pixels, {len(components)} components')
-            if len(components) <= 10:
-                print(f'  Component sizes: {sorted_sizes}')
-            else:
-                print(f'  Largest 5: {sorted_sizes[:5]}, smallest 5: {sorted_sizes[-5:]}, tiny(<10px): {n_tiny}')
+            Stack_unwrap2d._print_component_stats_debug('Maxflow', shape, np.sum(valid_mask_2d), n_total, sizes)
+            if n_total > len(components):
+                print(f'  Skipping {n_total - len(components)} components with < {min_size} pixels')
 
-        if len(components) > 1:
-            # Multiple components - process each separately using bounding boxes
-            # Sort by size (largest first)
-            comp_sizes = [np.sum(c) for c in components]
-            sorted_indices = np.argsort(comp_sizes)[::-1]
-            min_size = max(conncomp_size, 4)
-            n_skipped = sum(1 for s in comp_sizes if s < min_size)
+        if len(components) == 0:
+            return np.full(shape, np.nan, dtype=np.float32)
 
-            if debug and n_skipped > 0:
-                print(f'  Skipping {n_skipped} components with < {min_size} pixels')
-
-            result = np.full(shape, np.nan, dtype=np.float32)
-            n_to_process = len(components) - n_skipped
-            processed = 0
-
-            for rank, i in enumerate(sorted_indices):
-                comp_mask = components[i]
-                comp_size = comp_sizes[i]
-
-                # Skip small components
-                if comp_size < min_size:
-                    continue
-
-                processed += 1
-
-                # Find bounding box of this component
-                rows = np.any(comp_mask, axis=1)
-                cols = np.any(comp_mask, axis=0)
-                r_min, r_max = np.where(rows)[0][[0, -1]]
-                c_min, c_max = np.where(cols)[0][[0, -1]]
-
-                # Extract subgrid (bounding box)
-                sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
-                sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
-                sub_phase[~sub_mask] = np.nan  # Mask out pixels not in this component
-                sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
-                if sub_corr is not None:
-                    sub_corr[~sub_mask] = np.nan
-
-                if debug:
-                    print(f'  Component {processed}/{n_to_process}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
-                    t0 = time.time()
-
-                # Unwrap this component's subgrid
-                sub_result = Stack_unwrap2d._branch_cut_single(
-                    sub_phase, sub_corr, max_jump, norm, scale, max_iters, debug
-                )
-
-                # Merge back into result
-                result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
-                if debug:
-                    elapsed = time.time() - t0
-                    status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
-                    print(f' -> {status} ({elapsed:.2f}s)')
-            return result
-
-        # Single component - use bounding box for consistency
-        comp_mask = components[0]
-        rows = np.any(comp_mask, axis=1)
-        cols = np.any(comp_mask, axis=0)
-        r_min, r_max = np.where(rows)[0][[0, -1]]
-        c_min, c_max = np.where(cols)[0][[0, -1]]
-
-        sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
-        sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
-        sub_phase[~sub_mask] = np.nan
-        sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
-        if sub_corr is not None:
-            sub_corr[~sub_mask] = np.nan
-
-        if debug:
-            print(f'  Single component: {np.sum(comp_mask)} pixels, bbox {sub_phase.shape}', end='', flush=True)
-            t0 = time.time()
-
-        sub_result = Stack_unwrap2d._branch_cut_single(sub_phase, sub_corr, max_jump, norm, scale, max_iters, debug)
-
-        # Merge back
         result = np.full(shape, np.nan, dtype=np.float32)
-        result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
 
-        if debug:
-            elapsed = time.time() - t0
-            status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
-            print(f' -> {status} ({elapsed:.2f}s)')
+        for i, comp in enumerate(components):
+            slices, label, comp_size = comp['slices'], comp['label'], comp['size']
+            sub_mask = (labeled[slices] == label)
+
+            # Extract subgrid using slices from find_objects
+            sub_phase = phase[slices].copy()
+            sub_phase[~sub_mask] = np.nan
+            sub_corr = correlation[slices].copy() if correlation is not None else None
+            if sub_corr is not None:
+                sub_corr[~sub_mask] = np.nan
+
+            if debug:
+                print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
+                t0 = time.time()
+
+            # Unwrap this component's subgrid
+            sub_result = Stack_unwrap2d._branch_cut_single(
+                sub_phase, sub_corr, max_jump, norm, scale, max_iters, debug
+            )
+
+            # Merge back into result
+            result[slices][sub_mask] = sub_result[sub_mask]
+            if debug:
+                elapsed = time.time() - t0
+                status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
+                print(f' -> {status} ({elapsed:.2f}s)')
+
         return result
 
     @staticmethod
@@ -886,70 +868,45 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'ILP: no valid pixels in {shape} grid')
             return np.full(shape, np.nan, dtype=np.float32)
 
-        # Find connected components and process each separately
-        components = Stack_unwrap2d._find_connected_components(valid_mask_2d)
+        # Find connected components - use efficient scipy labeling
+        min_size = max(conncomp_size, 4)
+        labeled, components, n_total, sizes = Stack_unwrap2d._get_connected_components(valid_mask_2d, min_size)
 
         if debug:
-            total_valid = np.sum(valid_mask_2d)
-            comp_sizes = [np.sum(c) for c in components]
-            print(f'ILP: {shape} grid, {total_valid} valid pixels, {len(components)} components: {comp_sizes}')
+            Stack_unwrap2d._print_component_stats_debug('ILP', shape, np.sum(valid_mask_2d), n_total, sizes)
+            if n_total > len(components):
+                print(f'  Skipping {n_total - len(components)} components with < {min_size} pixels')
 
-        if len(components) > 1:
-            # Multiple components - process each separately using bounding boxes
-            result = np.full(shape, np.nan, dtype=np.float32)
-            for i, comp_mask in enumerate(components):
-                comp_size = np.sum(comp_mask)
-
-                # Skip small components
-                if comp_size < conncomp_size:
-                    if debug:
-                        print(f'  Component {i+1}/{len(components)}: {comp_size} pixels -> SKIPPED (< {conncomp_size})')
-                    continue
-
-                # Find bounding box of this component
-                rows = np.any(comp_mask, axis=1)
-                cols = np.any(comp_mask, axis=0)
-                r_min, r_max = np.where(rows)[0][[0, -1]]
-                c_min, c_max = np.where(cols)[0][[0, -1]]
-
-                # Extract subgrid (bounding box)
-                sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
-                sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
-                sub_phase[~sub_mask] = np.nan  # Mask out pixels not in this component
-                sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
-                if sub_corr is not None:
-                    sub_corr[~sub_mask] = np.nan
-
-                if debug:
-                    print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
-                    t0 = time.time()
-
-                # Unwrap this component's subgrid
-                sub_result = Stack_unwrap2d._ilp_unwrap_2d_single(sub_phase, sub_corr, max_time, search_workers, debug)
-
-                # Merge back into result
-                result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
-                if debug:
-                    elapsed = time.time() - t0
-                    status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
-                    print(f' -> {status} ({elapsed:.2f}s)')
-            return result
-
-        # Single component - check size and process directly
-        single_comp_size = np.sum(valid_mask_2d)
-        if single_comp_size < conncomp_size:
-            if debug:
-                print(f'  Single component: {single_comp_size} pixels -> SKIPPED (< {conncomp_size})')
+        if len(components) == 0:
             return np.full(shape, np.nan, dtype=np.float32)
 
-        if debug:
-            print(f'  Single component: {single_comp_size} pixels', end='', flush=True)
-            t0 = time.time()
-        result = Stack_unwrap2d._ilp_unwrap_2d_single(phase, correlation, max_time, search_workers, debug)
-        if debug:
-            elapsed = time.time() - t0
-            status = 'OK' if not np.all(np.isnan(result[valid_mask_2d])) else 'FAILED'
-            print(f' -> {status} ({elapsed:.2f}s)')
+        result = np.full(shape, np.nan, dtype=np.float32)
+
+        for i, comp in enumerate(components):
+            slices, label, comp_size = comp['slices'], comp['label'], comp['size']
+            sub_mask = (labeled[slices] == label)
+
+            # Extract subgrid using slices from find_objects
+            sub_phase = phase[slices].copy()
+            sub_phase[~sub_mask] = np.nan
+            sub_corr = correlation[slices].copy() if correlation is not None else None
+            if sub_corr is not None:
+                sub_corr[~sub_mask] = np.nan
+
+            if debug:
+                print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='', flush=True)
+                t0 = time.time()
+
+            # Unwrap this component's subgrid
+            sub_result = Stack_unwrap2d._ilp_unwrap_2d_single(sub_phase, sub_corr, max_time, search_workers, debug)
+
+            # Merge back into result
+            result[slices][sub_mask] = sub_result[sub_mask]
+            if debug:
+                elapsed = time.time() - t0
+                status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
+                print(f' -> {status} ({elapsed:.2f}s)')
+
         return result
 
     @staticmethod
@@ -1283,115 +1240,53 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'Minflow: no valid pixels in {shape} grid')
             return np.full(shape, np.nan, dtype=np.float32)
 
-        # Find connected components and process each separately
-        components = Stack_unwrap2d._find_connected_components(valid_mask_2d)
+        # Find connected components - use efficient scipy labeling
+        min_size = max(conncomp_size, 4)
+        labeled, components, n_total, sizes = Stack_unwrap2d._get_connected_components(valid_mask_2d, min_size)
 
         if debug:
-            total_valid = np.sum(valid_mask_2d)
-            comp_sizes = [np.sum(c) for c in components]
-            # Sort components by size (largest first) for display
-            sorted_sizes = sorted(comp_sizes, reverse=True)
-            n_tiny = sum(1 for s in comp_sizes if s < 10)
-            print(f'Minflow: {shape} grid, {total_valid} valid pixels, {len(components)} components')
-            if len(components) <= 10:
-                print(f'  Component sizes: {sorted_sizes}')
-            else:
-                print(f'  Largest 5: {sorted_sizes[:5]}, smallest 5: {sorted_sizes[-5:]}, tiny(<10px): {n_tiny}')
+            Stack_unwrap2d._print_component_stats_debug('Minflow', shape, np.sum(valid_mask_2d), n_total, sizes)
+            if n_total > len(components):
+                print(f'  Skipping {n_total - len(components)} components with < {min_size} pixels')
 
-        if len(components) > 1:
-            # Multiple components - process each separately using bounding boxes
-            # Sort components by size (largest first) to process main component first
-            comp_sizes = [np.sum(c) for c in components]
-            sorted_indices = np.argsort(comp_sizes)[::-1]  # Largest first
-            min_size = max(conncomp_size, 4)
-            n_skipped = sum(1 for s in comp_sizes if s < min_size)
+        if len(components) == 0:
+            return np.full(shape, np.nan, dtype=np.float32)
 
-            if debug and n_skipped > 0:
-                print(f'  Skipping {n_skipped} components with < {min_size} pixels')
-
-            result = np.full(shape, np.nan, dtype=np.float32)
-            n_to_process = len(components) - n_skipped
-            processed = 0
-            for rank, i in enumerate(sorted_indices):
-                comp_mask = components[i]
-                comp_size = comp_sizes[i]
-
-                # Skip small components (must be at least conncomp_size, and at least 4 for valid 2x2 cell)
-                if comp_size < min_size:
-                    continue
-
-                processed += 1
-
-                # Find bounding box of this component
-                rows = np.any(comp_mask, axis=1)
-                cols = np.any(comp_mask, axis=0)
-                r_min, r_max = np.where(rows)[0][[0, -1]]
-                c_min, c_max = np.where(cols)[0][[0, -1]]
-
-                # Extract subgrid (bounding box)
-                sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
-                sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
-                sub_phase[~sub_mask] = np.nan  # Mask out pixels not in this component
-                sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
-                if sub_corr is not None:
-                    sub_corr[~sub_mask] = np.nan
-
-                if debug:
-                    # Check for narrow regions in the component
-                    col_counts = np.sum(sub_mask, axis=0)
-                    row_counts = np.sum(sub_mask, axis=1)
-                    narrow_cols = np.sum((col_counts > 0) & (col_counts <= 2))
-                    narrow_rows = np.sum((row_counts > 0) & (row_counts <= 2))
-                    print(f'  Component {processed}/{n_to_process}: {comp_size} pixels, bbox {sub_phase.shape}', end='')
-                    if narrow_cols > 0 or narrow_rows > 0:
-                        print(f', NARROW: {narrow_cols} cols, {narrow_rows} rows', end='')
-                    print('', flush=True)
-                    t0 = time.time()
-
-                # Unwrap this component's subgrid
-                sub_result = Stack_unwrap2d._minflow_unwrap_2d_single(sub_phase, sub_corr, debug)
-
-                # Merge back into result
-                result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
-                if debug:
-                    elapsed = time.time() - t0
-                    status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
-                    print(f' -> {status} ({elapsed:.2f}s)')
-
-            return result
-
-        # Single component - use bounding box like multi-component case for consistency
-        comp_mask = components[0]
-        rows = np.any(comp_mask, axis=1)
-        cols = np.any(comp_mask, axis=0)
-        r_min, r_max = np.where(rows)[0][[0, -1]]
-        c_min, c_max = np.where(cols)[0][[0, -1]]
-
-        # Extract subgrid (bounding box)
-        sub_phase = phase[r_min:r_max+1, c_min:c_max+1].copy()
-        sub_mask = comp_mask[r_min:r_max+1, c_min:c_max+1]
-        sub_phase[~sub_mask] = np.nan
-        sub_corr = correlation[r_min:r_max+1, c_min:c_max+1].copy() if correlation is not None else None
-        if sub_corr is not None:
-            sub_corr[~sub_mask] = np.nan
-
-        if debug:
-            valid_phase = sub_phase[sub_mask]
-            print(f'  Single component: {np.sum(sub_mask)} pixels, bbox {sub_phase.shape}, input phase range: [{valid_phase.min():.4f}, {valid_phase.max():.4f}]', end='', flush=True)
-            t0 = time.time()
-
-        sub_result = Stack_unwrap2d._minflow_unwrap_2d_single(sub_phase, sub_corr, debug)
-
-        # Create full result and merge back
         result = np.full(shape, np.nan, dtype=np.float32)
-        result[r_min:r_max+1, c_min:c_max+1][sub_mask] = sub_result[sub_mask]
 
-        if debug:
-            elapsed = time.time() - t0
-            valid_result = result[valid_mask_2d]
-            n_zeros = np.sum(valid_result == 0)
-            status = 'OK' if not np.all(np.isnan(valid_result)) else 'FAILED'
-            print(f' -> {status} ({elapsed:.2f}s), output range: [{valid_result.min():.4f}, {valid_result.max():.4f}], zeros={n_zeros}')
+        for i, comp in enumerate(components):
+            slices, label, comp_size = comp['slices'], comp['label'], comp['size']
+            sub_mask = (labeled[slices] == label)
+
+            # Extract subgrid using slices from find_objects
+            sub_phase = phase[slices].copy()
+            sub_phase[~sub_mask] = np.nan
+            sub_corr = correlation[slices].copy() if correlation is not None else None
+            if sub_corr is not None:
+                sub_corr[~sub_mask] = np.nan
+
+            if debug:
+                # Check for narrow regions in the component
+                col_counts = np.sum(sub_mask, axis=0)
+                row_counts = np.sum(sub_mask, axis=1)
+                narrow_cols = np.sum((col_counts > 0) & (col_counts <= 2))
+                narrow_rows = np.sum((row_counts > 0) & (row_counts <= 2))
+                print(f'  Component {i+1}/{len(components)}: {comp_size} pixels, bbox {sub_phase.shape}', end='')
+                if narrow_cols > 0 or narrow_rows > 0:
+                    print(f', NARROW: {narrow_cols} cols, {narrow_rows} rows', end='')
+                print('', flush=True)
+                t0 = time.time()
+
+            # Unwrap this component's subgrid
+            sub_result = Stack_unwrap2d._minflow_unwrap_2d_single(sub_phase, sub_corr, debug)
+
+            # Merge back into result
+            result[slices][sub_mask] = sub_result[sub_mask]
+            if debug:
+                elapsed = time.time() - t0
+                status = 'OK' if not np.all(np.isnan(sub_result[sub_mask])) else 'FAILED'
+                print(f' -> {status} ({elapsed:.2f}s)')
+
         return result
 
     @staticmethod
@@ -2567,27 +2462,23 @@ class Stack_unwrap2d(Stack_unwrap1d):
             """Link components in a single 2D array."""
             import time
 
-            # Find connected components
+            # Find connected components - use efficient labeling
             valid_mask = ~np.isnan(phase_2d)
             if not np.any(valid_mask):
                 return phase_2d
 
-            components = Stack_unwrap2d._find_connected_components(valid_mask)
+            min_size = max(conncomp_size, 4)
+            labeled, components, n_total, sizes = Stack_unwrap2d._get_connected_components(valid_mask, min_size)
 
             if len(components) < 2:
-                return phase_2d  # Nothing to link
-
-            # Filter by size
-            min_size = max(conncomp_size, 4)
-            comp_sizes = [np.sum(c) for c in components]
-            processed_components = [c for c, s in zip(components, comp_sizes) if s >= min_size]
-
-            if len(processed_components) < 2:
                 return phase_2d  # Not enough components to link
+
+            # Create masks for valid components (already sorted by size, largest first)
+            processed_components = [(labeled == comp['label']) for comp in components]
 
             if debug:
                 gap_str = 'unlimited' if conncomp_gap is None else str(conncomp_gap)
-                print(f'  Linking {len(processed_components)} components (conncomp_gap={gap_str})...')
+                print(f'  Linking {len(components)} components (conncomp_gap={gap_str})...')
                 t0 = time.time()
 
             # Find connections
