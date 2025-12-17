@@ -57,6 +57,17 @@ class Batch(BatchCore):
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
+    def incidence(self) -> "Batch":
+        """Compute incidence angle from look vector components."""
+        out: dict[str, xr.Dataset] = {}
+        for key, tfm in self.items():
+            look_E = tfm["look_E"]
+            look_N = tfm["look_N"]
+            look_U = tfm["look_U"]
+            incidence = xr.ufuncs.atan2(xr.ufuncs.sqrt(look_E ** 2 + look_N ** 2), look_U) * xr.ufuncs.sign(look_E).astype("float32")
+            out[key] = xr.Dataset({"incidence": incidence})
+        return Batch(out)
+
 class BatchWrap(BatchCore):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores wrapped phase (real values).
@@ -336,7 +347,6 @@ class BatchWrap(BatchCore):
             out[k] = ds
 
         return BatchWrap(out)
-
 
 class BatchUnit(BatchCore):
     """
