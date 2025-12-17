@@ -11,7 +11,6 @@
 from .Stack_unwrap1d import Stack_unwrap1d
 import numpy as np
 
-
 class Stack_unwrap2d(Stack_unwrap1d):
     """2D phase unwrapping using various algorithms (maxflow, minflow, ILP)."""
 

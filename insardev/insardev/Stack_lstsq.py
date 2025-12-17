@@ -8,9 +8,9 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_incidence import Stack_incidence
+from .Stack_sbas import Stack_sbas
 
-class Stack_lstsq(Stack_incidence):
+class Stack_lstsq(Stack_sbas):
 
     @staticmethod
     def _lstsq1d(x, w, matrix, cumsum=True):

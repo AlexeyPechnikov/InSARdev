@@ -8,14 +8,13 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_multilooking import Stack_multilooking
+from .Stack_phasediff import Stack_phasediff
 # required for function decorators
 from numba import jit
 # import directive is not compatible to numba
 import numpy as np
 
-
-class Stack_unwrap1d(Stack_multilooking):
+class Stack_unwrap1d(Stack_phasediff):
     """1D phase unwrapping along the temporal dimension."""
 
     @staticmethod
