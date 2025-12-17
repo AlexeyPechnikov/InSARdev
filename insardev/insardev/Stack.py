@@ -548,3 +548,102 @@ class Stack(Stack_plot, BatchCore):
             out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
 
         return Batch(out)
+
+    def displacement_los(self, phase: Batch, transform: Batch) -> Batch:
+        """Compute line-of-sight displacement (meters) from unwrapped phase.
+
+        Parameters
+        ----------
+        phase : Batch
+            Unwrapped phase grids in radar coordinates.
+        transform : Batch
+            Transform batch providing mission constants; only the first burst is
+            queried for ``radar_wavelength``.
+
+        Returns
+        -------
+        Batch
+            LOS displacement grids (meters), lazily scaled by the mission wavelength.
+        """
+        import numpy as np
+        import xarray as xr
+
+        if not transform:
+            raise ValueError('transform must contain at least one burst with radar_wavelength')
+
+        transform_first = next(iter(transform.values()))
+
+        def _scalar_from_ds(ds, name: str):
+            if name in ds:
+                var = ds[name]
+                if var.ndim == 0:
+                    return var.item()
+            return ds.attrs.get(name)
+
+        wavelength = _scalar_from_ds(transform_first, 'radar_wavelength')
+        if wavelength is None:
+            raise KeyError('Missing radar_wavelength in transform')
+
+        # scale factor from phase in radians to displacement in meters
+        # constant is negative to make LOS = -1 * range change
+        scale = -float(wavelength) / (4 * np.pi)
+
+        out: dict[str, xr.Dataset] = {}
+        for key, phase_ds in phase.items():
+            disp_vars: dict[str, xr.DataArray] = {}
+            for var_name, data in phase_ds.data_vars.items():
+                disp = (data * scale).astype('float32')
+                name = 'los' if len(phase_ds.data_vars) == 1 else f'{var_name}_los'
+                disp_vars[name] = disp
+            out[key] = xr.Dataset(disp_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+
+        return Batch(out)
+
+    def _displacement_component(self, phase: Batch, transform: Batch, func, suffix: str) -> Batch:
+        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin)."""
+        import xarray as xr
+        import numpy as np
+
+        los_batch = self.displacement_los(phase, transform)
+        incidence_batch = transform.incidence()
+
+        out: dict[str, xr.Dataset] = {}
+
+        for key, los_ds in los_batch.items():
+            if key not in incidence_batch:
+                raise KeyError(f'Missing incidence for key: {key}')
+
+            inc_da = incidence_batch[key]['incidence']
+            comp_vars: dict[str, xr.DataArray] = {}
+
+            for var_name, data in los_ds.data_vars.items():
+                # align incidence to data grid
+                if 'y' in data.coords and 'x' in data.coords:
+                    incidence = inc_da.interp(y=data.y, x=data.x, method='linear')
+                else:
+                    incidence = inc_da.reindex_like(data, method='nearest')
+
+                comp = (data / func(incidence)).astype('float32')
+
+                if len(los_ds.data_vars) == 1:
+                    name = suffix
+                elif var_name.endswith('_los'):
+                    name = var_name[:-4] + f'_{suffix}'
+                else:
+                    name = f'{var_name}_{suffix}'
+
+                comp_vars[name] = comp
+
+            out[key] = xr.Dataset(comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
+
+        return Batch(out)
+
+    def displacement_vertical(self, phase: Batch, transform: Batch) -> Batch:
+        """Compute vertical displacement (meters) from unwrapped phase and incidence."""
+        import xarray as xr
+        return self._displacement_component(phase, transform, func=xr.ufuncs.cos, suffix='vertical')
+
+    def displacement_eastwest(self, phase: Batch, transform: Batch) -> Batch:
+        """Compute east-west displacement (meters) from unwrapped phase and incidence."""
+        import xarray as xr
+        return self._displacement_component(phase, transform, func=xr.ufuncs.sin, suffix='eastwest')
