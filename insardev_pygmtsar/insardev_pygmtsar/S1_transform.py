@@ -41,7 +41,7 @@ class S1_transform(S1_topo):
                   records: pd.DataFrame|None=None,
                   epsg: str|int|None='auto',
                   resolution: tuple[int, int]=(20, 5),
-                  topo_correction: bool = True,
+                  remove_topo_phase: bool = True,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
@@ -63,8 +63,9 @@ class S1_transform(S1_topo):
             The EPSG code to use for the output data. By default, the EPSG code is computed automatically for each burst.
         resolution : tuple[int, int], optional
             The resolution to use in meters per pixel in the projected coordinate system.
-        topo_correction : bool, optional
-            Apply topographic correction to the SLC data for future interferometric processing.
+        remove_topo_phase : bool, optional
+            Remove the topographic phase from SLC data for interferometric processing. Set to False
+            when creating a DEM from interferograms so the topo phase remains.
         dem_vertical_accuracy : float, optional
             The DEM vertical accuracy in meters.
         alignment_spacing : float, optional
@@ -165,12 +166,12 @@ class S1_transform(S1_topo):
                 # for topo phase calculation
                 #print ('compute_transform_inverse')
                 
-                if topo_correction:
+                if remove_topo_phase:
                     # topo in radar coordinate saved in the temp directory for the processing time only
                     self.compute_topo(target, transform, burst_refs[0][-1], basedir=tmpdir)
                     topo = self.get_topo(burst_ref, tmpdir)
                 else:
-                    # topographic phase is not needed when topo correction is not applied
+                    # keep topo phase intact (e.g., for DEM creation by interferogram)
                     topo = 0
 
                 # use sequential processing as it is well parallelized internally
