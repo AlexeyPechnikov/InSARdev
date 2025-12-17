@@ -27,11 +27,52 @@ class Stack(Stack_plot, BatchCore):
         #print('Stack __init__', 0 if mapping is None else len(mapping))
         super().__init__(mapping)
 
-    # def PRM(self, key:str) -> str|float|int:
-    #     """
-    #     Use as stack.PRM('radar_wavelength') to get the radar wavelength from the first burst.
-    #     """
-    #     return next(iter(self.dss.values())).attrs[key]
+    def PRM(self, keys: str | list[str] | None = None) -> dict:
+        """Return platform parameters per burst.
+
+        Parameters
+        ----------
+        keys : str | list[str] | None
+            Parameter name(s) to extract. If ``None``, all scalar attrs
+            and 0-D data_vars are returned per burst.
+
+        Returns
+        -------
+        dict
+            Mapping of burst key -> param dict (or burst key -> single value
+            when a single key is requested).
+        """
+        if not self:
+            return {}
+
+        # normalize key selection
+        select_all = keys is None
+        if isinstance(keys, str):
+            keys_list = [keys]
+        else:
+            keys_list = keys if keys is not None else None
+
+        result: dict[str, object] = {}
+        for burst, ds in self.items():
+            params: dict[str, object] = dict(getattr(ds, 'attrs', {}))
+            for name, var in getattr(ds, 'data_vars', {}).items():
+                if var.ndim == 0:
+                    try:
+                        params.setdefault(name, var.item())
+                    except Exception:
+                        params.setdefault(name, var.values)
+
+            if not select_all:
+                if keys_list is None:
+                    params = {}
+                else:
+                    params = {k: params.get(k) for k in keys_list}
+                    if isinstance(keys, str):
+                        params = params.get(keys)
+
+            result[burst] = params
+
+        return result
 
     def __getitem__(self, key):
         """Access by key or variable list."""
@@ -67,6 +108,10 @@ class Stack(Stack_plot, BatchCore):
                         return Batch(subset)
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def transform(self) -> Batch:
+        """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
+        return Batch(self)
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
@@ -408,3 +453,98 @@ class Stack(Stack_plot, BatchCore):
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
+
+    def elevation(self, phase: Batch, transform: Batch, baseline: float | None = None) -> Batch:
+        """Compute elevation (meters) from unwrapped phase grids in radar coordinates.
+
+        Parameters
+        ----------
+        phase : Batch
+            Unwrapped phase grids (e.g., output of unwrap2d()).
+        transform : Batch
+            Transform batch containing look vectors; its `.incidence()` is used.
+        baseline : float | None, optional
+            Perpendicular baseline in meters. If ``None``, use the burst-specific
+            ``BPR`` stored in the corresponding transform dataset.
+
+        Returns
+        -------
+        Batch
+            Elevation grids as float32 datasets.
+        """
+        import xarray as xr
+        import numpy as np
+
+        incidence_batch = transform.incidence()
+        out: dict[str, xr.Dataset] = {}
+
+        for key, phase_ds in phase.items():
+            if key not in incidence_batch:
+                raise KeyError(f'Missing incidence for key: {key}')
+
+            tfm = transform[key]
+
+            def _scalar_from_ds(ds, name: str):
+                if name in ds:
+                    var = ds[name]
+                    if var.ndim == 0:
+                        return var.item()
+                return ds.attrs.get(name)
+
+            wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
+            slant_start = _scalar_from_ds(tfm, 'SC_height_start')
+            slant_end = _scalar_from_ds(tfm, 'SC_height_end')
+            if wavelength is None or slant_start is None or slant_end is None:
+                raise KeyError(f"Missing parameters in transform for burst {key}: radar_wavelength, SC_height_start, SC_height_end")
+
+            def _extract_baseline(source: xr.Dataset | None):
+                if source is None:
+                    return None
+                bpr = _scalar_from_ds(source, 'BPR')
+                if bpr is None and 'BPR' in source:
+                    bpr_da = source['BPR']
+                    arr = np.asarray(bpr_da).ravel()
+                    arr = arr[np.isfinite(arr)]
+                    # prefer the first non-zero entry; fall back to the first finite value
+                    if arr.size:
+                        nonzero = arr[np.abs(arr) > 1e-9]
+                        pick = nonzero[0] if nonzero.size else arr[0]
+                        bpr = float(pick)
+                if bpr is None:
+                    return None
+                bpr_val = float(bpr)
+                return None if np.isnan(bpr_val) or abs(bpr_val) < 1e-9 else bpr_val
+
+            if baseline is None:
+                baseline_val = _extract_baseline(tfm)
+                if baseline_val is None:
+                    baseline_val = _extract_baseline(phase_ds)
+            else:
+                baseline_val = float(baseline)
+
+            if baseline_val is None:
+                raise KeyError(f"Missing baseline (BPR) for burst {key}")
+
+            inc_da = incidence_batch[key]['incidence']
+            slant_range = xr.DataArray(
+                np.linspace(slant_start, slant_end, inc_da.sizes['x']),
+                coords={'x': inc_da.coords['x']},
+                dims=('x',)
+            )
+
+            elev_vars: dict[str, xr.DataArray] = {}
+            for var_name, data in phase_ds.data_vars.items():
+                if 'y' in data.coords and 'x' in data.coords:
+                    incidence = inc_da.interp(y=data.y, x=data.x, method='linear')
+                    slant = slant_range.interp(x=data.x)
+                else:
+                    incidence = inc_da.reindex_like(data, method='nearest')
+                    slant = slant_range.reindex_like(data.x, method='nearest')
+
+                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * baseline_val))
+                name = 'ele' if len(phase_ds.data_vars) == 1 else f'{var_name}_ele'
+                elev_vars[name] = elev.astype('float32')
+
+            out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+
+        return Batch(out)

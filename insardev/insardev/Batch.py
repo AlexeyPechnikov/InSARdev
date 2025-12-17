@@ -27,10 +27,14 @@ class Batch(BatchCore):
             real_dict: dict[str, xr.Dataset] = {}
             for key, ds in mapping.items():
                 # keep only non-complex data_vars that live on the ('y','x') grid
+                # and include 1D non-complex variables (e.g., per-axis metadata)
                 real_vars = [
                     v for v in ds.data_vars
                     if ds[v].dtype.kind != 'c'
-                    and tuple(ds[v].dims) == ('y', 'x')
+                    and (
+                        tuple(ds[v].dims) == ('y', 'x')
+                        or len(ds[v].dims) == 1
+                    )
                 ]
                 real_dict[key] = ds[real_vars]
             mapping = real_dict
