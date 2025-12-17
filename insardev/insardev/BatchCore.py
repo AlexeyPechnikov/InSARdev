@@ -280,12 +280,22 @@ class BatchCore(dict):
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-    def __add__(self, other: Batch):
+    def __add__(self, other):
+        # scalar + batch → map scalar + each dataset
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: v + other for k, v in self.items()})
         keys = self.keys()
         #& other.keys()
         return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
 
-    def __sub__(self, other: Batch):
+    def __radd__(self, other):
+        # scalar + batch → same as batch + scalar
+        return self.__add__(other)
+
+    def __sub__(self, other):
+        # scalar - batch → map scalar - each dataset
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: v - other for k, v in self.items()})
         keys = self.keys()
         result = {}
         for k in keys:
@@ -317,7 +327,16 @@ class BatchCore(dict):
                     result[k] = ds - val
         return type(self)(result)
 
-    def __mul__(self, other: Batch):
+    def __rsub__(self, other):
+        # scalar - batch
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: other - v for k, v in self.items()})
+        return NotImplemented
+
+    def __mul__(self, other):
+        # scalar * batch → map scalar * each dataset
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: v * other for k, v in self.items()})
         keys = self.keys()
         return type(self)({k: (self[k] * other[k] if k in other else self[k]) for k in keys})
 
@@ -325,9 +344,18 @@ class BatchCore(dict):
         # scalar * batch  → map scalar * each dataset
         return type(self)({k: other * v for k, v in self.items()})
 
-    def __truediv__(self, other: Batch):
+    def __truediv__(self, other):
+        # batch / scalar → map each dataset / scalar
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: v / other for k, v in self.items()})
         keys = self.keys()
         return type(self)({k: (self[k] / other[k] if k in other else self[k]) for k in keys})
+
+    def __rtruediv__(self, other):
+        # scalar / batch
+        if isinstance(other, (int, float, np.floating, np.integer)):
+            return type(self)({k: other / v for k, v in self.items()})
+        return NotImplemented
     
     def _binop(self, other, op):
         """
