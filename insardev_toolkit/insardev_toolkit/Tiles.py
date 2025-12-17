@@ -183,7 +183,7 @@ class Tiles(datagrid, progressbar_joblib):
 
         if filename is not None and os.path.exists(filename) and skip_exist:
             print ('NOTE: Target file exists, return it. Use "skip_exist=False" or omit the filename to allow new downloading.')
-            return xr.open_dataarray(filename, engine=self.netcdf_engine_read, chunks=self.chunksize)
+            return xr.open_dataarray(filename, engine=self.netcdf_engine_read, chunks='auto')
 
         bounds = self.get_bounds(geometry)
 
