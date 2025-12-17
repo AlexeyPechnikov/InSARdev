@@ -113,6 +113,138 @@ class Stack(Stack_plot, BatchCore):
         """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
         return Batch(self)
 
+    def to_vtks(self, path: str, data: BatchCore | dict | None = None,
+               transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
+        """Export to VTK from a Batch.
+
+        Parameters
+        ----------
+        path : str
+            Output directory for VTK files.
+        data : BatchCore | dict | None, optional
+            Data to export. If ``None``, export this Stack. Accepts any mapping convertible to ``Batch``.
+        transform : Batch | None, optional
+            Optional transform Batch providing topography (`ele`).
+        overlay : xarray.DataArray | None, optional
+            Optional overlay (e.g., imagery). If it lacks a ``band`` dim, one is added.
+        mask : bool, optional
+            If True, mask topography by valid data pixels.
+        """
+        import os
+        import numpy as np
+        import xarray as xr
+        import pandas as pd
+        from tqdm.auto import tqdm
+        from vtk import vtkStructuredGridWriter, VTK_BINARY
+        from .utils_vtk import as_vtk
+
+        target = data if data is not None else self
+        if not isinstance(target, BatchCore):
+            target = Batch(target)
+        tfm = transform
+        if tfm is not None and not isinstance(tfm, BatchCore):
+            tfm = Batch(tfm)
+
+        if not target:
+            return
+
+        def _interp_to_grid(source: xr.DataArray, target_da: xr.DataArray) -> xr.DataArray:
+            if {'y', 'x'}.issubset(source.dims):
+                return source.interp(y=target_da.y, x=target_da.x, method='linear')
+            if {'lat', 'lon'}.issubset(source.dims):
+                if {'lat', 'lon'}.issubset(target_da.coords):
+                    return source.interp(lat=target_da.lat, lon=target_da.lon, method='linear')
+                return source.rename({'lat': 'y', 'lon': 'x'}).interp(y=target_da.y, x=target_da.x, method='linear')
+            return source
+
+        def _format_dt(val):
+            try:
+                ts = pd.to_datetime(val)
+                if pd.isna(ts):
+                    return str(val)
+                return ts.strftime('%Y%m%d')
+            except Exception:
+                return str(val)
+
+        def _format_pair(val):
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
+            return _format_dt(val)
+
+        os.makedirs(path, exist_ok=True)
+
+        with tqdm(total=len(target), desc='Exporting VTK') as pbar:
+            for burst, ds in target.items():
+                if not ds.data_vars:
+                    pbar.update(1)
+                    continue
+
+                data_var = next(iter(ds.data_vars))
+                base_da = ds[data_var]
+
+                if 'pair' in ds.dims:
+                    pair_coord = ds.coords.get('pair')
+                    pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
+                    export_items = []
+                    for i, pair_val in enumerate(pair_values):
+                        ds_slice = ds.isel(pair=i)
+                        if 'pair' in ds_slice.dims:
+                            ds_slice = ds_slice.squeeze('pair', drop=True)
+                        else:
+                            ds_slice = ds_slice.squeeze(drop=True)
+                        export_items.append((pair_val, ds_slice))
+                else:
+                    export_items = [(None, ds)]
+
+                for pair_val, ds_item in export_items:
+                    base_da_item = ds_item[data_var]
+                    layers = [base_da_item.rename(data_var)]
+
+                    if tfm is not None and burst in tfm:
+                        tfm_ds = tfm[burst]
+                        topo_da = tfm_ds.get('ele') if 'ele' in tfm_ds else tfm_ds.get('z') if 'z' in tfm_ds else None
+                        if topo_da is not None:
+                            topo_da = _interp_to_grid(topo_da, base_da_item)
+                            if mask:
+                                topo_da = topo_da.where(np.isfinite(base_da_item))
+                            layers.append(topo_da.rename('z'))
+
+                    if overlay is not None:
+                        if not isinstance(overlay, xr.DataArray):
+                            raise TypeError("overlay must be an xarray.DataArray (e.g., an RGB raster)")
+
+                        ov = overlay
+                        if 'band' not in ov.dims:
+                            ov = ov.expand_dims('band')
+                        try:
+                            ov = ov.sel(y=slice(float(base_da_item.y.min()), float(base_da_item.y.max())),
+                                        x=slice(float(base_da_item.x.min()), float(base_da_item.x.max())))
+                        except Exception:
+                            try:
+                                ov = ov.sel(lat=slice(float(base_da_item.lat.min()), float(base_da_item.lat.max())),
+                                            lon=slice(float(base_da_item.lon.min()), float(base_da_item.lon.max())))
+                            except Exception:
+                                pass
+                        ov = _interp_to_grid(ov, base_da_item)
+                        layers.append(ov.rename('colors'))
+
+                    ds_out = xr.merge(layers, compat='override', join='left')
+                    vtk_grid = as_vtk(ds_out)
+
+                    pair_suffix = ''
+                    if pair_val is not None:
+                        pair_suffix = f"_{_format_pair(pair_val)}"
+
+                    filename = os.path.join(path, f"{burst}{pair_suffix}.vtk")
+
+                    writer = vtkStructuredGridWriter()
+                    writer.SetFileName(filename)
+                    writer.SetInputData(vtk_grid)
+                    writer.SetFileType(VTK_BINARY)
+                    writer.Write()
+
+                pbar.update(1)
+
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
         if len(args) > 2:
