@@ -33,6 +33,41 @@ class Stack(Stack_plot, BatchCore):
     #     """
     #     return next(iter(self.dss.values())).attrs[key]
 
+    def __getitem__(self, key):
+        """Access by key or variable list."""
+        # Handle variable selection like sbas[['ele']]
+        if isinstance(key, list):
+            if len(key) == 1 and self:
+                var = key[0]
+                # Build a Batch containing only the requested variable for each scene
+                subset = {k: ds[[var]] for k, ds in self.items() if var in ds.data_vars}
+                if not subset:
+                    raise KeyError(var)
+                return Batch(subset)
+            # Multiple variables - return Stack with subset
+            return type(self)({k: ds[key] for k, ds in self.items()})
+        return dict.__getitem__(self, key)
+
+    def __getattr__(self, name: str):
+        """
+        Access variables (e.g., 'ele') from the Stack as Batch.
+
+        This allows accessing variables stored in burst datasets:
+            sbas.ele  -> BatchVar containing elevation data
+        """
+        if name.startswith('_') or name in ('keys', 'values', 'items', 'get'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        if self:
+            sample = next(iter(self.values()), None)
+            if sample is not None and hasattr(sample, 'data_vars'):
+                if name in sample.data_vars or name in sample.coords:
+                    subset = {k: ds[[name]] for k, ds in self.items() if name in ds.data_vars or name in ds.coords}
+                    if subset:
+                        return Batch(subset)
+
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
         if len(args) > 2:

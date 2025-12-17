@@ -16,7 +16,7 @@ import xarray as xr
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+    from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchVar
     from .Stack import Stack
     import rasterio as rio
     import pandas as pd
@@ -243,6 +243,42 @@ class BatchCore(dict):
                 if (isinstance(ds, self.CoordCollection) and key in ds._ds.coords) or 
                    (not isinstance(ds, self.CoordCollection) and (key in ds.coords or key in ds.data_vars))
             })
+
+    def __getattr__(self, name: str):
+        """Attribute-style access to coords or data variables (e.g., batch.ele)."""
+        if name.startswith('_') or name in ('keys', 'values', 'items', 'get'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        if not self:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        def _extract(ds):
+            # CoordCollection wrapper
+            if isinstance(ds, self.CoordCollection):
+                if name in ds._ds.coords:
+                    return ds._ds.coords.to_dataset()[[name]]
+                return None
+
+            # Dataset: prefer data_vars, then coords
+            if hasattr(ds, 'data_vars'):
+                if name in ds.data_vars:
+                    return ds[[name]]
+                if name in ds.coords:
+                    return ds.coords.to_dataset()[[name]]
+                return None
+
+            # DataArray fallback: match by name
+            if hasattr(ds, 'name') and ds.name == name:
+                return ds.to_dataset()
+            if hasattr(ds, 'coords') and name in ds.coords:
+                return ds.coords.to_dataset()[[name]]
+            return None
+
+        subset = {k: out for k, ds in self.items() if (out := _extract(ds)) is not None}
+        if subset:
+            return type(self)(subset)
+
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def __add__(self, other: Batch):
         keys = self.keys()
