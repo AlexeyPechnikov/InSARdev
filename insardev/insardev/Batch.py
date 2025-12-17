@@ -48,7 +48,7 @@ class Batch(BatchCore):
         self,
         cmap = 'turbo',
         alpha = 0.5,
-        caption='Phase, [rad]',
+        caption = None,
         *args,
         **kwargs
     ):

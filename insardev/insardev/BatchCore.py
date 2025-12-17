@@ -1529,17 +1529,28 @@ class BatchCore(dict):
                 _vmin = -minmax
                 _vmax =  minmax
             
-            # multi-plots ineffective for linked lazy data
-            fg = (self.wrap(da) if wrap else da).rename(caption)\
+            # wrapped phase special handling
+            if polarization in ['VV','VH','HH','HV']:
+                _caption = 'Phase, [rad]' if caption is None else caption
+                _vmin = -np.pi if _vmin is None else _vmin
+                _vmax = np.pi if _vmax is None else _vmax
+                _cmap = 'gist_rainbow_r' if cmap is None else cmap
+            else:
+                _caption = caption or ''
+                _cmap = cmap
+            
+            # note: multi-plots ineffective for linked lazy data
+            fg = (self.wrap(da) if wrap else da)\
                 .plot.imshow(
                 col=stackvar,
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax,
-                cmap=cmap, alpha=alpha,
+                cmap=_cmap, alpha=alpha,
+                cbar_kwargs={'label': _caption or polarization},
             )
             fg.set_axis_labels('easting [m]', 'northing [m]')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-            fg.fig.suptitle(f'{polarization} {caption}', y=y)
+            fg.fig.suptitle(f'{polarization} {_caption}'.strip(), y=y)
 
             # fg is the FacetGrid returned by xarray.plot.imshow
             for ax in fg.axes.flatten():
