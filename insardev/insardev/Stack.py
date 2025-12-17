@@ -113,6 +113,146 @@ class Stack(Stack_plot, BatchCore):
         """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
         return Batch(self)
 
+    def to_vtk(self, path: str, data: BatchCore | dict | None = None,
+               transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
+        """Export all pairs of each burst into a single VTK per burst.
+
+        Each pair becomes a variable named ``{varname}_{yyyymmdd}_{yyyymmdd}``.
+
+        Parameters
+        ----------
+        path : str
+            Output directory (one VTK per burst) or explicit ``.vtk`` file path when exporting a single burst.
+        data : BatchCore | dict | None, optional
+            Data to export. If ``None``, export this Stack. Accepts any mapping convertible to ``Batch``.
+        transform : Batch | None, optional
+            Optional transform Batch providing topography (``ele`` or ``z``).
+        overlay : xarray.DataArray | None, optional
+            Optional overlay (e.g., imagery). If it lacks a ``band`` dim, one is added.
+        mask : bool, optional
+            If True, mask topography by valid data pixels.
+        """
+        import os
+        import numpy as np
+        import xarray as xr
+        import pandas as pd
+        from tqdm.auto import tqdm
+        from vtk import vtkStructuredGridWriter, VTK_BINARY
+        from .utils_vtk import as_vtk
+
+        target = data if data is not None else self
+        if not isinstance(target, BatchCore):
+            target = Batch(target)
+        tfm = transform
+        if tfm is not None and not isinstance(tfm, BatchCore):
+            tfm = Batch(tfm)
+
+        if not target:
+            return
+
+        def _interp_to_grid(source: xr.DataArray, target_da: xr.DataArray) -> xr.DataArray:
+            if {'y', 'x'}.issubset(source.dims):
+                return source.interp(y=target_da.y, x=target_da.x, method='linear')
+            if {'lat', 'lon'}.issubset(source.dims):
+                if {'lat', 'lon'}.issubset(target_da.coords):
+                    return source.interp(lat=target_da.lat, lon=target_da.lon, method='linear')
+                return source.rename({'lat': 'y', 'lon': 'x'}).interp(y=target_da.y, x=target_da.x, method='linear')
+            return source
+
+        def _format_dt(val):
+            try:
+                ts = pd.to_datetime(val)
+                if pd.isna(ts):
+                    return str(val)
+                return ts.strftime('%Y%m%d')
+            except Exception:
+                return str(val)
+
+        def _format_pair(val):
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
+            return _format_dt(val)
+
+        is_file = path.lower().endswith('.vtk') and len(target) == 1
+        if not is_file:
+            os.makedirs(path, exist_ok=True)
+
+        with tqdm(total=len(target), desc='Exporting VTK') as pbar:
+            for burst, ds in target.items():
+                if not ds.data_vars:
+                    pbar.update(1)
+                    continue
+
+                data_var = next(iter(ds.data_vars))
+
+                if 'pair' in ds.dims:
+                    pair_coord = ds.coords.get('pair')
+                    pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
+                    export_items = []
+                    for i, pair_val in enumerate(pair_values):
+                        ds_slice = ds.isel(pair=i)
+                        if 'pair' in ds_slice.dims:
+                            ds_slice = ds_slice.squeeze('pair', drop=True)
+                        else:
+                            ds_slice = ds_slice.squeeze(drop=True)
+                        export_items.append((pair_val, ds_slice))
+                else:
+                    export_items = [(None, ds)]
+
+                if not export_items:
+                    pbar.update(1)
+                    continue
+
+                ref_da = export_items[0][1][data_var]
+                layers = []
+
+                if tfm is not None and burst in tfm:
+                    tfm_ds = tfm[burst]
+                    topo_da = tfm_ds.get('ele') if 'ele' in tfm_ds else tfm_ds.get('z') if 'z' in tfm_ds else None
+                    if topo_da is not None:
+                        topo_da = _interp_to_grid(topo_da, ref_da)
+                        if mask:
+                            topo_da = topo_da.where(np.isfinite(ref_da))
+                        layers.append(topo_da.rename('z'))
+
+                if overlay is not None:
+                    if not isinstance(overlay, xr.DataArray):
+                        raise TypeError("overlay must be an xarray.DataArray (e.g., an RGB raster)")
+
+                    ov = overlay
+                    if 'band' not in ov.dims:
+                        ov = ov.expand_dims('band')
+                    try:
+                        ov = ov.sel(y=slice(float(ref_da.y.min()), float(ref_da.y.max())),
+                                    x=slice(float(ref_da.x.min()), float(ref_da.x.max())))
+                    except Exception:
+                        try:
+                            ov = ov.sel(lat=slice(float(ref_da.lat.min()), float(ref_da.lat.max())),
+                                        lon=slice(float(ref_da.lon.min()), float(ref_da.lon.max())))
+                        except Exception:
+                            pass
+                    ov = _interp_to_grid(ov, ref_da)
+                    layers.append(ov.rename('colors'))
+
+                for pair_val, ds_item in export_items:
+                    da_item = ds_item[data_var]
+                    var_name = data_var if pair_val is None else f"{data_var}_{_format_pair(pair_val)}"
+                    layers.append(da_item.rename(var_name))
+
+                ds_out = xr.merge(layers, compat='override', join='left')
+                vtk_grid = as_vtk(ds_out)
+
+                filename = path if is_file else os.path.join(path, f"{burst}.vtk")
+                os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+
+                writer = vtkStructuredGridWriter()
+                writer.SetFileName(filename)
+                writer.SetInputData(vtk_grid)
+                writer.SetFileType(VTK_BINARY)
+                writer.Write()
+
+                pbar.update(1)
+
     def to_vtks(self, path: str, data: BatchCore | dict | None = None,
                transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
         """Export to VTK from a Batch.
