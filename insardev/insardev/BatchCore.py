@@ -356,7 +356,11 @@ class BatchCore(dict):
         if isinstance(other, (int, float, np.floating, np.integer)):
             return type(self)({k: other / v for k, v in self.items()})
         return NotImplemented
-    
+
+    def __neg__(self):
+        # -batch → negate each dataset
+        return type(self)({k: -v for k, v in self.items()})
+
     def _binop(self, other, op):
         """
         generic helper for any binary operator `op(ds, other)` or `op(ds, other_ds)`
@@ -787,6 +791,31 @@ class BatchCore(dict):
             coords = {}
         coords = dict(coords, **coords_kwargs)
         
+        # Check if any coord is a BatchCore - if so, we need per-burst assignment
+        batch_coords = {name: coord for name, coord in coords.items() 
+                       if isinstance(coord, tuple) and len(coord) == 2 
+                       and isinstance(coord[1], BatchCore)}
+        
+        if batch_coords:
+            # Per-burst coordinate assignment
+            result = {}
+            for key, ds in self.items():
+                ds_coords = {}
+                for name, coord in coords.items():
+                    if name in batch_coords:
+                        dims, batch = coord
+                        # Get this burst's values from the batch
+                        burst_ds = batch[key]
+                        var_name = next(iter(burst_ds.data_vars))
+                        data = burst_ds[var_name]
+                        # Compute lazy arrays - coordinates should never be lazy
+                        values = data.compute().values if hasattr(data.data, 'compute') else data.values
+                        ds_coords[name] = (dims, values)
+                    else:
+                        ds_coords[name] = coord
+                result[key] = ds.assign_coords(ds_coords)
+            return type(self)(result)
+        
         def process_coord(coord):
             if not isinstance(coord, tuple) or len(coord) != 2:
                 return coord
@@ -1129,6 +1158,28 @@ class BatchCore(dict):
 
     def map(self, func, *args, **kwargs):
         return type(self)({k: func(ds, *args, **kwargs) for k, ds in self.items()})
+
+    def to_dict(self) -> dict:
+        """
+        Extract data variables as a dictionary of {burst_key: {var_name: values}}.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping burst keys to dictionaries of variable names to numpy arrays.
+
+        Examples
+        --------
+        >>> bpr = stack.BPR(stack.isel(date=[1]), stack.isel(date=[0]))
+        >>> bpr.to_dict()
+        {'123_262885_IW2': {'BPR': array([-158.75])},
+         '123_262886_IW2': {'BPR': array([-158.81])},
+         '123_262887_IW2': {'BPR': array([-158.87])}}
+        """
+        result = {}
+        for key, ds in self.items():
+            result[key] = {var: ds[var].values for var in ds.data_vars}
+        return result
 
     def compute(self):
         import dask
