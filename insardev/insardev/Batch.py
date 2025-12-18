@@ -431,7 +431,6 @@ class BatchComplex(BatchCore):
         return Batch(out)
 
     def abs(self, **kwargs):
-        print ('BatchComplex abs')
         return Batch(self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs))
 
     def power(self, **kwargs):
