@@ -1486,6 +1486,68 @@ class BatchCore(dict):
         da = datagrid.spatial_ref(da, datas)
         return da if stackvar != 'fake' else da.isel({stackvar: 0})
 
+    def to_vtk(self, path: str, mask: bool = True):
+        """
+        Export the batch data to VTK files.
+
+        Converts the batch to a unified dataset using to_dataset(), then saves
+        each data variable as a separate VTK file named {varname}.vtk in the
+        specified directory.
+
+        Parameters
+        ----------
+        path : str
+            Output directory where VTK files will be saved.
+        mask : bool, optional
+            If True (default), set z-coordinate to NaN where data values are NaN,
+            effectively masking those areas in the VTK visualization.
+
+        Examples
+        --------
+        >>> intfs20.to_vtk('vtk')  # Creates vtk/VV.vtk, etc.
+        >>> intfs20.to_vtk('vtk', mask=False)  # No masking
+        """
+        import os
+        import numpy as np
+        from vtk import vtkStructuredGridWriter, VTK_BINARY
+        from .utils_vtk import as_vtk
+
+        os.makedirs(path, exist_ok=True)
+
+        ds = self.to_dataset()
+        if ds is None:
+            return
+
+        # Handle both Dataset and DataArray
+        if isinstance(ds, xr.DataArray):
+            ds = ds.to_dataset()
+
+        for varname in ds.data_vars:
+            if varname == 'spatial_ref':
+                continue
+            # Select this variable and convert to dataset for as_vtk
+            da = ds[varname]
+            # Handle 3D data (pair, y, x) - select first pair for VTK
+            if 'pair' in da.dims:
+                da = da.isel(pair=0)
+            
+            # Create dataset with z-coordinate for VTK
+            ds_var = da.to_dataset()
+            if mask:
+                # Set z to NaN where data is NaN to mask those areas
+                z = xr.zeros_like(da, dtype=np.float32)
+                z = z.where(np.isfinite(da))
+                ds_var['z'] = z
+            
+            vtk_grid = as_vtk(ds_var)
+
+            filename = os.path.join(path, f"{varname}.vtk")
+            writer = vtkStructuredGridWriter()
+            writer.SetFileName(filename)
+            writer.SetInputData(vtk_grid)
+            writer.SetFileType(VTK_BINARY)
+            writer.Write()
+
     def plot(self,
             cmap: matplotlib.colors.Colormap | str | None = 'viridis',
             alpha: float = 0.7,
@@ -1687,11 +1749,14 @@ class BatchCore(dict):
                 return out_da.chunk({d: da.chunks[i][0] for i, d in enumerate(da.dims)})
 
             # apply to every 2D or 3D (yx) var in the Dataset
-            out[key] = xr.Dataset({
+            new_ds = xr.Dataset({
                 var: gaussian_da(ds[var], w[var] if w is not None else None)
                 for var in ds.data_vars
                 if (ds[var].ndim in (2,3) and ds[var].dims[-2:] == ('y','x'))
             })
+            # preserve original Dataset attributes
+            new_ds.attrs = ds.attrs
+            out[key] = new_ds
 
         return type(self)(out)
 
@@ -2677,7 +2742,9 @@ class BatchCore(dict):
 
         def dissolve_pol(da_current, das_others, wrap, extend, weight):
             """Dissolve one polarization - returns numpy array."""
-            ys, xs = da_current.y.values, da_current.x.values
+            # Use exact coordinates from da_current - do NOT modify them
+            ys = da_current.y.values
+            xs = da_current.x.values
             n_others = len(das_others)
 
             if weight is None:
@@ -2686,7 +2753,13 @@ class BatchCore(dict):
                 w_current = weight
                 w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
 
-            das_reindexed = [d.reindex(y=ys, x=xs, fill_value=np.nan, copy=False) for d in das_others]
+            # Reindex das_others to match da_current coordinates
+            # Use interp for floating point coordinate matching instead of reindex
+            das_reindexed = []
+            for d in das_others:
+                # Use interp with nearest to avoid issues with floating point coordinate matching
+                das_reindexed.append(d.interp(y=ys, x=xs, method='nearest', kwargs={'fill_value': np.nan}))
+            
             current_vals = da_current.values
             current_valid = np.isfinite(current_vals)
 
