@@ -22,6 +22,18 @@ class S1_topo(S1_geocode):
         import warnings
         warnings.filterwarnings('ignore')
 
+        if topo is None:
+            # skip topo phase removal, use zero elevation for flat-earth correction
+            prm_ref = self.PRM(burst_ref, basedir=basedir)
+            xdim = prm_ref.get('num_rng_bins')
+            ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+            # use 0.5-based coordinates matching the SLC grid (same as compute_topo)
+            azis = np.arange(0.5, ydim, 1)
+            rngs = np.arange(0.5, xdim, 1)
+            topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
+                                dims=['a', 'r'],
+                                coords={'a': azis, 'r': rngs}).rename('topo')
+
         # calculate the combined earth curvature and topography correction
         def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
             sina = np.sin(alpha)

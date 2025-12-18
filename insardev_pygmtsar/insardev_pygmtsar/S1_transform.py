@@ -172,7 +172,7 @@ class S1_transform(S1_topo):
                     topo = self.get_topo(burst_ref, tmpdir)
                 else:
                     # keep topo phase intact (e.g., for DEM creation by interferogram)
-                    topo = 0
+                    topo = None
 
                 # use sequential processing as it is well parallelized internally
                 #print ('transform_slc')
@@ -206,7 +206,7 @@ class S1_transform(S1_topo):
     def transform_slc_int16(self,
                             outdir: str,
                             transform: xr.Dataset,
-                            topo: xr.DataArray,
+                            topo: xr.DataArray | None,
                             burst_rep: str,
                             burst_ref: str,
                             basedir: str,
