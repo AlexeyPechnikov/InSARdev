@@ -805,7 +805,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         # restore NaN values
         unwrapped[np.isnan(phase)] = np.nan
 
-        return unwrapped
+        return unwrapped - np.nanmean(unwrapped)
 
     @staticmethod
     def _ilp_unwrap_2d(phase, correlation=None, conncomp_size=100, max_time=300.0, search_workers=1, debug=False):
@@ -1185,7 +1185,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         unwrapped = (unwrapped_cycles * (2 * np.pi)).reshape(shape).astype(np.float32)
         unwrapped[np.isnan(phase)] = np.nan
 
-        return unwrapped
+        return unwrapped - np.nanmean(unwrapped)
 
     @staticmethod
     def _minflow_unwrap_2d(phase, correlation=None, conncomp_size=100, debug=False):
@@ -1836,7 +1836,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
             if len(valid_unwrapped) > 0:
                 print(f'    DEBUG: final unwrapped range: [{valid_unwrapped.min():.4f}, {valid_unwrapped.max():.4f}]')
 
-        return unwrapped
+        return unwrapped - np.nanmean(unwrapped)
 
     @staticmethod
     def _conncomp_2d(phase):
