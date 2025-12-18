@@ -572,7 +572,18 @@ class Stack(Stack_plot, BatchCore):
                 ds = xr.merge(datas)
                 del datas
             else:
-                ds = ds.rename({'data': polarizations[0]})
+                ds = bursts.rename({'data': polarizations[0]})
+
+            # add subswath and pathNumber as attributes
+            # subswath should be constant per burst - verify and use first value
+            if 'subswath' in ds.data_vars:
+                subswath_values = ds['subswath'].values
+                assert len(np.unique(subswath_values)) == 1, \
+                    f'subswath must be constant per burst, got: {np.unique(subswath_values)}'
+                ds.attrs['subswath'] = str(subswath_values[0])
+            # pathNumber can vary (e.g. S1A vs S1B), use minimum value for consistency
+            if 'pathNumber' in ds.data_vars:
+                ds.attrs['pathNumber'] = int(np.min(ds['pathNumber'].values))
 
             for var in transform.data_vars:
                 #if var not in ['re', 'im']:
@@ -616,6 +627,17 @@ class Stack(Stack_plot, BatchCore):
                 raise KeyError('spatial_ref')
             ds.attrs['spatial_ref'] = spatial_ref
             del datas
+
+            # add subswath and pathNumber as attributes
+            # subswath should be constant per burst - verify and use first value
+            if 'subswath' in ds.data_vars:
+                subswath_values = ds['subswath'].values
+                assert len(np.unique(subswath_values)) == 1, \
+                    f'subswath must be constant per burst, got: {np.unique(subswath_values)}'
+                ds.attrs['subswath'] = str(subswath_values[0])
+            # pathNumber can vary (e.g. S1A vs S1B), use minimum value for consistency
+            if 'pathNumber' in ds.data_vars:
+                ds.attrs['pathNumber'] = int(np.min(ds['pathNumber'].values))
 
             # add transform variables
             for var in transform.data_vars:
