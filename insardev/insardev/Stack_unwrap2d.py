@@ -2022,9 +2022,11 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 if conncomp and comp_da is not None:
                     comp_vars[var] = comp_da
 
-            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
+            # Compute coordinates to avoid lazy BPR in output
+            computed_coords = {k: (v.compute() if hasattr(v, 'compute') else v) for k, v in phase_ds.coords.items()}
+            unwrap_result[key] = xr.Dataset(unwrap_vars, coords=computed_coords, attrs=phase_ds.attrs)
             if conncomp:
-                conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+                conncomp_result[key] = xr.Dataset(comp_vars, coords=computed_coords, attrs=phase_ds.attrs)
 
         # use Batch (not BatchWrap) to avoid re-wrapping the unwrapped phase
         if conncomp:
@@ -2188,9 +2190,11 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 if conncomp and comp_da is not None:
                     comp_vars[var] = comp_da
 
-            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
+            # Compute coordinates to avoid lazy BPR in output
+            computed_coords = {k: (v.compute() if hasattr(v, 'compute') else v) for k, v in phase_ds.coords.items()}
+            unwrap_result[key] = xr.Dataset(unwrap_vars, coords=computed_coords, attrs=phase_ds.attrs)
             if conncomp:
-                conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+                conncomp_result[key] = xr.Dataset(comp_vars, coords=computed_coords, attrs=phase_ds.attrs)
 
         # use Batch (not BatchWrap) to avoid re-wrapping the unwrapped phase
         if conncomp:
@@ -2345,9 +2349,11 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 if conncomp and comp_da is not None:
                     comp_vars[var] = comp_da
 
-            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
+            # Compute coordinates to avoid lazy BPR in output
+            computed_coords = {k: (v.compute() if hasattr(v, 'compute') else v) for k, v in phase_ds.coords.items()}
+            unwrap_result[key] = xr.Dataset(unwrap_vars, coords=computed_coords, attrs=phase_ds.attrs)
             if conncomp:
-                conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+                conncomp_result[key] = xr.Dataset(comp_vars, coords=computed_coords, attrs=phase_ds.attrs)
 
         # use Batch (not BatchWrap) to avoid re-wrapping the unwrapped phase
         if conncomp:
@@ -2425,7 +2431,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 reordered_vars[var] = reordered_da
 
-            result[key] = xr.Dataset(reordered_vars, attrs=ds.attrs)
+            result[key] = xr.Dataset(reordered_vars, coords=ds.coords, attrs=ds.attrs)
 
         return BatchUnit(result)
 
@@ -2527,7 +2533,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 linked_vars[var] = linked_da
 
-            result[key] = xr.Dataset(linked_vars, attrs=ds.attrs)
+            result[key] = xr.Dataset(linked_vars, coords=ds.coords, attrs=ds.attrs)
 
         return Batch(result)
 
