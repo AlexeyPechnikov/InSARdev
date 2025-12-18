@@ -111,8 +111,7 @@ class S1_slc(S1_base):
         path_numbers = df.pathNumber.unique().tolist()
         min_dates = [str(df[df.pathNumber==path].startTime.dt.date.min()) for path in path_numbers]
         if len(path_numbers) > 1:
-            print (f'WARNING: Multiple path numbers found in the dataset: {", ".join(map(str, path_numbers))}.')
-            print ('WARNING: You can process only one path number at a time selecting the corresponding reference date.')
+            print (f'NOTE: Multiple path numbers found in the dataset: {", ".join(map(str, path_numbers))}.')
             print (f'NOTE: The following reference dates are available: {", ".join(min_dates)}.')
         print (f'NOTE: Loaded {len(df)} bursts.')
         self.df = df
