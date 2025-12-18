@@ -41,7 +41,6 @@ class Stack_phasediff(Stack_base):
             raise ValueError('wavelength is required to define spatial correlation for Goldstein filtering')
 
         pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
-        print ('pairs', pairs)
         ref_dates = pairs[:,0]
         rep_dates = pairs[:,1]
 
@@ -49,9 +48,9 @@ class Stack_phasediff(Stack_base):
         if weight is not None:
             data = data.reindex_like(weight, fill_value=np.nan)
 
-        data1 = data.isel(date=ref_dates).rename(date='pair')
-        data2 = data.isel(date=rep_dates).rename(date='pair')
-        phasediff = data1.drop_vars('pair') * data2.drop_vars('pair').conj()
+        data1 = self.isel(date=ref_dates).rename(date='pair')
+        data2 = self.isel(date=rep_dates).rename(date='pair')
+        phasediff = BatchComplex(data1).drop_vars('pair') * BatchComplex(data2).drop_vars('pair').conj()
         if phase is not None:
             phasediff = phasediff * (phase.iexp(-1) if not isinstance(phase, BatchComplex) else phase)
 
@@ -82,10 +81,17 @@ class Stack_phasediff(Stack_base):
         if not complex:
             phasediff_look = phasediff_look.angle()
 
-        def as_xarray(da):
-            return da.assign_coords(
-                ref=('pair', data1.coords['pair']),
-                rep=('pair', data2.coords['pair'])
+        # BPR differences aligned with pair dimension: BPR(ref) - BPR(rep)
+        bpr = data1[['BPR']].drop_vars('pair') - data2[['BPR']].drop_vars('pair')
+        #print ('bpr', bpr.to_dict())
+
+        def as_xarray(batch):
+            # Add ref/rep/BPR as coordinates along pair dimension
+            # BPR is passed as a Batch for per-burst assignment
+            return batch.assign_coords(
+                ref=('pair', data1.coords['pair'].values),
+                rep=('pair', data2.coords['pair'].values),
+                BPR=('pair', bpr)
             ).set_index(pair=['ref', 'rep'])
         
         if corr_look is None:
@@ -103,5 +109,3 @@ class Stack_phasediff(Stack_base):
         from .Batch import BatchComplex
         kwarg['multilook'] = True
         return self.phasediff(*args, **kwarg)
-        #intfs, corrs = self.phasediff(**kwarg)
-        #return BatchWrap(intfs), BatchUnit(corrs)
