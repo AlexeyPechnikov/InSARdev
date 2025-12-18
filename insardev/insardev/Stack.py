@@ -27,6 +27,18 @@ class Stack(Stack_plot, BatchCore):
         #print('Stack __init__', 0 if mapping is None else len(mapping))
         super().__init__(mapping)
 
+    @property
+    def coords(self):
+        """Return coordinates from the first dataset in the stack.
+        
+        All datasets in a Stack share the same coordinate structure,
+        so we expose the first one's coords for convenience.
+        """
+        if not self:
+            return None
+        first_ds = next(iter(self.values()))
+        return first_ds.coords
+
     def PRM(self, keys: str | list[str] | None = None) -> dict:
         """Return platform parameters per burst.
 
@@ -791,32 +803,13 @@ class Stack(Stack_plot, BatchCore):
             if wavelength is None or slant_start is None or slant_end is None:
                 raise KeyError(f"Missing parameters in transform for burst {key}: radar_wavelength, SC_height_start, SC_height_end")
 
-            def _extract_baseline(source: xr.Dataset | None):
-                if source is None:
-                    return None
-                bpr = _scalar_from_ds(source, 'BPR')
-                if bpr is None and 'BPR' in source:
-                    bpr_da = source['BPR']
-                    arr = np.asarray(bpr_da).ravel()
-                    arr = arr[np.isfinite(arr)]
-                    # prefer the first non-zero entry; fall back to the first finite value
-                    if arr.size:
-                        nonzero = arr[np.abs(arr) > 1e-9]
-                        pick = nonzero[0] if nonzero.size else arr[0]
-                        bpr = float(pick)
-                if bpr is None:
-                    return None
-                bpr_val = float(bpr)
-                return None if np.isnan(bpr_val) or abs(bpr_val) < 1e-9 else bpr_val
-
-            if baseline is None:
-                baseline_val = _extract_baseline(tfm)
-                if baseline_val is None:
-                    baseline_val = _extract_baseline(phase_ds)
+            # Get BPR - either scalar or per-pair DataArray for broadcasting
+            if baseline is not None:
+                bpr = float(baseline)
+            elif 'BPR' in phase_ds.coords:
+                # Use BPR as DataArray to broadcast correctly across pairs
+                bpr = phase_ds.coords['BPR']
             else:
-                baseline_val = float(baseline)
-
-            if baseline_val is None:
                 raise KeyError(f"Missing baseline (BPR) for burst {key}")
 
             inc_da = incidence_batch[key]['incidence']
@@ -835,7 +828,10 @@ class Stack(Stack_plot, BatchCore):
                     incidence = inc_da.reindex_like(data, method='nearest')
                     slant = slant_range.reindex_like(data.x, method='nearest')
 
-                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * baseline_val))
+                # Height from phase formula (PyGMTSAR convention):
+                # h = -λ * φ * R * cos(incidence) / (4π * B⊥)
+                # BPR broadcasts across pair dimension automatically
+                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
                 name = 'ele' if len(phase_ds.data_vars) == 1 else f'{var_name}_ele'
                 elev_vars[name] = elev.astype('float32')
 
