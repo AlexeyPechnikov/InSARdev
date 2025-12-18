@@ -92,16 +92,16 @@ class Stack_phasediff(Stack_base):
             return as_xarray(phasediff_look)
         return (as_xarray(da) for da in [phasediff_look, corr_look])
 
-    def phasediff_singlelook(self, **kwarg):
+    def phasediff_singlelook(self, *args, **kwarg):
         from .Batch import BatchComplex
         kwarg['multilook'] = False
-        return self.phasediff(**kwarg)
+        return self.phasediff(*args, **kwarg)
         #intfs, corrs = self.phasediff(**kwarg)
         #return BatchWrap(intfs), BatchUnit(corrs)
 
-    def phasediff_multilook(self, **kwarg):
+    def phasediff_multilook(self, *args, **kwarg):
         from .Batch import BatchComplex
         kwarg['multilook'] = True
-        return self.phasediff(**kwarg)
+        return self.phasediff(*args, **kwarg)
         #intfs, corrs = self.phasediff(**kwarg)
         #return BatchWrap(intfs), BatchUnit(corrs)
