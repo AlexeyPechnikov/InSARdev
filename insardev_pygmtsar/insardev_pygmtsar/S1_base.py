@@ -33,10 +33,11 @@ class S1_base(progressbar_joblib, datagrid):
         if ref is None:
             df = self.df
         else:
-            path_number = self.df[self.df.startTime.dt.date.astype(str)==ref].pathNumber.unique()
-            if len(path_number) == 0:
+            # Get fullBurstIDs from reference date and filter all bursts by them
+            ref_fullBurstIDs = self.df[self.df.startTime.dt.date.astype(str)==ref].index.get_level_values(0).unique()
+            if len(ref_fullBurstIDs) == 0:
                 return self.df
-            df = self.df[self.df.pathNumber==path_number[0]]
+            df = self.df[self.df.index.get_level_values(0).isin(ref_fullBurstIDs)]
         return df.set_crs(4326).to_crs(crs)
 
     def PRM(self, burst: str, basedir) -> PRM:
