@@ -1290,7 +1290,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     @staticmethod
     def _minflow_unwrap_2d_single(phase, correlation=None, debug=False):
-        """Core minflow implementation for a single connected component."""
+        """Core minflow implementation for a single connected component.
+
+        Memory-optimized: uses numpy arrays instead of Python dicts for lookups.
+        """
         from ortools.graph.python import min_cost_flow
         from collections import deque
         from scipy import ndimage
@@ -1343,15 +1346,45 @@ class Stack_unwrap2d(Stack_unwrap1d):
         if not np.any(valid_mask):
             return np.full(shape, np.nan, dtype=np.float32)
 
-        # Get edges for valid pixels only
-        all_edges = Stack_unwrap2d._get_2d_edges(shape)
-        valid_edges_mask = valid_mask[all_edges[:, 0]] & valid_mask[all_edges[:, 1]]
-        edges = all_edges[valid_edges_mask]
+        # Vectorized edge construction using numpy operations
+        valid_mask_2d_for_edges = valid_mask.reshape(height, width)
 
-        if len(edges) == 0:
+        # Horizontal edges: pixel (r,c) to (r,c+1)
+        # Valid where both left and right pixels are valid
+        h_valid = valid_mask_2d_for_edges[:, :-1] & valid_mask_2d_for_edges[:, 1:]
+        h_edge_idx = np.full((height, width - 1), -1, dtype=np.int32)
+        h_valid_flat = h_valid.ravel()
+        n_h_edges = np.sum(h_valid_flat)
+        h_edge_idx[h_valid] = np.arange(n_h_edges, dtype=np.int32)
+
+        # Build horizontal edge pixel pairs vectorized
+        h_rows, h_cols = np.where(h_valid)
+        h_left = h_rows * width + h_cols
+        h_right = h_left + 1
+
+        # Vertical edges: pixel (r,c) to (r+1,c)
+        # Valid where both top and bottom pixels are valid
+        v_valid = valid_mask_2d_for_edges[:-1, :] & valid_mask_2d_for_edges[1:, :]
+        v_edge_idx = np.full((height - 1, width), -1, dtype=np.int32)
+        v_valid_flat = v_valid.ravel()
+        n_v_edges = np.sum(v_valid_flat)
+        v_edge_idx[v_valid] = np.arange(n_h_edges, n_h_edges + n_v_edges, dtype=np.int32)
+
+        # Build vertical edge pixel pairs vectorized
+        v_rows, v_cols = np.where(v_valid)
+        v_top = v_rows * width + v_cols
+        v_bot = v_top + width
+
+        n_edges = n_h_edges + n_v_edges
+        if n_edges == 0:
             return np.full(shape, np.nan, dtype=np.float32)
 
-        n_edges = len(edges)
+        # Build combined edge array
+        edges = np.empty((n_edges, 2), dtype=np.int32)
+        edges[:n_h_edges, 0] = h_left
+        edges[:n_h_edges, 1] = h_right
+        edges[n_h_edges:, 0] = v_top
+        edges[n_h_edges:, 1] = v_bot
         n_nodes = phase_flat.size
 
         # Compute wrapped phase differences (in cycles)
@@ -1366,13 +1399,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
         else:
             edge_costs = np.ones(n_edges, dtype=np.int64) * 1000
 
-        # Build edge lookup: (pixel_i, pixel_j) -> (edge_idx, direction)
-        edge_dict = {}
-        for idx in range(n_edges):
-            i, j = int(edges[idx, 0]), int(edges[idx, 1])
-            edge_dict[(i, j)] = (idx, 1)
-            edge_dict[(j, i)] = (idx, -1)
-
         # Dual grid dimensions
         dual_height = height - 1
         dual_width = width - 1
@@ -1381,270 +1407,291 @@ class Stack_unwrap2d(Stack_unwrap1d):
             # No dual nodes - trivial unwrapping
             k = np.zeros(n_edges, dtype=np.float64)
         else:
-            # First pass: identify valid dual nodes (2x2 cells with all 4 corners valid)
-            # and compute their residues
-            valid_dual_nodes = []  # list of (r, c) for valid dual nodes
-            dual_to_idx = {}  # (r, c) -> index in valid_dual_nodes
-            residue_list = []
+            # Vectorized dual node identification and residue computation
+            # A valid dual node at (r,c) requires all 4 corners valid and all 4 edges exist
 
-            for r in range(dual_height):
-                for c in range(dual_width):
-                    tl = r * width + c
-                    tr = tl + 1
-                    bl = tl + width
-                    br = bl + 1
+            # Check 4 corners validity
+            tl_valid = valid_mask_2d[:-1, :-1]
+            tr_valid = valid_mask_2d[:-1, 1:]
+            bl_valid = valid_mask_2d[1:, :-1]
+            br_valid = valid_mask_2d[1:, 1:]
+            corners_valid = tl_valid & tr_valid & bl_valid & br_valid
 
-                    if not (valid_mask[tl] and valid_mask[tr] and
-                            valid_mask[bl] and valid_mask[br]):
-                        continue
+            # Check 4 edges exist
+            h_top_exists = h_edge_idx[:-1, :] >= 0  # top horizontal edge
+            h_bot_exists = h_edge_idx[1:, :] >= 0   # bottom horizontal edge
+            v_left_exists = v_edge_idx[:, :-1] >= 0  # left vertical edge
+            v_right_exists = v_edge_idx[:, 1:] >= 0  # right vertical edge
 
-                    if ((tl, tr) not in edge_dict or (tr, br) not in edge_dict or
-                        (br, bl) not in edge_dict or (bl, tl) not in edge_dict):
-                        continue
+            valid_dual_mask = corners_valid & h_top_exists & h_bot_exists & v_left_exists & v_right_exists
 
-                    e1, d1 = edge_dict[(tl, tr)]
-                    e2, d2 = edge_dict[(tr, br)]
-                    e3, d3 = edge_dict[(br, bl)]
-                    e4, d4 = edge_dict[(bl, tl)]
+            # Get dual node coordinates
+            dual_rows, dual_cols = np.where(valid_dual_mask)
+            n_valid_dual = len(dual_rows)
 
-                    cycle_sum = (d1 * phase_diff_wrapped[e1] + d2 * phase_diff_wrapped[e2] +
-                                d3 * phase_diff_wrapped[e3] + d4 * phase_diff_wrapped[e4])
-                    residue = int(np.round(cycle_sum))
-
-                    dual_to_idx[(r, c)] = len(valid_dual_nodes)
-                    valid_dual_nodes.append((r, c))
-                    residue_list.append(residue)
-
-            n_valid_dual = len(valid_dual_nodes)
-            residues = np.array(residue_list, dtype=np.int32) if residue_list else np.array([], dtype=np.int32)
-            total_residue = int(np.sum(residues))
-            n_nonzero = np.count_nonzero(residues)
-
-            if n_nonzero == 0 or n_valid_dual == 0:
+            if n_valid_dual == 0:
                 k = np.zeros(n_edges, dtype=np.float64)
             else:
-                # Build MCF network on dual grid using only valid dual nodes
-                # Each arc represents a pixel edge; flow = k value
-                smcf = min_cost_flow.SimpleMinCostFlow()
+                # Create dual node index lookup array (memory-efficient vs dict)
+                dual_to_idx = np.full((dual_height, dual_width), -1, dtype=np.int32)
+                dual_to_idx[dual_rows, dual_cols] = np.arange(n_valid_dual, dtype=np.int32)
 
-                # Node indices: 0..n_valid_dual-1 are valid interior dual nodes
-                # n_valid_dual is the boundary node
-                boundary_node = n_valid_dual
+                # Compute residues vectorized
+                e1 = h_edge_idx[dual_rows, dual_cols]      # top horizontal
+                e2 = v_edge_idx[dual_rows, dual_cols + 1]  # right vertical
+                e3 = h_edge_idx[dual_rows + 1, dual_cols]  # bottom horizontal
+                e4 = v_edge_idx[dual_rows, dual_cols]      # left vertical
 
-                arc_start = []
-                arc_end = []
-                arc_capacity = []
-                arc_cost = []
-                arc_to_edge = []
-                arc_direction = []
+                # Directions: top(+1), right(+1), bottom(-1), left(-1)
+                cycle_sum = (phase_diff_wrapped[e1] + phase_diff_wrapped[e2]
+                            - phase_diff_wrapped[e3] - phase_diff_wrapped[e4])
+                residues = np.round(cycle_sum).astype(np.int32)
+                total_residue = int(np.sum(residues))
+                n_nonzero = np.count_nonzero(residues)
 
-                max_cap = max(100, abs(total_residue) + 10)
-
-                # Helper to add bidirectional arcs
-                def add_arc_pair(node1, node2, e_idx, cost, dir_sign):
-                    arc_start.append(node1)
-                    arc_end.append(node2)
-                    arc_capacity.append(max_cap)
-                    arc_cost.append(cost)
-                    arc_to_edge.append(e_idx)
-                    arc_direction.append(dir_sign)
-
-                    arc_start.append(node2)
-                    arc_end.append(node1)
-                    arc_capacity.append(max_cap)
-                    arc_cost.append(cost)
-                    arc_to_edge.append(e_idx)
-                    arc_direction.append(-dir_sign)
-
-                # Horizontal arcs between adjacent valid dual nodes (cross vertical pixel edges)
-                for r in range(dual_height):
-                    for c in range(dual_width - 1):
-                        if (r, c) not in dual_to_idx or (r, c + 1) not in dual_to_idx:
-                            continue
-                        dual_left = dual_to_idx[(r, c)]
-                        dual_right = dual_to_idx[(r, c + 1)]
-                        pixel_top = r * width + (c + 1)
-                        pixel_bot = (r + 1) * width + (c + 1)
-
-                        if (pixel_top, pixel_bot) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_top, pixel_bot)]
-                            # Negate direction: flow from left to right should DECREASE k
-                            # to properly cancel residue at left cell
-                            add_arc_pair(dual_left, dual_right, e_idx, int(edge_costs[e_idx]), -e_dir)
-
-                # Vertical arcs between adjacent valid dual nodes (cross horizontal pixel edges)
-                for r in range(dual_height - 1):
-                    for c in range(dual_width):
-                        if (r, c) not in dual_to_idx or (r + 1, c) not in dual_to_idx:
-                            continue
-                        dual_top = dual_to_idx[(r, c)]
-                        dual_bot = dual_to_idx[(r + 1, c)]
-                        pixel_left = (r + 1) * width + c
-                        pixel_right = (r + 1) * width + c + 1
-
-                        if (pixel_left, pixel_right) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_left, pixel_right)]
-                            add_arc_pair(dual_top, dual_bot, e_idx, int(edge_costs[e_idx]), e_dir)  # Removed negation
-
-                # Boundary connections: connect each valid dual node to boundary
-                # A dual node at (r, c) is on the boundary of the valid region if any
-                # of its 4 neighbors is not a valid dual node
-                # Track which pixel edges AND which node pairs have been connected
-                # to avoid duplicate arcs (parallel arcs between same node pair cause issues)
-                boundary_edges_connected = set()
-                boundary_node_pairs = set()  # Track (dual_idx, boundary_node) pairs
-
-                for r, c in valid_dual_nodes:
-                    dual_idx = dual_to_idx[(r, c)]
-
-                    # Only allow one boundary connection per dual node
-                    # (corner nodes would otherwise get multiple connections)
-                    if dual_idx in boundary_node_pairs:
-                        continue
-
-                    # Check top boundary (r == 0 or (r-1, c) not valid)
-                    if r == 0 or (r - 1, c) not in dual_to_idx:
-                        pixel_left = r * width + c
-                        pixel_right = r * width + c + 1
-                        if (pixel_left, pixel_right) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_left, pixel_right)]
-                            if e_idx not in boundary_edges_connected:
-                                add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), e_dir)
-                                boundary_edges_connected.add(e_idx)
-                                boundary_node_pairs.add(dual_idx)
-                                continue  # Only one boundary connection per dual node
-
-                    # Check bottom boundary (r == dual_height-1 or (r+1, c) not valid)
-                    # Boundary is BELOW the cell - use -e_dir (reverse of interior vertical arc)
-                    if r == dual_height - 1 or (r + 1, c) not in dual_to_idx:
-                        pixel_left = (r + 1) * width + c
-                        pixel_right = (r + 1) * width + c + 1
-                        if (pixel_left, pixel_right) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_left, pixel_right)]
-                            if e_idx not in boundary_edges_connected:
-                                add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), -e_dir)
-                                boundary_edges_connected.add(e_idx)
-                                boundary_node_pairs.add(dual_idx)
-                                continue  # Only one boundary connection per dual node
-
-                    # Check left boundary (c == 0 or (r, c-1) not valid)
-                    # This is a vertical edge - use -e_dir like interior horizontal arcs
-                    if c == 0 or (r, c - 1) not in dual_to_idx:
-                        pixel_top = r * width + c
-                        pixel_bot = (r + 1) * width + c
-                        if (pixel_top, pixel_bot) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_top, pixel_bot)]
-                            if e_idx not in boundary_edges_connected:
-                                add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), -e_dir)
-                                boundary_edges_connected.add(e_idx)
-                                boundary_node_pairs.add(dual_idx)
-                                continue  # Only one boundary connection per dual node
-
-                    # Check right boundary (c == dual_width-1 or (r, c+1) not valid)
-                    # Boundary is to the RIGHT of cell - use +e_dir (opposite of left boundary)
-                    if c == dual_width - 1 or (r, c + 1) not in dual_to_idx:
-                        pixel_top = r * width + (c + 1)
-                        pixel_bot = (r + 1) * width + (c + 1)
-                        if (pixel_top, pixel_bot) in edge_dict:
-                            e_idx, e_dir = edge_dict[(pixel_top, pixel_bot)]
-                            if e_idx not in boundary_edges_connected:
-                                add_arc_pair(boundary_node, dual_idx, e_idx, int(edge_costs[e_idx]), e_dir)
-                                boundary_edges_connected.add(e_idx)
-                                boundary_node_pairs.add(dual_idx)
-
-                if debug:
-                    print(f'    DEBUG: {len(boundary_edges_connected)} unique boundary edges connected')
-                    # Check for duplicate arcs
-                    arc_pairs = {}
-                    for i in range(len(arc_start)):
-                        pair = (arc_start[i], arc_end[i])
-                        if pair not in arc_pairs:
-                            arc_pairs[pair] = []
-                        arc_pairs[pair].append(i)
-                    n_dup = sum(1 for v in arc_pairs.values() if len(v) > 1)
-                    total_dup_arcs = sum(len(v) - 1 for v in arc_pairs.values() if len(v) > 1)
-                    print(f'    DEBUG: {len(arc_start)} arcs, {n_dup} pairs with duplicates, {total_dup_arcs} duplicate arcs')
-                    # Show sample duplicates
-                    if n_dup > 0:
-                        boundary_dups = 0
-                        interior_dups = 0
-                        dup_samples = []
-                        for pair, indices in arc_pairs.items():
-                            if len(indices) > 1:
-                                if boundary_node in pair:
-                                    boundary_dups += len(indices) - 1
-                                    if len(dup_samples) < 3:
-                                        # Get details of this duplicate
-                                        other_node = pair[0] if pair[1] == boundary_node else pair[1]
-                                        e_idxs = [arc_to_edge[i] for i in indices]
-                                        dup_samples.append((pair, e_idxs, indices))
-                                else:
-                                    interior_dups += len(indices) - 1
-                        print(f'    DEBUG: boundary duplicates: {boundary_dups}, interior duplicates: {interior_dups}')
-                        if dup_samples:
-                            for samp in dup_samples[:3]:
-                                print(f'    DEBUG: sample dup: pair={samp[0]}, e_idxs={samp[1]}, arc_indices={samp[2]}')
-
-                if len(arc_start) == 0:
+                if n_nonzero == 0:
                     k = np.zeros(n_edges, dtype=np.float64)
                 else:
-                    smcf.add_arcs_with_capacity_and_unit_cost(
-                        np.array(arc_start, dtype=np.int32),
-                        np.array(arc_end, dtype=np.int32),
-                        np.array(arc_capacity, dtype=np.int64),
-                        np.array(arc_cost, dtype=np.int64)
-                    )
+                    # Build MCF network using vectorized operations
+                    smcf = min_cost_flow.SimpleMinCostFlow()
+                    boundary_node = n_valid_dual
+                    max_cap = max(100, abs(total_residue) + 10)
 
-                    n_total_nodes = n_valid_dual + 1
-                    supplies = np.zeros(n_total_nodes, dtype=np.int64)
-                    supplies[:n_valid_dual] = residues
-                    supplies[boundary_node] = -total_residue
+                    # Collect all arcs in lists, then convert to arrays at end
+                    arc_lists = {'start': [], 'end': [], 'capacity': [], 'cost': [], 'edge': [], 'dir': []}
 
-                    smcf.set_nodes_supplies(np.arange(n_total_nodes, dtype=np.int32), supplies)
+                    def add_arcs_vectorized(nodes1, nodes2, e_idxs, costs, dir_signs):
+                        """Add bidirectional arcs from arrays."""
+                        n = len(nodes1)
+                        if n == 0:
+                            return
+                        arc_lists['start'].append(np.concatenate([nodes1, nodes2]))
+                        arc_lists['end'].append(np.concatenate([nodes2, nodes1]))
+                        arc_lists['capacity'].append(np.full(2 * n, max_cap, dtype=np.int64))
+                        arc_lists['cost'].append(np.concatenate([costs, costs]))
+                        arc_lists['edge'].append(np.concatenate([e_idxs, e_idxs]))
+                        arc_lists['dir'].append(np.concatenate([dir_signs, -dir_signs]))
 
-                    status = smcf.solve()
+                    # Vectorized horizontal arcs (between horizontally adjacent dual nodes)
+                    # These cross vertical pixel edges at column c+1
+                    has_right = dual_cols + 1 < dual_width
+                    right_idx = np.where(has_right)[0]
+                    if len(right_idx) > 0:
+                        r_r, c_r = dual_rows[right_idx], dual_cols[right_idx]
+                        right_dual = dual_to_idx[r_r, c_r + 1]
+                        valid_right = right_dual >= 0
+                        if np.any(valid_right):
+                            idx_valid = right_idx[valid_right]
+                            r_v, c_v = dual_rows[idx_valid], dual_cols[idx_valid]
+                            e_idx = v_edge_idx[r_v, c_v + 1]
+                            edge_valid = e_idx >= 0
+                            if np.any(edge_valid):
+                                final_idx = idx_valid[edge_valid]
+                                final_e = e_idx[edge_valid]
+                                final_right = dual_to_idx[dual_rows[final_idx], dual_cols[final_idx] + 1]
+                                add_arcs_vectorized(
+                                    final_idx.astype(np.int32), final_right.astype(np.int32),
+                                    final_e.astype(np.int32), edge_costs[final_e],
+                                    np.full(len(final_idx), -1, dtype=np.int8)
+                                )
 
-                    if status != smcf.OPTIMAL:
-                        import warnings
-                        warnings.warn(f'Minflow solver failed with status {status}, returning NaN', RuntimeWarning)
-                        return np.full(shape, np.nan, dtype=np.float32)
+                    # Vectorized vertical arcs (between vertically adjacent dual nodes)
+                    # These cross horizontal pixel edges at row r+1
+                    has_bot = dual_rows + 1 < dual_height
+                    bot_idx = np.where(has_bot)[0]
+                    if len(bot_idx) > 0:
+                        r_b, c_b = dual_rows[bot_idx], dual_cols[bot_idx]
+                        bot_dual = dual_to_idx[r_b + 1, c_b]
+                        valid_bot = bot_dual >= 0
+                        if np.any(valid_bot):
+                            idx_valid = bot_idx[valid_bot]
+                            r_v, c_v = dual_rows[idx_valid], dual_cols[idx_valid]
+                            e_idx = h_edge_idx[r_v + 1, c_v]
+                            edge_valid = e_idx >= 0
+                            if np.any(edge_valid):
+                                final_idx = idx_valid[edge_valid]
+                                final_e = e_idx[edge_valid]
+                                final_bot = dual_to_idx[dual_rows[final_idx] + 1, dual_cols[final_idx]]
+                                add_arcs_vectorized(
+                                    final_idx.astype(np.int32), final_bot.astype(np.int32),
+                                    final_e.astype(np.int32), edge_costs[final_e],
+                                    np.full(len(final_idx), 1, dtype=np.int8)
+                                )
 
-                    # Extract k values from flow
-                    k = np.zeros(n_edges, dtype=np.float64)
-                    n_arcs = len(arc_start)
-                    edges_with_multiple_flows = {}  # Track edges receiving flow from multiple arcs
-                    for arc in range(n_arcs):
-                        flow = smcf.flow(arc)
-                        if flow != 0:
-                            e_idx = arc_to_edge[arc]
-                            direction = arc_direction[arc]
-                            if e_idx not in edges_with_multiple_flows:
-                                edges_with_multiple_flows[e_idx] = []
-                            edges_with_multiple_flows[e_idx].append((arc, flow, direction))
-                            k[e_idx] += flow * direction
+                    # Boundary connections - vectorized detection of boundary nodes
+                    # A dual node is on boundary if any neighbor is invalid
+                    top_neighbor = np.where(dual_rows > 0, dual_to_idx[np.maximum(dual_rows - 1, 0), dual_cols], -1)
+                    bot_neighbor = np.where(dual_rows < dual_height - 1, dual_to_idx[np.minimum(dual_rows + 1, dual_height - 1), dual_cols], -1)
+                    left_neighbor = np.where(dual_cols > 0, dual_to_idx[dual_rows, np.maximum(dual_cols - 1, 0)], -1)
+                    right_neighbor = np.where(dual_cols < dual_width - 1, dual_to_idx[dual_rows, np.minimum(dual_cols + 1, dual_width - 1)], -1)
+
+                    is_top_boundary = (dual_rows == 0) | (top_neighbor < 0)
+                    is_bot_boundary = (dual_rows == dual_height - 1) | (bot_neighbor < 0)
+                    is_left_boundary = (dual_cols == 0) | (left_neighbor < 0)
+                    is_right_boundary = (dual_cols == dual_width - 1) | (right_neighbor < 0)
+
+                    # Connect boundary nodes - use priority: top > bottom > left > right
+                    # Track which nodes are already connected
+                    connected = np.zeros(n_valid_dual, dtype=bool)
+                    boundary_edges_used = set()
+
+                    # Top boundary connections
+                    top_candidates = np.where(is_top_boundary & ~connected)[0]
+                    if len(top_candidates) > 0:
+                        r_t, c_t = dual_rows[top_candidates], dual_cols[top_candidates]
+                        e_idx = h_edge_idx[r_t, c_t]
+                        valid_e = e_idx >= 0
+                        for i, idx in enumerate(top_candidates):
+                            if valid_e[i] and e_idx[i] not in boundary_edges_used:
+                                arc_lists['start'].append(np.array([boundary_node, idx], dtype=np.int32))
+                                arc_lists['end'].append(np.array([idx, boundary_node], dtype=np.int32))
+                                arc_lists['capacity'].append(np.array([max_cap, max_cap], dtype=np.int64))
+                                arc_lists['cost'].append(np.array([edge_costs[e_idx[i]], edge_costs[e_idx[i]]], dtype=np.int64))
+                                arc_lists['edge'].append(np.array([e_idx[i], e_idx[i]], dtype=np.int32))
+                                arc_lists['dir'].append(np.array([1, -1], dtype=np.int8))
+                                boundary_edges_used.add(e_idx[i])
+                                connected[idx] = True
+
+                    # Bottom boundary connections
+                    bot_candidates = np.where(is_bot_boundary & ~connected)[0]
+                    if len(bot_candidates) > 0:
+                        r_b, c_b = dual_rows[bot_candidates], dual_cols[bot_candidates]
+                        e_idx = h_edge_idx[r_b + 1, c_b]
+                        valid_e = e_idx >= 0
+                        for i, idx in enumerate(bot_candidates):
+                            if valid_e[i] and e_idx[i] not in boundary_edges_used:
+                                arc_lists['start'].append(np.array([boundary_node, idx], dtype=np.int32))
+                                arc_lists['end'].append(np.array([idx, boundary_node], dtype=np.int32))
+                                arc_lists['capacity'].append(np.array([max_cap, max_cap], dtype=np.int64))
+                                arc_lists['cost'].append(np.array([edge_costs[e_idx[i]], edge_costs[e_idx[i]]], dtype=np.int64))
+                                arc_lists['edge'].append(np.array([e_idx[i], e_idx[i]], dtype=np.int32))
+                                arc_lists['dir'].append(np.array([-1, 1], dtype=np.int8))
+                                boundary_edges_used.add(e_idx[i])
+                                connected[idx] = True
+
+                    # Left boundary connections
+                    left_candidates = np.where(is_left_boundary & ~connected)[0]
+                    if len(left_candidates) > 0:
+                        r_l, c_l = dual_rows[left_candidates], dual_cols[left_candidates]
+                        e_idx = v_edge_idx[r_l, c_l]
+                        valid_e = e_idx >= 0
+                        for i, idx in enumerate(left_candidates):
+                            if valid_e[i] and e_idx[i] not in boundary_edges_used:
+                                arc_lists['start'].append(np.array([boundary_node, idx], dtype=np.int32))
+                                arc_lists['end'].append(np.array([idx, boundary_node], dtype=np.int32))
+                                arc_lists['capacity'].append(np.array([max_cap, max_cap], dtype=np.int64))
+                                arc_lists['cost'].append(np.array([edge_costs[e_idx[i]], edge_costs[e_idx[i]]], dtype=np.int64))
+                                arc_lists['edge'].append(np.array([e_idx[i], e_idx[i]], dtype=np.int32))
+                                arc_lists['dir'].append(np.array([-1, 1], dtype=np.int8))
+                                boundary_edges_used.add(e_idx[i])
+                                connected[idx] = True
+
+                    # Right boundary connections
+                    right_candidates = np.where(is_right_boundary & ~connected)[0]
+                    if len(right_candidates) > 0:
+                        r_r, c_r = dual_rows[right_candidates], dual_cols[right_candidates]
+                        e_idx = v_edge_idx[r_r, c_r + 1]
+                        valid_e = e_idx >= 0
+                        for i, idx in enumerate(right_candidates):
+                            if valid_e[i] and e_idx[i] not in boundary_edges_used:
+                                arc_lists['start'].append(np.array([boundary_node, idx], dtype=np.int32))
+                                arc_lists['end'].append(np.array([idx, boundary_node], dtype=np.int32))
+                                arc_lists['capacity'].append(np.array([max_cap, max_cap], dtype=np.int64))
+                                arc_lists['cost'].append(np.array([edge_costs[e_idx[i]], edge_costs[e_idx[i]]], dtype=np.int64))
+                                arc_lists['edge'].append(np.array([e_idx[i], e_idx[i]], dtype=np.int32))
+                                arc_lists['dir'].append(np.array([1, -1], dtype=np.int8))
+                                boundary_edges_used.add(e_idx[i])
+                                connected[idx] = True
+
+                    # Concatenate all arc arrays
+                    if arc_lists['start']:
+                        arc_start = np.concatenate(arc_lists['start'])
+                        arc_end = np.concatenate(arc_lists['end'])
+                        arc_capacity = np.concatenate(arc_lists['capacity'])
+                        arc_cost = np.concatenate(arc_lists['cost'])
+                        arc_to_edge = np.concatenate(arc_lists['edge'])
+                        arc_direction = np.concatenate(arc_lists['dir'])
+                    else:
+                        arc_start = np.array([], dtype=np.int32)
+                        arc_end = np.array([], dtype=np.int32)
+                        arc_capacity = np.array([], dtype=np.int64)
+                        arc_cost = np.array([], dtype=np.int64)
+                        arc_to_edge = np.array([], dtype=np.int32)
+                        arc_direction = np.array([], dtype=np.int8)
 
                     if debug:
-                        multi_flow = [(e, flows) for e, flows in edges_with_multiple_flows.items() if len(flows) > 1]
-                        if multi_flow:
-                            print(f'    DEBUG: {len(multi_flow)} edges receiving flow from multiple arcs')
-                            for e, flows in multi_flow[:3]:
-                                total = sum(f * d for a, f, d in flows)
-                                print(f'    DEBUG: edge {e}: flows={[(f,d) for a,f,d in flows]}, total k={total}')
+                        print(f'    DEBUG: {len(boundary_edges_used)} unique boundary edges connected')
+                        print(f'    DEBUG: {len(arc_start)} arcs total')
+
+                    if len(arc_start) == 0:
+                        k = np.zeros(n_edges, dtype=np.float64)
+                    else:
+                        smcf.add_arcs_with_capacity_and_unit_cost(
+                            arc_start.astype(np.int32),
+                            arc_end.astype(np.int32),
+                            arc_capacity.astype(np.int64),
+                            arc_cost.astype(np.int64)
+                        )
+
+                        n_total_nodes = n_valid_dual + 1
+                        supplies = np.zeros(n_total_nodes, dtype=np.int64)
+                        supplies[:n_valid_dual] = residues
+                        supplies[boundary_node] = -total_residue
+
+                        smcf.set_nodes_supplies(np.arange(n_total_nodes, dtype=np.int32), supplies)
+
+                        status = smcf.solve()
+
+                        if status != smcf.OPTIMAL:
+                            import warnings
+                            warnings.warn(f'Minflow solver failed with status {status}, returning NaN', RuntimeWarning)
+                            return np.full(shape, np.nan, dtype=np.float32)
+
+                        # Extract k values from flow - vectorized where possible
+                        k = np.zeros(n_edges, dtype=np.float64)
+                        n_arcs = len(arc_start)
+                        # Get all flows at once using list comprehension (still need individual calls)
+                        flows = np.array([smcf.flow(arc) for arc in range(n_arcs)], dtype=np.int64)
+                        # Use numpy scatter-add for efficiency
+                        nonzero_mask = flows != 0
+                        if np.any(nonzero_mask):
+                            np.add.at(k, arc_to_edge[nonzero_mask],
+                                     flows[nonzero_mask] * arc_direction[nonzero_mask])
+
+                        if debug:
+                            print(f'    DEBUG: {np.count_nonzero(k)} edges with non-zero k')
 
         # Convert edge-based k values to node-based unwrapped phase
         # The unwrapped phase difference across edge (i,j) is:
         #   unwrapped_diff[e] = phase_diff_wrapped[e] + k[e] = unwrapped[j] - unwrapped[i]
         # We integrate these gradients using BFS on a spanning tree.
 
-        # Build adjacency list for BFS integration
-        adj_neighbors = [[] for _ in range(n_nodes)]
-        for e in range(n_edges):
-            i, j = edges[e, 0], edges[e, 1]
-            adj_neighbors[i].append((j, e, 1))
-            adj_neighbors[j].append((i, e, -1))
+        # Memory-optimized BFS using CSR-like sparse adjacency
+        # Build arrays: adj_idx[node] gives start index in adj_data for that node's neighbors
+        # adj_data stores (neighbor, edge_idx, direction) tuples flattened
+        from scipy.sparse import csr_matrix
+
+        # Build adjacency in CSR format for memory efficiency
+        # Each edge contributes 2 entries (one for each direction)
+        row_idx = np.concatenate([edges[:, 0], edges[:, 1]])
+        col_idx = np.concatenate([edges[:, 1], edges[:, 0]])
+        edge_indices = np.concatenate([np.arange(n_edges), np.arange(n_edges)])
+        directions = np.concatenate([np.ones(n_edges, dtype=np.int8), -np.ones(n_edges, dtype=np.int8)])
+
+        # Sort by row to get CSR-like structure
+        sort_idx = np.argsort(row_idx)
+        row_sorted = row_idx[sort_idx]
+        col_sorted = col_idx[sort_idx]
+        edge_sorted = edge_indices[sort_idx]
+        dir_sorted = directions[sort_idx]
+
+        # Build indptr (row pointers)
+        adj_indptr = np.zeros(n_nodes + 1, dtype=np.int32)
+        np.add.at(adj_indptr[1:], row_sorted, 1)
+        np.cumsum(adj_indptr, out=adj_indptr)
 
         if debug:
-            has_neighbors = sum(1 for node in range(n_nodes) if len(adj_neighbors[node]) > 0)
+            has_neighbors = np.sum(adj_indptr[1:] > adj_indptr[:-1])
             print(f'\n    DEBUG: n_nodes={n_nodes}, n_edges={n_edges}, nodes_with_neighbors={has_neighbors}')
             print(f'    DEBUG: n_valid={np.sum(valid_mask)}, k_nonzero={np.count_nonzero(k)}, k_range=[{k.min():.3f}, {k.max():.3f}]')
             print(f'    DEBUG: phase_diff range: [{phase_diff.min():.4f}, {phase_diff.max():.4f}]')
@@ -1653,11 +1700,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         # The unwrapped phase difference across each edge is:
         #   unwrapped_diff[e] = phase_diff_wrapped[e] + k[e]
-        # This is the "gradient" of the unwrapped phase.
-        #
-        # We integrate these gradients using BFS to get the unwrapped phase directly.
-        # Starting from a reference node with its original phase value,
-        # we propagate: unwrapped[j] = unwrapped[i] + unwrapped_diff[e]
         unwrapped_diff = phase_diff_wrapped + k
 
         # BFS to integrate unwrapped phase differences
@@ -1669,16 +1711,16 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 continue
 
             queue = deque([start_node])
-            # Initialize with the original phase value at the starting node
             unwrapped_cycles[start_node] = phase_flat[start_node]
 
             while queue:
                 node = queue.popleft()
-                for neighbor, edge_idx, direction in adj_neighbors[node]:
+                # Get neighbors from CSR structure
+                for idx in range(adj_indptr[node], adj_indptr[node + 1]):
+                    neighbor = col_sorted[idx]
                     if np.isnan(unwrapped_cycles[neighbor]):
-                        # unwrapped_diff[e] = unwrapped[j] - unwrapped[i] for edge from i to j
-                        # direction=+1 means we go from node(=i) to neighbor(=j)
-                        # direction=-1 means we go from node(=j) to neighbor(=i)
+                        edge_idx = edge_sorted[idx]
+                        direction = dir_sorted[idx]
                         unwrapped_cycles[neighbor] = unwrapped_cycles[node] + direction * unwrapped_diff[edge_idx]
                         queue.append(neighbor)
 
@@ -1693,128 +1735,35 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     actual_diff = unwrapped_cycles[j] - unwrapped_cycles[i]
                     expected_diff = unwrapped_diff[e]
                     err = abs(actual_diff - expected_diff)
-                    if err > 0.001:  # significant error
+                    if err > 0.001:
                         errors.append((e, err, actual_diff, expected_diff, k[e]))
             if errors:
                 print(f'    DEBUG: {len(errors)} edges with integration errors > 0.001')
-                # Show distribution of errors
                 err_vals = [e[1] for e in errors]
                 print(f'    DEBUG: error range: [{min(err_vals):.4f}, {max(err_vals):.4f}], mean: {np.mean(err_vals):.4f}')
-                # Show sample errors with pixel positions
-                for e, err, actual, expected, k_val in errors[:5]:
-                    i, j = edges[e, 0], edges[e, 1]
-                    ri, ci = i // width, i % width
-                    rj, cj = j // width, j % width
-                    print(f'    DEBUG: edge ({ri},{ci})-({rj},{cj}): actual={actual:.4f}, expected={expected:.4f}, k={k_val:.4f}')
-                # Analyze error locations
-                error_edge_indices = set(e[0] for e in errors)
-                k_nonzero_edges = set(np.where(k != 0)[0])
-                overlap = error_edge_indices & k_nonzero_edges
-                print(f'    DEBUG: {len(overlap)} error edges have non-zero k (of {len(k_nonzero_edges)} total)')
-                # Check if errors form a connected region
-                error_rows = [edges[e[0], 0] // width for e in errors]
-                error_cols = [edges[e[0], 0] % width for e in errors]
-                print(f'    DEBUG: error edges span rows [{min(error_rows)}, {max(error_rows)}], cols [{min(error_cols)}, {max(error_cols)}]')
-                # Check for holes in the mask
-                valid_mask_2d = valid_mask.reshape(height, width)
-                from scipy import ndimage
-                # Invert mask and find connected NaN regions (holes)
-                hole_labels, n_holes = ndimage.label(~valid_mask_2d)
-                # The largest NaN region is the exterior (not a hole)
-                if n_holes > 0:
-                    hole_sizes = ndimage.sum(~valid_mask_2d, hole_labels, range(1, n_holes + 1))
-                    n_interior_holes = np.sum(np.array(hole_sizes) < np.max(hole_sizes))
-                    if n_interior_holes > 0:
-                        print(f'    DEBUG: {n_interior_holes} interior NaN holes (multiply-connected domain)')
 
-            # Verify that k values make gradient conservative by checking residues
+            # Verify residues using array-based lookup
             corrected_diff = phase_diff_wrapped + k
             residue_errors = 0
             curls = []
-            k_correction_needed = np.zeros_like(k)
             for r in range(height - 1):
                 for c in range(width - 1):
-                    tl = r * width + c
-                    tr = tl + 1
-                    bl = tl + width
-                    br = bl + 1
-                    if not (valid_mask[tl] and valid_mask[tr] and valid_mask[bl] and valid_mask[br]):
+                    # Check all 4 edges exist
+                    e1 = h_edge_idx[r, c] if c < width - 1 else -1
+                    e2 = v_edge_idx[r, c + 1] if c + 1 < width else -1
+                    e3 = h_edge_idx[r + 1, c] if r + 1 < height - 1 and c < width - 1 else -1
+                    e4 = v_edge_idx[r, c] if c < width else -1
+                    if e1 < 0 or e2 < 0 or e3 < 0 or e4 < 0:
                         continue
-                    # Get edges for this 2x2 cell
-                    if (tl, tr) not in edge_dict or (tr, br) not in edge_dict:
-                        continue
-                    if (br, bl) not in edge_dict or (bl, tl) not in edge_dict:
-                        continue
-                    e1, d1 = edge_dict[(tl, tr)]
-                    e2, d2 = edge_dict[(tr, br)]
-                    e3, d3 = edge_dict[(br, bl)]
-                    e4, d4 = edge_dict[(bl, tl)]
-                    # Compute curl of corrected gradient
-                    curl = (d1 * corrected_diff[e1] + d2 * corrected_diff[e2] +
-                           d3 * corrected_diff[e3] + d4 * corrected_diff[e4])
+                    # Compute curl
+                    curl = (corrected_diff[e1] + corrected_diff[e2]
+                           - corrected_diff[e3] - corrected_diff[e4])
                     if abs(curl) > 0.001:
                         residue_errors += 1
                         curls.append(curl)
             print(f'    DEBUG: {residue_errors} cells with non-zero curl after k correction')
             if curls:
                 print(f'    DEBUG: curl values: [{min(curls):.4f}, {max(curls):.4f}], unique: {sorted(set([round(c) for c in curls]))}')
-                # Show where the curl errors are located
-                curl_positions = []
-                for r in range(height - 1):
-                    for c in range(width - 1):
-                        tl = r * width + c
-                        tr = tl + 1
-                        bl = tl + width
-                        br = bl + 1
-                        if not (valid_mask[tl] and valid_mask[tr] and valid_mask[bl] and valid_mask[br]):
-                            continue
-                        if (tl, tr) not in edge_dict or (tr, br) not in edge_dict:
-                            continue
-                        if (br, bl) not in edge_dict or (bl, tl) not in edge_dict:
-                            continue
-                        e1, d1 = edge_dict[(tl, tr)]
-                        e2, d2 = edge_dict[(tr, br)]
-                        e3, d3 = edge_dict[(br, bl)]
-                        e4, d4 = edge_dict[(bl, tl)]
-                        curl = (d1 * corrected_diff[e1] + d2 * corrected_diff[e2] +
-                               d3 * corrected_diff[e3] + d4 * corrected_diff[e4])
-                        if abs(curl) > 0.001:
-                            curl_positions.append((r, c, curl))
-                if curl_positions:
-                    cols_with_errors = sorted(set(p[1] for p in curl_positions))
-                    rows_with_errors = sorted(set(p[0] for p in curl_positions))
-                    print(f'    DEBUG: curl errors at columns: {cols_with_errors[:10]}{"..." if len(cols_with_errors) > 10 else ""}')
-                    print(f'    DEBUG: curl errors at rows: {rows_with_errors[:10]}{"..." if len(rows_with_errors) > 10 else ""}')
-
-                    # Detailed analysis of first few curl errors
-                    for r, c, curl in curl_positions[:3]:
-                        print(f'    DEBUG: Curl error at ({r},{c}), curl={curl:.4f}:')
-                        tl = r * width + c
-                        tr = tl + 1
-                        bl = tl + width
-                        br = bl + 1
-                        e1, d1 = edge_dict[(tl, tr)]
-                        e2, d2 = edge_dict[(tr, br)]
-                        e3, d3 = edge_dict[(br, bl)]
-                        e4, d4 = edge_dict[(bl, tl)]
-                        # Check if this cell was in valid_dual_nodes
-                        dual_idx = dual_to_idx.get((r, c), -1)
-                        orig_res = residues[dual_idx] if dual_idx >= 0 else 'N/A'
-                        print(f'      dual_idx={dual_idx}, original_residue={orig_res}')
-                        # Show neighboring cell residues
-                        neighbor_info = []
-                        for dr, dc, name in [(-1,0,'top'), (1,0,'bot'), (0,-1,'left'), (0,1,'right')]:
-                            nr, nc = r + dr, c + dc
-                            n_idx = dual_to_idx.get((nr, nc), -1)
-                            n_res = residues[n_idx] if n_idx >= 0 else 'N/A'
-                            neighbor_info.append(f'{name}({nr},{nc})={n_res}')
-                        print(f'      neighbors: {", ".join(neighbor_info)}')
-                        print(f'      edges: e1={e1}(d={d1}), e2={e2}(d={d2}), e3={e3}(d={d3}), e4={e4}(d={d4})')
-                        print(f'      k: k1={k[e1]:.0f}, k2={k[e2]:.0f}, k3={k[e3]:.0f}, k4={k[e4]:.0f}')
-                        print(f'      phase_diff: p1={phase_diff_wrapped[e1]:.4f}, p2={phase_diff_wrapped[e2]:.4f}, p3={phase_diff_wrapped[e3]:.4f}, p4={phase_diff_wrapped[e4]:.4f}')
-                        # Sum of k*d should equal -residue for zero curl
-                        k_sum = d1*k[e1] + d2*k[e2] + d3*k[e3] + d4*k[e4]
-                        print(f'      k_sum (d1*k1+d2*k2+d3*k3+d4*k4) = {k_sum:.0f}, should be -{orig_res} for zero curl')
 
             # Check: what fraction of k values are nonzero
             print(f'    DEBUG: k nonzero: {np.count_nonzero(k)} out of {len(k)} edges')
@@ -1898,8 +1847,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array."""
             return Stack_unwrap2d._branch_cut(phase_2d, correlation=corr_2d,
-                                            conncomp_size=conncomp_size, max_jump=max_jump,
-                                            norm=norm, scale=scale, max_iters=max_iters, debug=debug)
+                                             conncomp_size=conncomp_size, max_jump=max_jump,
+                                             norm=norm, scale=scale, max_iters=max_iters, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
@@ -2068,7 +2017,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array using ILP."""
             return Stack_unwrap2d._ilp_unwrap_2d(phase_2d, correlation=corr_2d, conncomp_size=conncomp_size,
-                                               max_time=max_time, search_workers=search_workers, debug=debug)
+                                                max_time=max_time, search_workers=search_workers, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
@@ -2230,7 +2179,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         def _unwrap_single(phase_2d, corr_2d=None):
             """Unwrap a single 2D phase array using minflow."""
             return Stack_unwrap2d._minflow_unwrap_2d(phase_2d, correlation=corr_2d,
-                                                   conncomp_size=conncomp_size, debug=debug)
+                                                    conncomp_size=conncomp_size, debug=debug)
 
         def _conncomp_single(phase_2d):
             """Compute connected components for a single 2D array."""
