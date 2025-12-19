@@ -2729,13 +2729,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
     @staticmethod
     def _dct_unwrap_2d(phase, device=None, debug=False):
         """
-        Unwrap 2D phase using DCT-based Poisson solver (unweighted L² norm).
+        Unwrap 2D phase using GPU-accelerated DCT-based Poisson solver (unweighted L² norm).
 
         This is a fast, single-pass algorithm that solves:
             ∇²φ = ∇·(wrap(∇ψ))
 
         where ψ is the wrapped phase and φ is the unwrapped phase.
-        Based on Ghiglia & Romero (1994) DCT method.
+        Based on Ghiglia & Romero (1994) DCT method. GPU-accelerated using
+        PyTorch (MPS on Apple Silicon, CUDA on NVIDIA, or CPU fallback).
+
+        This method is also used internally as the initial solution for IRLS,
+        providing a good starting point for weighted iterative refinement.
 
         Parameters
         ----------
@@ -2759,9 +2763,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         configurations in different images lead to different error patterns,
         causing inconsistency between bursts.
 
-        For data with residues (typical InSAR), use IRLS which implements
-        weighted least-squares with correlation-based weighting to properly
-        handle inconsistent regions.
+        For data with residues (typical InSAR), use IRLS which uses this DCT
+        solution as initialization and then refines it with weighted
+        least-squares iterations using correlation-based weighting.
 
         References
         ----------
@@ -2821,15 +2825,16 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     @staticmethod
     def _irls_unwrap_2d(phase, weight=None, device=None, max_iter=10, tol=1e-2,
-                        cg_max_iter=20, cg_tol=1e-2, epsilon=1e-2, debug=False):
+                        cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
-        Unwrap 2D phase using Iteratively Reweighted Least Squares (L¹ norm).
+        Unwrap 2D phase using GPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
 
         This algorithm solves the L¹ phase unwrapping problem:
             min Σ w_ij |∇φ_ij - wrap(∇ψ_ij)|
 
         by iteratively solving weighted L² problems using preconditioned
-        conjugate gradient. GPU-accelerated using PyTorch.
+        conjugate gradient. GPU-accelerated using PyTorch (MPS on Apple Silicon,
+        CUDA on NVIDIA, or CPU fallback).
 
         Parameters
         ----------
@@ -2845,9 +2850,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         tol : float, optional
             Convergence tolerance for relative change in solution. Default is 1e-2.
         cg_max_iter : int, optional
-            Maximum conjugate gradient iterations per IRLS step. Default is 20.
+            Maximum conjugate gradient iterations per IRLS step. Default is 10.
         cg_tol : float, optional
-            Conjugate gradient convergence tolerance. Default is 1e-2.
+            Conjugate gradient convergence tolerance. Default is 1e-3.
         epsilon : float, optional
             Smoothing parameter for L¹ approximation. Default is 1e-2.
         debug : bool, optional
@@ -2860,10 +2865,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         Notes
         -----
+        The algorithm uses GPU-accelerated DCT as initial solution (same as
+        standalone DCT method), then refines it through weighted iterations.
+        The DCT initialization provides a good starting point, and the IRLS
+        iterations correct for residue-induced errors using correlation weights.
+
         Based on: Dubois-Taine et al., "Iteratively Reweighted Least Squares
         for Phase Unwrapping", arXiv:2401.09961 (2024).
 
-        The algorithm uses a DCT-based preconditioner for fast convergence.
         Achieves 10-20x speedup over SNAPHU on GPU.
         """
         import torch
@@ -2935,50 +2944,54 @@ class Stack_unwrap2d(Stack_unwrap1d):
         eigenvalues = 2 * cos_i.unsqueeze(1) + 2 * cos_j.unsqueeze(0) - 4
         eigenvalues[0, 0] = 1.0  # Avoid division by zero
 
+        # Pre-allocate buffers for gradient computation (avoid repeated allocation)
+        _dx_buf = torch.zeros_like(phi)
+        _dy_buf = torch.zeros_like(phi)
+        _result_buf = torch.zeros_like(phi)
+
         def apply_laplacian(x, wx_irls, wy_irls):
             """Apply weighted Laplacian operator: -∇·(w·∇x)"""
-            # Forward differences
-            dx = torch.zeros_like(x)
-            dy = torch.zeros_like(x)
-            dx[:, :-1] = x[:, 1:] - x[:, :-1]
-            dy[:-1, :] = x[1:, :] - x[:-1, :]
+            # Forward differences (reuse buffers)
+            _dx_buf.zero_()
+            _dy_buf.zero_()
+            _dx_buf[:, :-1] = x[:, 1:] - x[:, :-1]
+            _dy_buf[:-1, :] = x[1:, :] - x[:-1, :]
 
-            # Weight the gradients
-            dx_w = wx_irls * dx
-            dy_w = wy_irls * dy
+            # Weight the gradients in-place
+            _dx_buf.mul_(wx_irls)
+            _dy_buf.mul_(wy_irls)
 
             # Backward differences (divergence)
-            result = torch.zeros_like(x)
-            result[:, 1:] -= dx_w[:, :-1]
-            result[:, :-1] += dx_w[:, :-1]
-            result[1:, :] -= dy_w[:-1, :]
-            result[:-1, :] += dy_w[:-1, :]
+            _result_buf.zero_()
+            _result_buf[:, 1:].sub_(_dx_buf[:, :-1])
+            _result_buf[:, :-1].add_(_dx_buf[:, :-1])
+            _result_buf[1:, :].sub_(_dy_buf[:-1, :])
+            _result_buf[:-1, :].add_(_dy_buf[:-1, :])
 
-            return -result
+            return _result_buf.neg()
 
         def apply_preconditioner(r):
             """Apply DCT-based preconditioner (approximate inverse Laplacian)"""
             r_dct = dct_2d(r)
-            z_dct = r_dct / (-eigenvalues + 1e-10)
-            z_dct[0, 0] = 0.0
-            return idct_2d(z_dct)
+            r_dct.div_(-eigenvalues + 1e-10)
+            r_dct[0, 0] = 0.0
+            return idct_2d(r_dct)
 
         def conjugate_gradient(b, wx_irls, wy_irls, x0, max_iter_cg, tol_cg):
             """Preconditioned conjugate gradient solver with numerical stability checks"""
-            x = x0.clone()
-            x_prev = x.clone()  # Keep copy in case we need to revert
+            x = x0  # No clone - modify in place, caller provides buffer
             r = b - apply_laplacian(x, wx_irls, wy_irls)
 
             # Check for NaN in initial residual
             if not torch.isfinite(r).all():
-                return x0.clone()  # Return copy of initial guess
+                return x0
 
             z = apply_preconditioner(r)
-            p = z.clone()
+            p = z.clone()  # Need clone here - p gets modified
             rz = torch.sum(r * z)
 
             for i in range(max_iter_cg):
-                Ap = apply_laplacian(p, wx_irls, wy_irls)
+                Ap = apply_laplacian(p, wx_irls, wy_irls).clone()  # Need clone - buffer reused
                 pAp = torch.sum(p * Ap)
                 if pAp.abs() < 1e-15 or not torch.isfinite(pAp):
                     break
@@ -2987,13 +3000,13 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 # Clamp alpha to prevent explosion
                 alpha = torch.clamp(alpha, -1e6, 1e6)
 
-                x_prev = x.clone()
-                x = x + alpha * p
-                r = r - alpha * Ap
+                # In-place updates
+                x.add_(p, alpha=alpha.item())
+                r.sub_(Ap, alpha=alpha.item())
 
                 # Check for numerical issues mid-iteration
                 if not torch.isfinite(x).all():
-                    return x_prev  # Return last good solution
+                    break
 
                 r_norm = torch.sqrt(torch.sum(r * r))
                 if r_norm < tol_cg or not torch.isfinite(r_norm):
@@ -3005,7 +3018,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     break
                 beta = rz_new / rz
                 beta = torch.clamp(beta, -1e6, 1e6)
-                p = z + beta * p
+                p.mul_(beta.item()).add_(z)
                 rz = rz_new
 
             return x
@@ -3046,42 +3059,56 @@ class Stack_unwrap2d(Stack_unwrap1d):
         u_best = u.clone()
         best_residual = float('inf')
 
-        for iteration in range(max_iter):
-            u_prev = u.clone()
+        # Pre-allocate buffers for IRLS loop
+        dx_u = torch.zeros_like(u)
+        dy_u = torch.zeros_like(u)
+        rx = torch.zeros_like(u)
+        ry = torch.zeros_like(u)
+        wx_irls = torch.zeros_like(u)
+        wy_irls = torch.zeros_like(u)
+        b = torch.zeros_like(u)
+        u_prev = torch.zeros_like(u)
+        eps_sq = epsilon * epsilon
 
-            # Compute current gradients
-            dx_u = torch.zeros_like(u)
-            dy_u = torch.zeros_like(u)
+        for iteration in range(max_iter):
+            u_prev.copy_(u)
+
+            # Compute current gradients (reuse buffers)
+            dx_u.zero_()
+            dy_u.zero_()
             dx_u[:, :-1] = u[:, 1:] - u[:, :-1]
             dy_u[:-1, :] = u[1:, :] - u[:-1, :]
 
-            # Compute residuals
-            rx = dx_u - dx_target
-            ry = dy_u - dy_target
+            # Compute residuals in-place
+            torch.sub(dx_u, dx_target, out=rx)
+            torch.sub(dy_u, dy_target, out=ry)
 
             # Track best solution by residual magnitude
             current_residual = (torch.sum(rx * rx) + torch.sum(ry * ry)).item()
             if current_residual < best_residual and torch.isfinite(u).all():
                 best_residual = current_residual
-                u_best = u.clone()
+                u_best.copy_(u)
 
             # Update IRLS weights: w_irls = w / sqrt(r² + ε²)
-            # This reweighting converts L¹ to weighted L²
-            # Use larger epsilon for stability, clamp weights aggressively
-            eps_sq = epsilon * epsilon
-            wx_irls = wx / torch.sqrt(rx * rx + eps_sq)
-            wy_irls = wy / torch.sqrt(ry * ry + eps_sq)
+            # In-place operations
+            torch.addcmul(torch.full_like(rx, eps_sq), rx, rx, out=wx_irls)
+            wx_irls.sqrt_()
+            torch.div(wx, wx_irls, out=wx_irls)
 
-            # Clamp weights to prevent numerical instability
-            wx_irls = torch.clamp(wx_irls, min=1e-6, max=1e6)
-            wy_irls = torch.clamp(wy_irls, min=1e-6, max=1e6)
+            torch.addcmul(torch.full_like(ry, eps_sq), ry, ry, out=wy_irls)
+            wy_irls.sqrt_()
+            torch.div(wy, wy_irls, out=wy_irls)
+
+            # Clamp weights in-place
+            wx_irls.clamp_(min=1e-6, max=1e6)
+            wy_irls.clamp_(min=1e-6, max=1e6)
 
             # Compute right-hand side: -∇·(w_irls · ∇target)
-            b = torch.zeros_like(u)
-            b[:, 1:] += wx_irls[:, :-1] * dx_target[:, :-1]
-            b[:, :-1] -= wx_irls[:, :-1] * dx_target[:, :-1]
-            b[1:, :] += wy_irls[:-1, :] * dy_target[:-1, :]
-            b[:-1, :] -= wy_irls[:-1, :] * dy_target[:-1, :]
+            b.zero_()
+            b[:, 1:].addcmul_(wx_irls[:, :-1], dx_target[:, :-1])
+            b[:, :-1].addcmul_(wx_irls[:, :-1], dx_target[:, :-1], value=-1)
+            b[1:, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :])
+            b[:-1, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :], value=-1)
 
             # Solve weighted Laplacian system using CG
             u = conjugate_gradient(b, wx_irls, wy_irls, u, cg_max_iter, cg_tol)
@@ -3093,9 +3120,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 u = u_best.clone()
                 break
 
-            # Check convergence
-            diff = torch.sqrt(torch.sum((u - u_prev) ** 2))
-            norm_u = torch.sqrt(torch.sum(u ** 2)) + 1e-10
+            # Check convergence (in-place computation)
+            diff = torch.norm(u - u_prev)
+            norm_u = torch.norm(u) + 1e-10
             rel_change = (diff / norm_u).item()
 
             if debug and iteration % 5 == 0:
@@ -3146,9 +3173,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     def unwrap2d_dct(self, phase, conncomp=False, conncomp_size=100, debug=False):
         """
-        Unwrap phase using DCT-based Poisson solver (unweighted L² norm, GPU-accelerated).
+        Unwrap phase using GPU-accelerated DCT-based Poisson solver (unweighted L² norm).
 
         Fast algorithm for quick preview. Based on Ghiglia & Romero (1994).
+        GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA on NVIDIA,
+        or CPU fallback).
+
+        This same DCT algorithm is used internally as the initial solution
+        for IRLS, which then refines it with weighted iterations.
 
         **Important**: Unweighted DCT does not handle phase residues (inconsistencies)
         properly. Residues cause different error patterns in different bursts,
@@ -3180,6 +3212,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         - No quality weighting - residues propagate as global errors
         - Best for: low-noise data, single images, quick preview
         - Not suitable for: multi-burst consistency, noisy data with residues
+        - Used as initial solution for IRLS (which adds weighted refinement)
 
         See Also
         --------
@@ -3320,13 +3353,18 @@ class Stack_unwrap2d(Stack_unwrap1d):
         return result, labels
 
     def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100,
-                      max_iter=10, tol=1e-2, cg_max_iter=20, cg_tol=1e-2, epsilon=1e-2, debug=False):
+                      max_iter=10, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
-        Unwrap phase using IRLS algorithm (L¹ norm, GPU-accelerated).
+        Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
         This algorithm provides high-quality unwrapping with L¹ norm that
         preserves discontinuities, and supports quality weighting from
-        correlation data. GPU-accelerated using PyTorch.
+        correlation data. GPU-accelerated using PyTorch (MPS on Apple Silicon,
+        CUDA on NVIDIA, or CPU fallback).
+
+        Uses GPU-accelerated DCT as initial solution, then refines it through
+        weighted IRLS iterations. This handles phase residues properly by
+        down-weighting inconsistent regions based on correlation.
 
         Parameters
         ----------
@@ -3345,9 +3383,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         tol : float, optional
             Convergence tolerance for relative change. Default is 1e-2.
         cg_max_iter : int, optional
-            Maximum conjugate gradient iterations per IRLS step. Default is 20.
+            Maximum conjugate gradient iterations per IRLS step. Default is 10.
         cg_tol : float, optional
-            Conjugate gradient convergence tolerance. Default is 1e-2.
+            Conjugate gradient convergence tolerance. Default is 1e-3.
         epsilon : float, optional
             Smoothing parameter for L¹ approximation. Larger values improve
             numerical stability but reduce L¹ approximation quality. Default is 1e-2.
@@ -3363,13 +3401,15 @@ class Stack_unwrap2d(Stack_unwrap1d):
         Notes
         -----
         - GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA, or CPU)
-        - Uses L¹ norm which preserves discontinuities better than L²
-        - Supports quality weighting (correlation-based)
+        - Uses GPU-accelerated DCT for fast initialization
+        - L¹ norm preserves discontinuities better than L² (DCT)
+        - Correlation weighting handles phase residues properly
+        - Provides consistent results across multi-burst data
         - Based on arXiv:2401.09961
 
         See Also
         --------
-        unwrap2d_dct : Fast L² estimation without weighting
+        unwrap2d_dct : Fast L² estimation (used as initial solution here)
         unwrap2d_minflow : CPU-based L¹ unwrapping using min-cost flow
         """
         import xarray as xr
