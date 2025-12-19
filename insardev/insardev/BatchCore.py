@@ -2854,8 +2854,9 @@ class BatchCore(dict):
                         valid = np.isfinite(vals)
                         weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
                         weight_sum += np.where(valid, w_other, 0.0)
-                    weight_sum = np.where(weight_sum > 0, weight_sum, np.nan)
-                    out = np.arctan2((weighted_sum / weight_sum).imag, (weighted_sum / weight_sum).real)
+                    valid_weights = weight_sum > 0
+                    normalized = np.where(valid_weights, weighted_sum / weight_sum, 0.0)
+                    out = np.where(valid_weights, np.arctan2(normalized.imag, normalized.real), np.nan)
                 else:
                     weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
                     weight_sum = np.where(current_valid, w_current, 0.0)
@@ -2864,8 +2865,7 @@ class BatchCore(dict):
                         valid = np.isfinite(vals)
                         weighted_sum += np.where(valid, vals * w_other, 0.0)
                         weight_sum += np.where(valid, w_other, 0.0)
-                    weight_sum = np.where(weight_sum > 0, weight_sum, np.nan)
-                    out = weighted_sum / weight_sum
+                    out = np.where(weight_sum > 0, weighted_sum / weight_sum, np.nan)
 
                 if not extend:
                     out = np.where(current_valid, out, np.nan)
