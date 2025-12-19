@@ -2651,15 +2651,32 @@ class Stack_unwrap2d(Stack_unwrap1d):
             The best available device (MPS for Apple Silicon, CUDA, or CPU).
         str
             Device name for display.
+
+        Notes
+        -----
+        MPS (Apple Silicon GPU) does not work in forked/spawned child processes
+        (e.g., Dask workers). This function attempts to detect such cases by
+        doing a simple tensor operation and falls back to CPU if it fails.
         """
         import torch
 
         if torch.backends.mps.is_available():
-            return torch.device("mps"), "MPS (Apple Silicon GPU)"
-        elif torch.cuda.is_available():
-            return torch.device("cuda"), f"CUDA ({torch.cuda.get_device_name(0)})"
-        else:
-            return torch.device("cpu"), "CPU"
+            try:
+                # Test that MPS actually works (may fail in forked processes)
+                device = torch.device("mps")
+                test = torch.zeros(1, device=device)
+                del test
+                return device, "MPS (Apple Silicon GPU)"
+            except Exception:
+                # MPS not available in this process (e.g., Dask worker)
+                pass
+        if torch.cuda.is_available():
+            try:
+                device = torch.device("cuda")
+                return device, f"CUDA ({torch.cuda.get_device_name(0)})"
+            except Exception:
+                pass
+        return torch.device("cpu"), "CPU"
 
     @staticmethod
     def _dct_unwrap_2d_single(phase, valid, device, dtype):
@@ -2778,8 +2795,15 @@ class Stack_unwrap2d(Stack_unwrap1d):
         if device is None:
             device, _ = Stack_unwrap2d._get_torch_device()
 
-        dtype = torch.float32
         height, width = phase.shape
+
+        # Use float64 for large grids to maintain numerical precision
+        # MPS doesn't support float64, so fall back to CPU for large grids
+        use_float64 = height * width > 4_000_000
+        if use_float64 and device.type == 'mps':
+            device = torch.device('cpu')  # MPS doesn't support float64
+        dtype = torch.float64 if use_float64 else torch.float32
+        np_dtype = np.float64 if use_float64 else np.float32
 
         # Handle NaN values
         nan_mask = np.isnan(phase)
@@ -2789,9 +2813,15 @@ class Stack_unwrap2d(Stack_unwrap1d):
         # Fill NaN with 0 for computation
         phase_filled = np.where(nan_mask, 0.0, phase)
 
-        # Convert to torch
-        phi = torch.from_numpy(phase_filled.astype(np.float32)).to(device)
-        valid = torch.from_numpy(~nan_mask).to(device)
+        # Convert to torch - with fallback to CPU if GPU fails
+        try:
+            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+            valid = torch.from_numpy(~nan_mask).to(device)
+        except Exception:
+            # GPU failed (e.g., MPS in forked process), fall back to CPU
+            device = torch.device("cpu")
+            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+            valid = torch.from_numpy(~nan_mask).to(device)
 
         # Single-scale DCT unwrap
         unwrapped = Stack_unwrap2d._dct_unwrap_2d_single(phi, valid, device, dtype)
@@ -2884,12 +2914,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
         else:
             device_name = str(device)
 
-        # Use float32 for MPS compatibility (MPS doesn't support float64)
-        dtype = torch.float32
+        height, width = phase.shape
+
+        # Use float64 for large grids to maintain numerical precision
+        # MPS doesn't support float64, so fall back to CPU for large grids
+        use_float64 = (device.type == 'cpu')
+        if device.type == 'cuda' and height * width > 4_000_000:
+            use_float64 = True
+        if device.type == 'mps' and height * width > 4_000_000:
+            # MPS doesn't support float64, fall back to CPU for precision
+            device = torch.device('cpu')
+            device_name = 'CPU (precision fallback)'
+            use_float64 = True
+        dtype = torch.float64 if use_float64 else torch.float32
 
         _t_start = time.time()
-
-        height, width = phase.shape
 
         # Handle NaN values
         nan_mask = np.isnan(phase)
@@ -2911,10 +2950,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
         else:
             weight_filled = np.where(nan_mask, 0.0, 1.0)
 
-        # Convert to torch tensors
-        phi = torch.from_numpy(phase_filled.astype(np.float32)).to(device)
-        w = torch.from_numpy(weight_filled.astype(np.float32)).to(device)
-        valid = torch.from_numpy(valid_mask).to(device)
+        # Convert to torch tensors - with fallback to CPU if GPU fails
+        np_dtype = np.float64 if use_float64 else np.float32
+        try:
+            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+            w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
+            valid = torch.from_numpy(valid_mask).to(device)
+        except Exception:
+            # GPU failed (e.g., MPS in forked process), fall back to CPU
+            device = torch.device("cpu")
+            device_name = "CPU (fallback)"
+            dtype = torch.float64
+            np_dtype = np.float64
+            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+            w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
+            valid = torch.from_numpy(valid_mask).to(device)
 
         # Compute wrapped phase differences (target gradients)
         dx_target = torch.zeros_like(phi)
@@ -2933,8 +2983,12 @@ class Stack_unwrap2d(Stack_unwrap1d):
         wy[:-1, :] = (w[:-1, :] + w[1:, :]) / 2
 
         # Zero out weights at invalid edges
-        wx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).float()
-        wy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).float()
+        wx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).to(dtype)
+        wy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).to(dtype)
+
+        # Check if we need compensated arithmetic for numerical stability
+        # Large grids with float32 need error compensation to maintain precision
+        use_compensated = not use_float64 and height * width > 1_000_000
 
         # Precompute DCT eigenvalues for preconditioner
         i_idx = torch.arange(height, dtype=dtype, device=device)
@@ -2978,7 +3032,13 @@ class Stack_unwrap2d(Stack_unwrap1d):
             return idct_2d(r_dct)
 
         def conjugate_gradient(b, wx_irls, wy_irls, x0, max_iter_cg, tol_cg):
-            """Preconditioned conjugate gradient solver with numerical stability checks"""
+            """
+            Preconditioned conjugate gradient solver with Kahan summation.
+
+            Uses compensated summation (Kahan algorithm) for float32 on large grids
+            to maintain numerical precision. The solution x is split into two
+            components: x_sum (main value) and x_comp (error compensation).
+            """
             x = x0  # No clone - modify in place, caller provides buffer
             r = b - apply_laplacian(x, wx_irls, wy_irls)
 
@@ -2990,6 +3050,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
             p = z.clone()  # Need clone here - p gets modified
             rz = torch.sum(r * z)
 
+            # Kahan compensation term for x (tracks accumulated rounding errors)
+            x_comp = torch.zeros_like(x) if use_compensated else None
+
             for i in range(max_iter_cg):
                 Ap = apply_laplacian(p, wx_irls, wy_irls).clone()  # Need clone - buffer reused
                 pAp = torch.sum(p * Ap)
@@ -2999,10 +3062,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 # Clamp alpha to prevent explosion
                 alpha = torch.clamp(alpha, -1e6, 1e6)
+                alpha_val = alpha.item()
 
-                # In-place updates
-                x.add_(p, alpha=alpha.item())
-                r.sub_(Ap, alpha=alpha.item())
+                # Update x with Kahan summation for better precision
+                if use_compensated:
+                    # Kahan summation: y = (alpha * p) - x_comp
+                    y = alpha_val * p - x_comp
+                    # t = x + y (may lose precision)
+                    t = x + y
+                    # x_comp = (t - x) - y (recovers lost precision)
+                    x_comp = (t - x) - y
+                    x.copy_(t)
+                else:
+                    x.add_(p, alpha=alpha_val)
+
+                r.sub_(Ap, alpha=alpha_val)
 
                 # Check for numerical issues mid-iteration
                 if not torch.isfinite(x).all():
@@ -3042,6 +3116,12 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'  DCT init produced {nan_count} NaN/inf values, filling with zeros')
             u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
 
+        # Re-center DCT result to improve float32 precision
+        # This keeps values near zero where float32 has best precision
+        if use_compensated and valid.any():
+            u_mean = u[valid].mean()
+            u.sub_(u_mean)
+
         _t_init = time.time()
 
         if debug:
@@ -3072,6 +3152,12 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         for iteration in range(max_iter):
             u_prev.copy_(u)
+
+            # Re-center u to prevent numerical drift (important for float32)
+            # Phase unwrapping only cares about gradients, so mean is arbitrary
+            if use_compensated and valid.any():
+                u_mean = u[valid].mean()
+                u.sub_(u_mean)
 
             # Compute current gradients (reuse buffers)
             dx_u.zero_()
