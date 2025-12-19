@@ -1400,6 +1400,7 @@ class BatchCore(dict):
         import xarray as xr
         import numpy as np
         import dask
+        import dask.array as da
         from insardev_toolkit import progressbar, datagrid
 
         if not len(self):
@@ -1412,135 +1413,158 @@ class BatchCore(dict):
                 return sample
             return sample
 
+        # Determine which polarizations to process
         if polarization is None:
-            # exclude spatial_ref as it's a metadata variable, not a data variable
             polarizations = [v for v in sample.data_vars if v != 'spatial_ref']
+        else:
+            polarizations = [polarization]
 
-            # process list of datasets with one or multiple polarizations
-            das = xr.merge([self.to_dataset(polarization=pol) for pol in polarizations])
-            if compute:
-                progressbar(das := das.persist(), desc=f'Computing Dataset...'.ljust(25))
-                return das
-            return das
+        # Build data dictionary: {pol: [burst0_data, burst1_data, ...]}
+        burst_keys = list(self.keys())
+        datas_by_pol = {pol: [self[k][pol] for k in burst_keys] for pol in polarizations}
 
-        # process single polarization dataarrays
-        datas = [self[k][polarization] for k in self.keys()]
+        # Get grid info from first polarization (all pols have same grid)
+        first_pol = polarizations[0]
+        first_datas = datas_by_pol[first_pol]
 
-        # Compute dask arrays upfront to avoid issues with complex task graphs in block_dask
-        # The distributed scheduler can lose track of rechunk/transpose keys when slicing
-        if any(hasattr(da.data, 'dask') for da in datas):
-            datas = list(dask.compute(*datas))
-
-        # define unified grid from all burst extents
-        y_min = min(ds.y.min().item() for ds in datas)
-        y_max = max(ds.y.max().item() for ds in datas)
-        x_min = min(ds.x.min().item() for ds in datas)
-        x_max = max(ds.x.max().item() for ds in datas)
-        dims = datas[0].dims
+        # Define unified grid from all burst extents
+        y_min = min(ds.y.min().item() for ds in first_datas)
+        y_max = max(ds.y.max().item() for ds in first_datas)
+        x_min = min(ds.x.min().item() for ds in first_datas)
+        x_max = max(ds.x.max().item() for ds in first_datas)
+        dims = first_datas[0].dims
         stackvar = list(dims)[0] if len(dims) > 2 else None
 
-        # workaround for dask.array.blockwise - need 3D data
+        # Handle stack dimension
         if stackvar == 'pair':
-            # multiindex pair
-            stackval = [(str(ref)[:10] + ' ' + str(rep)[:10]) for ref, rep in datas[0][stackvar].values]
+            stackval = [(str(ref)[:10] + ' ' + str(rep)[:10]) for ref, rep in first_datas[0][stackvar].values]
         elif stackvar is not None:
-            stackval = datas[0][stackvar].astype(str)
+            stackval = first_datas[0][stackvar].astype(str)
         else:
             stackvar = 'fake'
             stackval = [0]
-            datas = [da.expand_dims({stackvar: [0]}) for da in datas]
+            # Expand dims for all polarizations
+            for pol in polarizations:
+                datas_by_pol[pol] = [d.expand_dims({stackvar: [0]}) for d in datas_by_pol[pol]]
+            first_datas = datas_by_pol[first_pol]
 
-        stackidx = xr.DataArray(np.arange(len(stackval), dtype=int), dims=('z',))
-        dy = datas[0].y.diff('y').item(0)
-        dx = datas[0].x.diff('x').item(0)
-        ys = xr.DataArray(np.arange(y_min, y_max + dy/2, dy), dims=['y'])
-        xs = xr.DataArray(np.arange(x_min, x_max + dx/2, dx), dims=['x'])
+        n_stack = len(stackval)
+        dy = first_datas[0].y.diff('y').item(0)
+        dx = first_datas[0].x.diff('x').item(0)
+        ys = np.arange(y_min, y_max + dy/2, dy)
+        xs = np.arange(x_min, x_max + dx/2, dx)
 
-        # extract extents of all datasets once (materialized coordinates)
-        extents = [(float(da.y.min()), float(da.y.max()),
-                    float(da.x.min()), float(da.x.max())) for da in datas]
+        # Extract extents of all datasets once (same for all polarizations)
+        extents = [(float(d.y.min()), float(d.y.max()),
+                    float(d.x.min()), float(d.x.max())) for d in first_datas]
 
-        # precompute burst coverage areas for fast lookup
-        # For each burst, store its y and x coordinate arrays for exact matching
-        burst_coords = [(da.y.values, da.x.values) for da in datas]
+        # Precompute burst coverage areas for fast lookup
+        burst_coords = [(d.y.values, d.x.values) for d in first_datas]
 
-        def block_dask(stack, y_chunk, x_chunk, fill_dtype):
-            """Process a single output chunk by selecting minimal input bursts."""
+        fill_dtype = first_datas[0].dtype
+
+        def process_chunk(ys_block, xs_block, pol, datas):
+            """Process a single output chunk for one polarization.
+
+            Args:
+                ys_block, xs_block: coordinate arrays for this chunk
+                pol: polarization name (for naming)
+                datas: list of DataArrays for this polarization
+            """
             import warnings
             fill_nan = np.nan * np.ones((), dtype=fill_dtype)
 
-            # extract extent of the current chunk
-            ymin0, ymax0 = float(y_chunk.min()), float(y_chunk.max())
-            xmin0, xmax0 = float(x_chunk.min()), float(x_chunk.max())
+            ymin0, ymax0 = float(ys_block.min()), float(ys_block.max())
+            xmin0, xmax0 = float(xs_block.min()), float(xs_block.max())
 
-            # find all bursts overlapping with this chunk
+            # Find all bursts overlapping with this chunk
             overlapping = []
             for idx, (ymin, ymax, xmin, xmax) in enumerate(extents):
                 if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin:
-                    # compute coverage: how much of the chunk is covered by this burst
                     burst_y, burst_x = burst_coords[idx]
-                    # count pixels in chunk that are covered by this burst
-                    y_covered = np.sum((y_chunk >= burst_y.min()) & (y_chunk <= burst_y.max()))
-                    x_covered = np.sum((x_chunk >= burst_x.min()) & (x_chunk <= burst_x.max()))
+                    y_covered = np.sum((ys_block >= burst_y.min()) & (ys_block <= burst_y.max()))
+                    x_covered = np.sum((xs_block >= burst_x.min()) & (xs_block <= burst_x.max()))
                     coverage = y_covered * x_covered
                     overlapping.append((idx, coverage))
 
             if len(overlapping) == 0:
-                return np.full((stack.size, y_chunk.size, x_chunk.size), fill_nan, dtype=fill_dtype)
+                return np.full((n_stack, ys_block.size, xs_block.size), fill_nan, dtype=fill_dtype)
 
-            # sort by coverage (descending) - prefer bursts that cover more of the chunk
+            # Sort by coverage (descending)
             overlapping.sort(key=lambda x: -x[1])
 
-            # check if only one burst overlaps - no need to combine
-            if len(overlapping) == 1:
-                best_idx = overlapping[0][0]
-                da_block = datas[best_idx].isel({stackvar: stack})\
-                    .sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                da_block = dask.compute(da_block, n_workers=1)[0]
-                return da_block.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False).values
+            # Process each stack element
+            result_slices = []
+            for s_idx in range(n_stack):
+                if len(overlapping) == 1:
+                    best_idx = overlapping[0][0]
+                    da_block = datas[best_idx].isel({stackvar: s_idx})\
+                        .sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
+                    if hasattr(da_block.data, 'compute'):
+                        da_block = da_block.compute(n_workers=1)
+                    da_block = da_block.reindex(y=ys_block, x=xs_block, fill_value=fill_nan, copy=False)
+                    result_slices.append(da_block.values)
+                else:
+                    selected_indices = [idx for idx, _ in overlapping]
+                    das_block = [datas[idx].isel({stackvar: s_idx}).sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
+                                for idx in selected_indices]
+                    das_block = [d.compute(n_workers=1) if hasattr(d.data, 'compute') else d for d in das_block]
+                    das_block = [d.reindex(y=ys_block, x=xs_block, fill_value=fill_nan, copy=False) for d in das_block]
 
-            # need to combine multiple bursts to fill NaN gaps
-            # use ALL overlapping bursts to ensure NaN gaps are filled
-            selected_indices = [idx for idx, _ in overlapping]
+                    if len(das_block) == 1:
+                        result_slices.append(das_block[0].values)
+                    else:
+                        das_block_concat = np.stack([d.values for d in das_block], axis=0)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('ignore', RuntimeWarning)
+                            result_slices.append(np.nanmin(das_block_concat, axis=0))
 
-            # fetch data from selected bursts
-            das_block = [datas[idx].isel({stackvar: stack}).sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                        for idx in selected_indices]
-            das_block = dask.compute(*das_block, n_workers=1)
-            das_block = [da.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False) for da in das_block]
+            return np.stack(result_slices, axis=0)
 
-            if len(das_block) == 1:
-                return das_block[0].values
+        # Determine chunk sizes
+        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=fill_dtype)
+        ys_blocks = np.array_split(ys, np.cumsum(chunks[0])[:-1])
+        xs_blocks = np.array_split(xs, np.cumsum(chunks[1])[:-1])
 
-            # combine multiple bursts - all valid pixels are the same, nanmin returns the valid value
-            das_block_concat = np.stack([da.values for da in das_block], axis=0)
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)  # ignore "All-NaN slice encountered"
-                return np.nanmin(das_block_concat, axis=0)
+        # Build result for each polarization
+        results = {}
+        for pol in polarizations:
+            datas = datas_by_pol[pol]
 
-        # prevent warnings 'PerformanceWarning: Increasing number of chunks by factor of ...'
-        import warnings
-        from dask.array.core import PerformanceWarning
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', category=PerformanceWarning)
-            # rechunk data for expected usage using Dask machinery
-            # TODO: fix the hard coded value 16
-            chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size, 16), dtype=datas[0].dtype)
-            data = dask.array.blockwise(
-                block_dask,
-                'zyx',
-                stackidx.chunk(1), 'z',
-                ys.chunk({'y': chunks[0]}), 'y',
-                xs.chunk({'x': chunks[1]}), 'x',
-                meta=np.empty((0, 0, 0), dtype=datas[0].dtype),
-                fill_dtype=datas[0].dtype,
-            )
+            # Build blocks using da.from_delayed
+            blocks_total = []
+            for ys_block in ys_blocks:
+                blocks_row = []
+                for xs_block in xs_blocks:
+                    block = da.from_delayed(
+                        dask.delayed(process_chunk)(ys_block, xs_block, pol, datas),
+                        shape=(n_stack, ys_block.size, xs_block.size),
+                        dtype=fill_dtype
+                    )
+                    blocks_row.append(block)
+                blocks_total.append(blocks_row)
 
-        da = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
-            .rename(datas[0].name)\
-            .assign_attrs(datas[0].attrs)
-        da = datagrid.spatial_ref(da, datas)
-        return da if stackvar != 'fake' else da.isel({stackvar: 0})
+            data = da.block(blocks_total)
+
+            result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
+                .rename(pol)\
+                .assign_attrs(datas[0].attrs)
+            result = datagrid.spatial_ref(result, datas)
+            if stackvar == 'fake':
+                result = result.isel({stackvar: 0})
+            results[pol] = result
+
+        # Return DataArray if single polarization was requested, Dataset otherwise
+        if polarization is not None:
+            # Single polarization explicitly requested - return DataArray
+            output = results[polarization]
+        else:
+            # All polarizations - return Dataset (even if only one)
+            output = xr.merge(list(results.values()))
+
+        if compute:
+            progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
+        return output
 
     def to_vtk(self, path: str, mask: bool = True):
         """
