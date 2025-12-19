@@ -1395,7 +1395,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         if correlation is not None:
             corr_flat = correlation.ravel().astype(np.float64)
             edge_corr = (corr_flat[edges[:, 0]] + corr_flat[edges[:, 1]]) / 2
-            edge_costs = (1000.0 / np.maximum(edge_corr, 0.01)).astype(np.int64)
+            # Suppress warning for NaN→int64 cast (NaN becomes large value = high cost, which is desired)
+            with np.errstate(invalid='ignore'):
+                edge_costs = (1000.0 / np.maximum(edge_corr, 0.01)).astype(np.int64)
         else:
             edge_costs = np.ones(n_edges, dtype=np.int64) * 1000
 
