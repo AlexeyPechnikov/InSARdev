@@ -1426,6 +1426,11 @@ class BatchCore(dict):
         # process single polarization dataarrays
         datas = [self[k][polarization] for k in self.keys()]
 
+        # Compute dask arrays upfront to avoid issues with complex task graphs in block_dask
+        # The distributed scheduler can lose track of rechunk/transpose keys when slicing
+        if any(hasattr(da.data, 'dask') for da in datas):
+            datas = list(dask.compute(*datas))
+
         # define unified grid from all burst extents
         y_min = min(ds.y.min().item() for ds in datas)
         y_max = max(ds.y.max().item() for ds in datas)
@@ -1491,7 +1496,7 @@ class BatchCore(dict):
                 best_idx = overlapping[0][0]
                 da_block = datas[best_idx].isel({stackvar: stack})\
                     .sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                da_block = dask.compute(da_block)[0]
+                da_block = dask.compute(da_block, n_workers=1)[0]
                 return da_block.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False).values
 
             # need to combine multiple bursts to fill NaN gaps
@@ -1501,7 +1506,7 @@ class BatchCore(dict):
             # fetch data from selected bursts
             das_block = [datas[idx].isel({stackvar: stack}).sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
                         for idx in selected_indices]
-            das_block = dask.compute(*das_block)
+            das_block = dask.compute(*das_block, n_workers=1)
             das_block = [da.reindex(y=y_chunk, x=x_chunk, fill_value=fill_nan, copy=False) for da in das_block]
 
             if len(das_block) == 1:
@@ -2810,7 +2815,7 @@ class BatchCore(dict):
             for d in das_others:
                 # Use interp with nearest to avoid issues with floating point coordinate matching
                 das_reindexed.append(d.interp(y=ys, x=xs, method='nearest', kwargs={'fill_value': np.nan}))
-            
+
             current_vals = da_current.values
             current_valid = np.isfinite(current_vals)
 
@@ -2861,11 +2866,38 @@ class BatchCore(dict):
                 da_current = ds_current[pol]
                 das_others = [ds[pol] for ds in ds_others]
 
-                delayed_array = da.from_delayed(
-                    dask.delayed(dissolve_pol)(da_current, das_others, wrap, extend, weight),
-                    shape=da_current.shape,
-                    dtype=da_current.dtype
-                )
+                # Check if 3D (has stack dimension like 'pair')
+                if len(da_current.dims) > 2:
+                    stackvar = da_current.dims[0]
+                    n_stack = da_current.sizes[stackvar]
+                    shape_2d = da_current.shape[1:]
+
+                    def dissolve_pol_3d(da_slice, das_others_slice, wrap, extend, weight):
+                        """Wrapper to return 3D array with shape (1, y, x)."""
+                        return dissolve_pol(da_slice, das_others_slice, wrap, extend, weight)[np.newaxis, ...]
+
+                    # Create separate delayed array for each stack element for parallelization
+                    delayed_slices = []
+                    for i in range(n_stack):
+                        da_slice = da_current.isel({stackvar: i})
+                        das_others_slice = [d.isel({stackvar: i}) for d in das_others]
+                        # Create 3D delayed array with shape (1, y, x) and chunks (1, -1, -1)
+                        delayed_slice = da.from_delayed(
+                            dask.delayed(dissolve_pol_3d)(da_slice, das_others_slice, wrap, extend, weight),
+                            shape=(1,) + shape_2d,
+                            dtype=da_current.dtype
+                        )
+                        delayed_slices.append(delayed_slice)
+
+                    # Concatenate along axis 0 - each slice is already (1, y, x)
+                    delayed_array = da.concatenate(delayed_slices, axis=0)
+                else:
+                    # 2D case - single delayed array
+                    delayed_array = da.from_delayed(
+                        dask.delayed(dissolve_pol)(da_current, das_others, wrap, extend, weight),
+                        shape=da_current.shape,
+                        dtype=da_current.dtype
+                    )
                 new_ds[pol] = da_current.copy(data=delayed_array)
 
             output[bid] = new_ds
