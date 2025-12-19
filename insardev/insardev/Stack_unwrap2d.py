@@ -2641,44 +2641,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
     # =========================================================================
 
     @staticmethod
-    def _get_torch_device():
-        """
-        Detect and return the best available PyTorch device.
-
-        Returns
-        -------
-        torch.device
-            The best available device (MPS for Apple Silicon, CUDA, or CPU).
-        str
-            Device name for display.
-
-        Notes
-        -----
-        MPS (Apple Silicon GPU) does not work in forked/spawned child processes
-        (e.g., Dask workers). This function attempts to detect such cases by
-        doing a simple tensor operation and falls back to CPU if it fails.
-        """
-        import torch
-
-        if torch.backends.mps.is_available():
-            try:
-                # Test that MPS actually works (may fail in forked processes)
-                device = torch.device("mps")
-                test = torch.zeros(1, device=device)
-                del test
-                return device, "MPS (Apple Silicon GPU)"
-            except Exception:
-                # MPS not available in this process (e.g., Dask worker)
-                pass
-        if torch.cuda.is_available():
-            try:
-                device = torch.device("cuda")
-                return device, f"CUDA ({torch.cuda.get_device_name(0)})"
-            except Exception:
-                pass
-        return torch.device("cpu"), "CPU"
-
-    @staticmethod
     def _dct_unwrap_2d_single(phase, valid, device, dtype):
         """
         Single-scale DCT unwrapping (internal helper).
@@ -2716,10 +2678,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
         dy = torch.atan2(torch.sin(dy), torch.cos(dy))
 
         # Zero out gradients at invalid edges
-        dx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).float()
-        dy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).float()
+        dx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).to(dtype)
+        dy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).to(dtype)
 
-        # Compute divergence
+        # Compute divergence (rho = div(gradient))
         rho = torch.zeros_like(phase)
         rho[:, 1:] += dx[:, :-1]
         rho[:, :-1] -= dx[:, :-1]
@@ -2741,7 +2703,13 @@ class Stack_unwrap2d(Stack_unwrap1d):
         phi_dct = rho_dct / (-eigenvalues + 1e-10)
         phi_dct[0, 0] = 0.0  # DC = 0
 
-        return idct_2d(phi_dct)
+        result = idct_2d(phi_dct)
+
+        # Re-center result to improve float32 precision (keeps values near zero)
+        if valid.any():
+            result = result - result[valid].mean()
+
+        return result
 
     @staticmethod
     def _dct_unwrap_2d(phase, device=None, debug=False):
@@ -2792,18 +2760,35 @@ class Stack_unwrap2d(Stack_unwrap1d):
         """
         import torch
 
-        if device is None:
-            device, _ = Stack_unwrap2d._get_torch_device()
+        # Validate and set device
+        if device is None or device == 'auto':
+            # Auto-select best available device
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+            elif torch.backends.mps.is_available():
+                device = torch.device('mps')
+            else:
+                device = torch.device('cpu')
+        elif isinstance(device, str):
+            device = torch.device(device)
+
+        # Check GPU availability for explicit device requests
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device requested but not available. "
+                f"Use device='cpu' or device='auto' instead."
+            )
+        if device.type == 'mps' and not torch.backends.mps.is_available():
+            raise RuntimeError(
+                f"MPS device requested but not available. "
+                f"Use device='cpu' or device='auto' instead."
+            )
 
         height, width = phase.shape
 
-        # Use float64 for large grids to maintain numerical precision
-        # MPS doesn't support float64, so fall back to CPU for large grids
-        use_float64 = height * width > 4_000_000
-        if use_float64 and device.type == 'mps':
-            device = torch.device('cpu')  # MPS doesn't support float64
-        dtype = torch.float64 if use_float64 else torch.float32
-        np_dtype = np.float64 if use_float64 else np.float32
+        # Use float32 for all devices - sufficient for phase unwrapping
+        dtype = torch.float32
+        np_dtype = np.float32
 
         # Handle NaN values
         nan_mask = np.isnan(phase)
@@ -2813,15 +2798,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         # Fill NaN with 0 for computation
         phase_filled = np.where(nan_mask, 0.0, phase)
 
-        # Convert to torch - with fallback to CPU if GPU fails
-        try:
-            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
-            valid = torch.from_numpy(~nan_mask).to(device)
-        except Exception:
-            # GPU failed (e.g., MPS in forked process), fall back to CPU
-            device = torch.device("cpu")
-            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
-            valid = torch.from_numpy(~nan_mask).to(device)
+        # Convert to torch
+        phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+        valid = torch.from_numpy(~nan_mask).to(device)
 
         # Single-scale DCT unwrap
         unwrapped = Stack_unwrap2d._dct_unwrap_2d_single(phi, valid, device, dtype)
@@ -2909,24 +2888,36 @@ class Stack_unwrap2d(Stack_unwrap1d):
         from torch_dct import dct_2d, idct_2d
         import time
 
-        if device is None:
-            device, device_name = Stack_unwrap2d._get_torch_device()
-        else:
-            device_name = str(device)
+        # Validate and set device
+        if device is None or device == 'auto':
+            # Auto-select best available device
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+            elif torch.backends.mps.is_available():
+                device = torch.device('mps')
+            else:
+                device = torch.device('cpu')
+        elif isinstance(device, str):
+            device = torch.device(device)
 
+        # Check GPU availability for explicit device requests
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device requested but not available. "
+                f"Use device='cpu' or device='auto' instead."
+            )
+        if device.type == 'mps' and not torch.backends.mps.is_available():
+            raise RuntimeError(
+                f"MPS device requested but not available. "
+                f"Use device='cpu' or device='auto' instead."
+            )
+
+        device_name = str(device)
         height, width = phase.shape
 
-        # Use float64 for large grids to maintain numerical precision
-        # MPS doesn't support float64, so fall back to CPU for large grids
-        use_float64 = (device.type == 'cpu')
-        if device.type == 'cuda' and height * width > 4_000_000:
-            use_float64 = True
-        if device.type == 'mps' and height * width > 4_000_000:
-            # MPS doesn't support float64, fall back to CPU for precision
-            device = torch.device('cpu')
-            device_name = 'CPU (precision fallback)'
-            use_float64 = True
-        dtype = torch.float64 if use_float64 else torch.float32
+        # Use float32 for all devices - sufficient for phase unwrapping
+        dtype = torch.float32
+        np_dtype = np.float32
 
         _t_start = time.time()
 
@@ -2950,21 +2941,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
         else:
             weight_filled = np.where(nan_mask, 0.0, 1.0)
 
-        # Convert to torch tensors - with fallback to CPU if GPU fails
-        np_dtype = np.float64 if use_float64 else np.float32
-        try:
-            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
-            w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
-            valid = torch.from_numpy(valid_mask).to(device)
-        except Exception:
-            # GPU failed (e.g., MPS in forked process), fall back to CPU
-            device = torch.device("cpu")
-            device_name = "CPU (fallback)"
-            dtype = torch.float64
-            np_dtype = np.float64
-            phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
-            w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
-            valid = torch.from_numpy(valid_mask).to(device)
+        # Convert to torch tensors
+        phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
+        w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
+        valid = torch.from_numpy(valid_mask).to(device)
 
         # Compute wrapped phase differences (target gradients)
         dx_target = torch.zeros_like(phi)
@@ -2986,16 +2966,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
         wx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).to(dtype)
         wy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).to(dtype)
 
-        # Check if we need compensated arithmetic for numerical stability
-        # Large grids with float32 need error compensation to maintain precision
-        use_compensated = not use_float64 and height * width > 1_000_000
-
         # Precompute DCT eigenvalues for preconditioner
-        i_idx = torch.arange(height, dtype=dtype, device=device)
-        j_idx = torch.arange(width, dtype=dtype, device=device)
+        # IMPORTANT: Trigonometric functions require float64 precision!
+        # Small errors in cos() accumulate through thousands of preconditioner
+        # applications in the CG solver. Using float32 on GPU for eigenvalues
+        # causes residuals to degrade from ~0.4 rad to ~1.4 rad at 6400x6400.
+        # Compute on CPU with float64, then convert to float32 and transfer.
+        i_idx = torch.arange(height, dtype=torch.float64)
+        j_idx = torch.arange(width, dtype=torch.float64)
         cos_i = torch.cos(torch.pi * i_idx / height)
         cos_j = torch.cos(torch.pi * j_idx / width)
-        eigenvalues = 2 * cos_i.unsqueeze(1) + 2 * cos_j.unsqueeze(0) - 4
+        eigenvalues = (2 * cos_i.unsqueeze(1) + 2 * cos_j.unsqueeze(0) - 4).to(dtype).to(device)
         eigenvalues[0, 0] = 1.0  # Avoid division by zero
 
         # Pre-allocate buffers for gradient computation (avoid repeated allocation)
@@ -3032,13 +3013,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
             return idct_2d(r_dct)
 
         def conjugate_gradient(b, wx_irls, wy_irls, x0, max_iter_cg, tol_cg):
-            """
-            Preconditioned conjugate gradient solver with Kahan summation.
-
-            Uses compensated summation (Kahan algorithm) for float32 on large grids
-            to maintain numerical precision. The solution x is split into two
-            components: x_sum (main value) and x_comp (error compensation).
-            """
+            """Preconditioned conjugate gradient solver for IRLS."""
             x = x0  # No clone - modify in place, caller provides buffer
             r = b - apply_laplacian(x, wx_irls, wy_irls)
 
@@ -3049,9 +3024,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
             z = apply_preconditioner(r)
             p = z.clone()  # Need clone here - p gets modified
             rz = torch.sum(r * z)
-
-            # Kahan compensation term for x (tracks accumulated rounding errors)
-            x_comp = torch.zeros_like(x) if use_compensated else None
 
             for i in range(max_iter_cg):
                 Ap = apply_laplacian(p, wx_irls, wy_irls).clone()  # Need clone - buffer reused
@@ -3064,17 +3036,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 alpha = torch.clamp(alpha, -1e6, 1e6)
                 alpha_val = alpha.item()
 
-                # Update x with Kahan summation for better precision
-                if use_compensated:
-                    # Kahan summation: y = (alpha * p) - x_comp
-                    y = alpha_val * p - x_comp
-                    # t = x + y (may lose precision)
-                    t = x + y
-                    # x_comp = (t - x) - y (recovers lost precision)
-                    x_comp = (t - x) - y
-                    x.copy_(t)
-                else:
-                    x.add_(p, alpha=alpha_val)
+                # Update x
+                x.add_(p, alpha=alpha_val)
 
                 r.sub_(Ap, alpha=alpha_val)
 
@@ -3118,7 +3081,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         # Re-center DCT result to improve float32 precision
         # This keeps values near zero where float32 has best precision
-        if use_compensated and valid.any():
+        if valid.any():
             u_mean = u[valid].mean()
             u.sub_(u_mean)
 
@@ -3155,7 +3118,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
             # Re-center u to prevent numerical drift (important for float32)
             # Phase unwrapping only cares about gradients, so mean is arbitrary
-            if use_compensated and valid.any():
+            if valid.any():
                 u_mean = u[valid].mean()
                 u.sub_(u_mean)
 
@@ -3257,188 +3220,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         return unwrapped
 
-    def unwrap2d_dct(self, phase, conncomp=False, conncomp_size=100, debug=False):
-        """
-        Unwrap phase using GPU-accelerated DCT-based Poisson solver (unweighted L² norm).
-
-        Fast algorithm for quick preview. Based on Ghiglia & Romero (1994).
-        GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA on NVIDIA,
-        or CPU fallback).
-
-        This same DCT algorithm is used internally as the initial solution
-        for IRLS, which then refines it with weighted iterations.
-
-        **Important**: Unweighted DCT does not handle phase residues (inconsistencies)
-        properly. Residues cause different error patterns in different bursts,
-        leading to burst-to-burst inconsistency. For consistent multi-burst
-        results, use IRLS with correlation weighting.
-
-        Parameters
-        ----------
-        phase : BatchWrap
-            Batch of wrapped phase datasets with 'pair' dimension.
-        conncomp : bool, optional
-            If True, also return connected components. Default is False.
-        conncomp_size : int, optional
-            Minimum number of pixels for a connected component to be processed.
-            Components smaller than this are left as NaN. Default is 100.
-        debug : bool, optional
-            If True, print diagnostic information. Default is False.
-
-        Returns
-        -------
-        Batch or tuple
-            If conncomp is False: Batch of unwrapped phase.
-            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp).
-
-        Notes
-        -----
-        - GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA, or CPU)
-        - Very fast: <100ms for 1000x1000 images on GPU
-        - No quality weighting - residues propagate as global errors
-        - Best for: low-noise data, single images, quick preview
-        - Not suitable for: multi-burst consistency, noisy data with residues
-        - Used as initial solution for IRLS (which adds weighted refinement)
-
-        See Also
-        --------
-        unwrap2d_irls : Weighted L¹ norm (recommended for InSAR production)
-        """
-        import xarray as xr
-        from .Batch import Batch, BatchWrap, BatchUnit
-
-        assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
-
-        device, device_name = self._get_torch_device()
-        if debug:
-            print(f'Using device: {device_name}')
-
-        # Process each burst in the batch
-        unwrap_result = {}
-        conncomp_result = {}
-
-        burst_idx = 0
-        for key in phase.keys():
-            phase_ds = phase[key]
-
-            if debug:
-                print(f'\nProcessing burst {burst_idx}: {key}')
-            burst_idx += 1
-
-            # Get data variables (typically polarization like 'VV')
-            data_vars = list(phase_ds.data_vars)
-
-            unwrap_vars = {}
-            comp_vars = {}
-
-            for var in data_vars:
-                phase_da = phase_ds[var]
-
-                # Process each pair in the stack
-                if 'pair' in phase_da.dims:
-                    results = []
-                    comp_results = []
-                    for i in range(phase_da.sizes['pair']):
-                        phase_slice = phase_da.isel(pair=i).values
-                        unwrapped, labels = self._process_dct_slice(
-                            phase_slice, device, conncomp_size, debug
-                        )
-                        results.append(unwrapped)
-                        comp_results.append(labels)
-
-                    result_data = np.stack(results, axis=0)
-                    result_da = xr.DataArray(
-                        result_data,
-                        dims=phase_da.dims,
-                        coords=phase_da.coords,
-                        attrs={'units': 'radians'}
-                    )
-                    comp_data = np.stack(comp_results, axis=0)
-                    comp_da = xr.DataArray(
-                        comp_data,
-                        dims=phase_da.dims,
-                        coords=phase_da.coords
-                    )
-                else:
-                    phase_np = phase_da.values
-                    unwrapped, labels = self._process_dct_slice(
-                        phase_np, device, conncomp_size, debug
-                    )
-                    result_da = xr.DataArray(
-                        unwrapped,
-                        dims=phase_da.dims,
-                        coords=phase_da.coords,
-                        attrs={'units': 'radians'}
-                    )
-                    comp_da = xr.DataArray(
-                        labels,
-                        dims=phase_da.dims,
-                        coords=phase_da.coords
-                    )
-
-                unwrap_vars[var] = result_da
-                comp_vars[var] = comp_da
-
-            # Preserve dataset attributes (subswath, pathNumber, etc.)
-            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
-            conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
-
-        output = Batch(unwrap_result)
-
-        if conncomp:
-            return output, BatchUnit(conncomp_result)
-        return output
-
-    def _process_dct_slice(self, phase_np, device, conncomp_size, debug):
-        """Process a single 2D phase slice with DCT unwrapping."""
-        if debug:
-            print(f'  Slice shape: {phase_np.shape}, '
-                  f'valid: {np.sum(~np.isnan(phase_np))}, '
-                  f'phase range: [{np.nanmin(phase_np):.3f}, {np.nanmax(phase_np):.3f}]')
-
-        if np.all(np.isnan(phase_np)):
-            if debug:
-                print('  All NaN, skipping')
-            return phase_np.astype(np.float32), np.zeros_like(phase_np, dtype=np.int32)
-
-        # Get connected components
-        labels = self._conncomp_2d(phase_np)
-        unique_labels = np.unique(labels[labels > 0])
-
-        if debug:
-            print(f'  Connected components: {len(unique_labels)}')
-
-        # Process each component
-        result = np.full_like(phase_np, np.nan, dtype=np.float32)
-
-        for label in unique_labels:
-            mask = labels == label
-            comp_size = np.sum(mask)
-            if comp_size < conncomp_size:
-                continue
-
-            # Extract component bounding box for efficiency
-            rows, cols = np.where(mask)
-            r0, r1 = rows.min(), rows.max() + 1
-            c0, c1 = cols.min(), cols.max() + 1
-
-            if debug:
-                print(f'  Component {label}: size={comp_size}, '
-                      f'bbox=[{r0}:{r1}, {c0}:{c1}] ({r1-r0}x{c1-c0})')
-
-            phase_crop = phase_np[r0:r1, c0:c1].copy()
-            mask_crop = mask[r0:r1, c0:c1]
-            phase_crop[~mask_crop] = np.nan
-
-            # Unwrap using DCT
-            unwrapped_crop = self._dct_unwrap_2d(phase_crop, device=device, debug=debug)
-
-            # Place back
-            result[r0:r1, c0:c1] = np.where(mask_crop, unwrapped_crop, result[r0:r1, c0:c1])
-
-        return result, labels
-
-    def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100,
+    def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100, device='auto',
                       max_iter=10, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
@@ -3464,6 +3246,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         conncomp_size : int, optional
             Minimum number of pixels for a connected component to be processed.
             Components smaller than this are left as NaN. Default is 100.
+        device : str, optional
+            Device for computation: 'auto' (default), 'cpu', 'cuda', or 'mps'.
+            'auto' selects the best available GPU, falling back to CPU.
         max_iter : int, optional
             Maximum IRLS iterations. Default is 10.
         tol : float, optional
@@ -3495,16 +3280,29 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         See Also
         --------
-        unwrap2d_dct : Fast L² estimation (used as initial solution here)
         unwrap2d_minflow : CPU-based L¹ unwrapping using min-cost flow
         """
+        import torch
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
 
         assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
         assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
 
-        device, device_name = self._get_torch_device()
+        # Resolve device
+        if device == 'auto':
+            if torch.cuda.is_available():
+                device = 'cuda'
+                device_name = f"CUDA ({torch.cuda.get_device_name(0)})"
+            elif torch.backends.mps.is_available():
+                device = 'mps'
+                device_name = "MPS (Apple Silicon GPU)"
+            else:
+                device = 'cpu'
+                device_name = "CPU"
+        else:
+            device_name = device.upper()
+
         if debug:
             print(f'Using device: {device_name}')
 
