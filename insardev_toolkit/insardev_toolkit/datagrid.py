@@ -187,13 +187,6 @@ class datagrid:
                                                        standard_name='longitude',
                                                        long_name="longitude"))
                   .assign_attrs({'Conventions': 'CF-1.8'}))
-            if isinstance(da_spatial, xr.Dataset):
-                da_spatial = da_spatial.assign({
-                    var: da_spatial[var].assign_attrs(grid_mapping='spatial_ref', coordinates='lon lat')  
-                        for var in da_spatial.data_vars if 'lat' in da_spatial[var].dims and 'lon' in da_spatial[var].dims
-                })
-            else:
-                da_spatial = da_spatial.assign_attrs(grid_mapping='spatial_ref', coordinates='lon lat')
         else:
             # projected coordinates
             da_spatial = (
@@ -208,14 +201,6 @@ class datagrid:
                                                    long_name="easting"))
                   .assign_attrs({'Conventions': 'CF-1.8'}))
     
-            if isinstance(da_spatial, xr.Dataset):
-                da_spatial = da_spatial.assign({
-                    var: da_spatial[var].assign_attrs(grid_mapping='spatial_ref', coordinates='x y')  
-                        for var in da_spatial.data_vars if 'y' in da_spatial[var].dims and 'x' in da_spatial[var].dims
-                })
-            else:
-                da_spatial = da_spatial.assign_attrs(grid_mapping='spatial_ref', coordinates='x y')
-
         return da_spatial.assign_attrs(coordinates='spatial_ref')
 
     @staticmethod
