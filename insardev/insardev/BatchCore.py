@@ -1853,7 +1853,7 @@ class BatchCore(dict):
 
         return type(self)(out)
 
-    def residuals(self, polarization: str = 'VV', debug: bool = False) -> float | list[float]:
+    def residuals(self, polarization: str | None = None, debug: bool = False) -> float | list[float]:
         """
         Measure phase offset discrepancy across all burst overlaps.
 
@@ -1864,7 +1864,8 @@ class BatchCore(dict):
         Parameters
         ----------
         polarization : str, optional
-            Polarization to use for residual computation (default 'VV').
+            Polarization to use for residual computation. Auto-detected if
+            only one variable exists, otherwise defaults to 'VV'.
         debug : bool, optional
             Print debug information for each overlap. Default is False.
 
@@ -1910,9 +1911,11 @@ class BatchCore(dict):
         # Collect burst extents and detect pair dimension
         ids = sorted(self.keys())
 
-        # Validate polarization exists
+        # Auto-detect polarization if not specified
         sample_ds = self[ids[0]]
         available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        if polarization is None:
+            polarization = available_pols[0]
         if polarization not in available_pols:
             raise ValueError(f"Polarization '{polarization}' not found. Available: {available_pols}")
 
@@ -2073,7 +2076,7 @@ class BatchCore(dict):
     def fit(self,
             degree: int = 0,
             method: str = 'median',
-            polarization: str = 'VV',
+            polarization: str | None = None,
             debug: bool = False,
             return_residuals: bool = False):
         """
@@ -2092,7 +2095,8 @@ class BatchCore(dict):
         method : str, optional
             Estimation method: 'median' (robust) or 'mean' (faster).
         polarization : str, optional
-            Polarization to use for coefficient estimation (default 'VV').
+            Polarization to use for coefficient estimation. Auto-detected if
+            only one variable exists, otherwise defaults to 'VV'.
         debug : bool, optional
             Print debug information. Default is False.
         return_residuals : bool, optional
@@ -2176,9 +2180,11 @@ class BatchCore(dict):
         n_bursts = len(ids)
         id_to_idx = {bid: i for i, bid in enumerate(ids)}
 
-        # Validate polarization exists
+        # Auto-detect polarization if not specified
         sample_ds = self[ids[0]]
         available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        if polarization is None:
+            polarization = available_pols[0]
         if polarization not in available_pols:
             raise ValueError(f"Polarization '{polarization}' not found. Available: {available_pols}")
 
@@ -2586,7 +2592,7 @@ class BatchCore(dict):
     def align(self,
               degree: int = 0,
               method: str = 'median',
-              polarization: str = 'VV',
+              polarization: str | None = None,
               debug: bool = False,
               return_residuals: bool = False):
         """
@@ -2608,7 +2614,8 @@ class BatchCore(dict):
         method : str, optional
             Estimation method: 'median' (robust, default) or 'mean' (faster).
         polarization : str, optional
-            Polarization to use for coefficient estimation (default 'VV').
+            Polarization to use for coefficient estimation. Auto-detected if
+            only one variable exists, otherwise defaults to 'VV'.
             Corrections are applied to all polarizations since phase offsets
             are the same for all polarizations (same geometry).
         debug : bool, optional
@@ -2665,6 +2672,13 @@ class BatchCore(dict):
         # Validate class type
         if not isinstance(self, (Batch, BatchWrap)):
             raise TypeError(f"align() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
+
+        # Auto-detect polarization if not specified
+        if polarization is None:
+            ids = list(self.keys())
+            sample_ds = self[ids[0]]
+            available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+            polarization = available_pols[0]
 
         if degree == 0:
             # Single-step offset correction
