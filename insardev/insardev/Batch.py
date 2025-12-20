@@ -170,7 +170,7 @@ class BatchWrap(BatchCore):
         """
         Converts wrapped phase to complex numbers before aggregation and back to wrapped phase after.
         """
-        print ('wrap _agg')
+        #print ('wrap _agg')
         import inspect
         import xarray as xr
         import pandas as pd
@@ -224,12 +224,12 @@ class BatchWrap(BatchCore):
             
         #print ('wrap _agg self.chunks', self.chunks)
         #return type(self)(out).chunk(self.chunks)
-        print ('wrap _agg self.chunks', self.chunks)
+        #print ('wrap _agg self.chunks', self.chunks)
         # filter out collapsed dimensions
         sample = next(iter(out.values()), None)
         dims = (sample.dims or []) if hasattr(sample, 'dims') else []
         chunks = {d: size for d, size in self.chunks.items() if d in dims}
-        print ('wrap chunks', chunks)
+        #print ('wrap chunks', chunks)
         result = type(self)(out)
         if chunks:
             return result.chunk(chunks)
