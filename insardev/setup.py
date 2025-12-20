@@ -46,8 +46,14 @@ setup(
                       'xarray',
                       'numpy',
                       'numba',
+                      'torch',
+                      'torch_dct',
+                      'ortools',
                       'pandas',
                       'geopandas',
+                      'shapely',
+                      'rasterio',
+                      'rioxarray',
                       'distributed',
                       'dask[complete]',
                       'zarr',
@@ -61,11 +67,14 @@ setup(
                       'seaborn',
                       'bottleneck',
                       'fsspec',
-                      'aiohttp'
+                      'aiohttp',
+                      'tqdm',
+                      'joblib'
                       ],
-#    extras_require={
-#                      'vtk_support': ['vtk', 'panel']
-#    },
+    extras_require={
+                      'vtk_support': ['vtk', 'panel'],
+                      'cv': ['opencv-python']
+    },
     classifiers=[
         'Development Status :: 4 - Beta',
         'Intended Audience :: Science/Research',
