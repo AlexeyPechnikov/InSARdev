@@ -1316,6 +1316,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None else None
 
+                # Save original coordinates before chunking (they may become lazy)
+                # For dask arrays, compute() to get actual values
+                original_coords = {}
+                for k, v in phase_da.coords.items():
+                    if hasattr(v, 'data') and hasattr(v.data, 'compute'):
+                        original_coords[k] = v.compute().values
+                    elif hasattr(v, 'values'):
+                        original_coords[k] = v.values
+                    else:
+                        original_coords[k] = v
+
                 # Ensure data is chunked for lazy processing (1 chunk per pair)
                 if 'pair' in phase_da.dims:
                     if not isinstance(phase_da.data, dask.array.Array):
@@ -1364,9 +1375,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 result_da.attrs['units'] = 'radians'
                 comp_da = result.isel(output=1).astype(np.int32)
 
-                # Restore coordinates
-                result_da = result_da.assign_coords(phase_da.coords)
-                comp_da = comp_da.assign_coords(phase_da.coords)
+                # Restore coordinates from original (non-lazy) values
+                result_da = result_da.assign_coords(original_coords)
+                comp_da = comp_da.assign_coords(original_coords)
 
                 unwrap_vars[var] = result_da
                 comp_vars[var] = comp_da
