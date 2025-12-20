@@ -1318,14 +1318,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 # Save original coordinates before chunking (they may become lazy)
                 # For dask arrays, compute() to get actual values
+                # Preserve dimension info for non-dimension coordinates (like BPR along 'pair')
                 original_coords = {}
                 for k, v in phase_da.coords.items():
                     if hasattr(v, 'data') and hasattr(v.data, 'compute'):
-                        original_coords[k] = v.compute().values
+                        vals = v.compute().values
                     elif hasattr(v, 'values'):
-                        original_coords[k] = v.values
+                        vals = v.values
                     else:
-                        original_coords[k] = v
+                        vals = v
+                    # Preserve dimension tuple for coordinates that have dimensions
+                    # different from their name (e.g., BPR with dims=('pair',))
+                    if hasattr(v, 'dims') and len(v.dims) > 0 and v.dims != (k,):
+                        original_coords[k] = (v.dims, vals)
+                    else:
+                        original_coords[k] = vals
 
                 # Ensure data is chunked for lazy processing (1 chunk per pair)
                 if 'pair' in phase_da.dims:
