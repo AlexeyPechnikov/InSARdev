@@ -1185,7 +1185,19 @@ class BatchCore(dict):
         import dask
         from insardev_toolkit.progressbar import progressbar
         progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
-        return type(self)(result)
+        # Ensure coordinates are also computed (not lazy dask arrays)
+        computed = {}
+        for key, ds in result.items():
+            # Compute any lazy coordinates, preserving their dims
+            new_coords = {}
+            for name, coord in ds.coords.items():
+                if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
+                    # Preserve original dims when assigning computed values
+                    new_coords[name] = (coord.dims, coord.compute().values)
+            if new_coords:
+                ds = ds.assign_coords(new_coords)
+            computed[key] = ds
+        return type(self)(computed)
 
     def to_dataframe(self,
                      crs: str | int | None = 'auto',
@@ -1329,7 +1341,7 @@ class BatchCore(dict):
         sample = next(iter(self.values()))
         return sample.y.diff('y').item(0), sample.x.diff('x').item(0)
     
-    def downsample(self, new_spacing: tuple[float, float] | float | int):
+    def downsample(self, new_spacing: tuple[float, float] | float | int, debug: bool = False):
         """
         Update the Batch data onto a grid with the given (y, x) spacing.
         Like to coarsening but with cell size in meters instead of pixels:
@@ -1346,7 +1358,8 @@ class BatchCore(dict):
         # If both scale factors are 1, no downsampling needed - return as is
         if yscale == 1 and xscale == 1:
             return self
-        print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
+        if debug:
+            print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
         return self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
