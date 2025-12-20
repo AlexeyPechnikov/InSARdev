@@ -81,8 +81,8 @@ class Stack_phasediff(Stack_base):
         if not complex:
             phasediff_look = phasediff_look.angle()
 
-        # BPR differences aligned with pair dimension: BPR(ref) - BPR(rep)
-        bpr = data1[['BPR']].drop_vars('pair') - data2[['BPR']].drop_vars('pair')
+        # BPR differences aligned with pair dimension: BPR(rep) - BPR(ref)
+        bpr = data2[['BPR']].drop_vars('pair') - data1[['BPR']].drop_vars('pair')
         #print ('bpr', bpr.to_dict())
 
         def as_xarray(batch):
@@ -96,7 +96,7 @@ class Stack_phasediff(Stack_base):
         
         if corr_look is None:
             return as_xarray(phasediff_look)
-        return (as_xarray(da) for da in [phasediff_look, corr_look])
+        return (as_xarray(phasediff_look), as_xarray(corr_look))
 
     def phasediff_singlelook(self, *args, **kwarg):
         from .Batch import BatchComplex
