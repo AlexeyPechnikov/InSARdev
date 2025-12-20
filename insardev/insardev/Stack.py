@@ -127,14 +127,16 @@ class Stack(Stack_plot, BatchCore):
 
     def to_vtk(self, path: str, data: BatchCore | dict | None = None,
                transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
-        """Export all pairs of each burst into a single VTK per burst.
+        """Export to VTK.
 
-        Each pair becomes a variable named ``{varname}_{yyyymmdd}_{yyyymmdd}``.
+        Merges bursts using to_dataset() and exports one VTK file per data variable
+        (e.g., VV.vtk). Within each file, pairs become separate VTK arrays named
+        by date (e.g., 20190708_20190702).
 
         Parameters
         ----------
         path : str
-            Output directory (one VTK per burst) or explicit ``.vtk`` file path when exporting a single burst.
+            Output directory for VTK files.
         data : BatchCore | dict | None, optional
             Data to export. If ``None``, export this Stack. Accepts any mapping convertible to ``Batch``.
         transform : Batch | None, optional
@@ -155,21 +157,13 @@ class Stack(Stack_plot, BatchCore):
         target = data if data is not None else self
         if not isinstance(target, BatchCore):
             target = Batch(target)
-        tfm = transform
+        # Default to self.transform() when called on Stack and transform not provided
+        tfm = transform if transform is not None else self.transform()
         if tfm is not None and not isinstance(tfm, BatchCore):
             tfm = Batch(tfm)
 
         if not target:
             return
-
-        def _interp_to_grid(source: xr.DataArray, target_da: xr.DataArray) -> xr.DataArray:
-            if {'y', 'x'}.issubset(source.dims):
-                return source.interp(y=target_da.y, x=target_da.x, method='linear')
-            if {'lat', 'lon'}.issubset(source.dims):
-                if {'lat', 'lon'}.issubset(target_da.coords):
-                    return source.interp(lat=target_da.lat, lon=target_da.lon, method='linear')
-                return source.rename({'lat': 'y', 'lon': 'x'}).interp(y=target_da.y, x=target_da.x, method='linear')
-            return source
 
         def _format_dt(val):
             try:
@@ -183,50 +177,70 @@ class Stack(Stack_plot, BatchCore):
         def _format_pair(val):
             if isinstance(val, (list, tuple)) and len(val) == 2:
                 return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
+            # Handle string format from to_dataset(): "2019-07-02 2019-07-08"
+            if isinstance(val, str) and ' ' in val:
+                parts = val.split()
+                if len(parts) == 2:
+                    return f"{_format_dt(parts[0])}_{_format_dt(parts[1])}"
             return _format_dt(val)
 
-        is_file = path.lower().endswith('.vtk') and len(target) == 1
-        if not is_file:
-            os.makedirs(path, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
 
-        with tqdm(total=len(target), desc='Exporting VTK') as pbar:
-            for burst, ds in target.items():
-                if not ds.data_vars:
-                    pbar.update(1)
-                    continue
+        # Merge bursts into unified dataset(s) per variable
+        merged = target.to_dataset()
+        if isinstance(merged, xr.DataArray):
+            merged = merged.to_dataset()
 
-                data_var = next(iter(ds.data_vars))
+        # Get transform elevation merged via to_dataset()
+        topo_merged = None
+        if tfm is not None:
+            # Use [['ele']] to get a Batch of Datasets with just 'ele' variable
+            if any('ele' in ds for ds in tfm.values()):
+                topo_merged = tfm[['ele']].to_dataset()
+            elif any('z' in ds for ds in tfm.values()):
+                topo_merged = tfm[['z']].to_dataset()
+                if isinstance(topo_merged, xr.DataArray):
+                    topo_merged = topo_merged.rename('ele')
+                elif isinstance(topo_merged, xr.Dataset) and 'z' in topo_merged:
+                    topo_merged = topo_merged.rename({'z': 'ele'})
 
-                if 'pair' in ds.dims:
-                    pair_coord = ds.coords.get('pair')
-                    pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
+        # Group by data variable (polarization)
+        data_vars = list(merged.data_vars)
+
+        with tqdm(total=len(data_vars), desc='Exporting VTK') as pbar:
+            for data_var in data_vars:
+                da = merged[data_var]
+
+                # Handle pair dimension
+                if 'pair' in da.dims:
+                    pair_coord = da.coords.get('pair')
+                    pair_values = pair_coord.values if pair_coord is not None else range(da.sizes.get('pair', 0))
                     export_items = []
                     for i, pair_val in enumerate(pair_values):
-                        ds_slice = ds.isel(pair=i)
-                        if 'pair' in ds_slice.dims:
-                            ds_slice = ds_slice.squeeze('pair', drop=True)
-                        else:
-                            ds_slice = ds_slice.squeeze(drop=True)
-                        export_items.append((pair_val, ds_slice))
+                        da_slice = da.isel(pair=i)
+                        if 'pair' in da_slice.dims:
+                            da_slice = da_slice.squeeze('pair', drop=True)
+                        export_items.append((pair_val, da_slice))
                 else:
-                    export_items = [(None, ds)]
+                    export_items = [(None, da)]
 
                 if not export_items:
                     pbar.update(1)
                     continue
 
-                ref_da = export_items[0][1][data_var]
+                ref_da = export_items[0][1]
                 layers = []
 
-                if tfm is not None and burst in tfm:
-                    tfm_ds = tfm[burst]
-                    topo_da = tfm_ds.get('ele') if 'ele' in tfm_ds else tfm_ds.get('z') if 'z' in tfm_ds else None
+                # Add topography from transform
+                if topo_merged is not None:
+                    topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
                     if topo_da is not None:
-                        topo_da = _interp_to_grid(topo_da, ref_da)
+                        topo_da = topo_da.interp(y=ref_da.y, x=ref_da.x, method='linear')
                         if mask:
                             topo_da = topo_da.where(np.isfinite(ref_da))
                         layers.append(topo_da.rename('z'))
 
+                # Add overlay
                 if overlay is not None:
                     if not isinstance(overlay, xr.DataArray):
                         raise TypeError("overlay must be an xarray.DataArray (e.g., an RGB raster)")
@@ -243,19 +257,18 @@ class Stack(Stack_plot, BatchCore):
                                         lon=slice(float(ref_da.lon.min()), float(ref_da.lon.max())))
                         except Exception:
                             pass
-                    ov = _interp_to_grid(ov, ref_da)
+                    ov = ov.interp(y=ref_da.y, x=ref_da.x, method='linear')
                     layers.append(ov.rename('colors'))
 
-                for pair_val, ds_item in export_items:
-                    da_item = ds_item[data_var]
-                    var_name = data_var if pair_val is None else f"{data_var}_{_format_pair(pair_val)}"
+                # Add data arrays with pair names
+                for pair_val, da_item in export_items:
+                    var_name = _format_pair(pair_val) if pair_val is not None else data_var
                     layers.append(da_item.rename(var_name))
 
                 ds_out = xr.merge(layers, compat='override', join='left')
                 vtk_grid = as_vtk(ds_out)
 
-                filename = path if is_file else os.path.join(path, f"{burst}.vtk")
-                os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+                filename = os.path.join(path, f"{data_var}.vtk")
 
                 writer = vtkStructuredGridWriter()
                 writer.SetFileName(filename)
@@ -760,27 +773,72 @@ class Stack(Stack_plot, BatchCore):
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
 
-    def elevation(self, phase: Batch, transform: Batch, baseline: float | None = None) -> Batch:
+    def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
         """Compute elevation (meters) from unwrapped phase grids in radar coordinates.
 
         Parameters
         ----------
-        phase : Batch
-            Unwrapped phase grids (e.g., output of unwrap2d()).
-        transform : Batch
-            Transform batch containing look vectors; its `.incidence()` is used.
+        phase : Batch | float | list | np.ndarray
+            Unwrapped phase grids (e.g., output of unwrap2d()), or a scalar/array
+            of phase values for quick height-per-fringe calculations.
         baseline : float | None, optional
-            Perpendicular baseline in meters. If ``None``, use the burst-specific
-            ``BPR`` stored in the corresponding transform dataset.
+            Perpendicular baseline in meters. Required when phase is scalar/array.
+            If ``None`` and phase is Batch, use the burst-specific ``BPR``.
+        transform : Batch | None, optional
+            Transform batch containing look vectors; its `.incidence()` is used.
+            If ``None``, defaults to ``self.transform()``.
 
         Returns
         -------
-        Batch
-            Elevation grids as float32 datasets.
+        Batch | float | np.ndarray
+            Elevation grids as float32 datasets, or scalar/array if input was scalar/array.
         """
         import xarray as xr
         import numpy as np
 
+        # Handle scalar/list/array input for quick calculations
+        if not isinstance(phase, BatchCore):
+            if baseline is None:
+                raise ValueError("baseline is required when phase is a scalar/list/array")
+            if transform is None:
+                transform = self.transform()
+
+            # Get average parameters from first burst
+            first_key = next(iter(transform.keys()))
+            tfm = transform[first_key]
+
+            def _scalar_from_ds(ds, name: str):
+                if name in ds:
+                    var = ds[name]
+                    if var.ndim == 0:
+                        return var.item()
+                return ds.attrs.get(name)
+
+            wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
+            slant_start = _scalar_from_ds(tfm, 'SC_height_start')
+            slant_end = _scalar_from_ds(tfm, 'SC_height_end')
+            slant_range = (slant_start + slant_end) / 2  # average slant range
+
+            # Get average incidence angle
+            inc_batch = transform.incidence()
+            inc_da = inc_batch[first_key]['incidence']
+            incidence = float(inc_da.mean().compute())
+
+            # Convert input to numpy array
+            phase_arr = np.asarray(phase)
+            is_scalar = phase_arr.ndim == 0
+
+            # Height from phase formula: h = -λ * φ * R * cos(incidence) / (4π * B⊥)
+            elev = -(wavelength * phase_arr * slant_range * np.cos(incidence) / (4 * np.pi * baseline))
+
+            # Return same type as input, rounded to 3 decimals
+            if is_scalar:
+                return round(float(elev), 3)
+            return np.round(elev, 3)
+
+        # Default to self.transform() when called on Stack and transform not provided
+        if transform is None:
+            transform = self.transform()
         incidence_batch = transform.incidence()
         out: dict[str, xr.Dataset] = {}
 
