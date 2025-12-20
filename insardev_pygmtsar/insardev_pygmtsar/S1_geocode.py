@@ -116,13 +116,25 @@ class S1_geocode(S1_align):
         """
         import xarray as xr
         import os
+        import numpy as np
         ds = xr.open_zarr(store=os.path.join(outdir, 'transform'),
                          consolidated=True,
                           zarr_format=3,
                          chunks='auto')
-        # variables are stored as int32, convert to float32 instead of default float64
+        # variables are stored as int32 with _FillValue=int32.max and scale_factor
+        # modern xarray applies mask_and_scale automatically (attrs become empty)
+        # older versions may not - handle both cases
         for v in ('azi','rng','ele'):
-            ds[v] = ds[v].astype('float32')
+            fill_value = ds[v].attrs.get('_FillValue')
+            scale_factor = ds[v].attrs.get('scale_factor', 1.0)
+            if fill_value is not None:
+                # xarray didn't decode - apply manually
+                data = ds[v].astype('float32')
+                data = data.where(ds[v] != fill_value)
+                ds[v] = data * scale_factor
+            else:
+                # xarray already decoded - just ensure float32
+                ds[v] = ds[v].astype('float32')
         return ds
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
