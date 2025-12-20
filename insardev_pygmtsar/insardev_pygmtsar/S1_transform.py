@@ -88,6 +88,7 @@ class S1_transform(S1_topo):
         import os
         import tempfile
         import shutil
+        import sys
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -197,6 +198,9 @@ class S1_transform(S1_topo):
         refreps = [v for v in refrep_dict.values()]
         
         joblib_backend = None if not debug else 'sequential'
+        # for Google Colab NetCDF compatibility use threading backend
+        if joblib_backend is None and 'google.colab' in sys.modules:
+            joblib_backend = 'threading'
         with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
             joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
 
