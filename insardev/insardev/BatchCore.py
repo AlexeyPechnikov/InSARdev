@@ -2892,7 +2892,7 @@ class BatchCore(dict):
                         valid = np.isfinite(vals)
                         weighted_sum += np.where(valid, vals * w_other, 0.0)
                         weight_sum += np.where(valid, w_other, 0.0)
-                    out = np.where(weight_sum > 0, weighted_sum / weight_sum, np.nan)
+                    out = np.divide(weighted_sum, weight_sum, out=np.full_like(weighted_sum, np.nan), where=weight_sum > 0)
 
                 if not extend:
                     out = np.where(current_valid, out, np.nan)
