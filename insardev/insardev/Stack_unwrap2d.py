@@ -1306,8 +1306,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'\nProcessing burst {burst_idx}: {key}')
             burst_idx += 1
 
-            # Get data variables (typically polarization like 'VV')
-            data_vars = list(phase_ds.data_vars)
+            # Get data variables (typically polarization like 'VV'), excluding spatial_ref
+            data_vars = [v for v in phase_ds.data_vars if v != 'spatial_ref']
 
             unwrap_vars = {}
             comp_vars = {}
@@ -1392,6 +1392,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
             # Preserve dataset attributes (subswath, pathNumber, etc.)
             unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
             conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+            # Preserve CRS from input dataset
+            if phase_ds.rio.crs is not None:
+                unwrap_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
+                conncomp_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
 
         output = Batch(unwrap_result)
 
