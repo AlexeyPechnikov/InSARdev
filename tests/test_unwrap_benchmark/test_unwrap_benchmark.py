@@ -326,6 +326,8 @@ def run_snaphu(phase, correlation, timeout=900):
 
     Returns (unwrapped, elapsed_time, peak_memory_mb) or (None, None, None) on failure/timeout.
     """
+    import psutil
+
     height, width = phase.shape
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -379,17 +381,41 @@ def run_snaphu(phase, correlation, timeout=900):
 
         t0 = time.time()
         try:
-            result = subprocess.run(
+            # Use Popen to monitor memory during execution
+            proc = subprocess.Popen(
                 cmd,
                 cwd=tmpdir,
-                input=config,
-                capture_output=True,
-                timeout=timeout,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True
             )
+
+            # Monitor memory usage while process runs
+            peak_memory_bytes = 0
+            ps_proc = psutil.Process(proc.pid)
+
+            # Send config to stdin
+            proc.stdin.write(config)
+            proc.stdin.close()
+
+            # Poll for completion while tracking memory
+            while proc.poll() is None:
+                try:
+                    mem_info = ps_proc.memory_info()
+                    peak_memory_bytes = max(peak_memory_bytes, mem_info.rss)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                time.sleep(0.01)  # 10ms polling interval
+
             elapsed = time.time() - t0
 
-            if result.returncode != 0:
+            # Check if timed out
+            if elapsed > timeout:
+                proc.kill()
+                return None, None, None
+
+            if proc.returncode != 0:
                 return None, None, None
 
             # Read output
@@ -397,9 +423,8 @@ def run_snaphu(phase, correlation, timeout=900):
                 unwrapped = np.fromfile(out_file, dtype=np.float32).reshape(height, width)
                 # Restore NaN mask
                 unwrapped[np.isnan(phase)] = np.nan
-                # SNAPHU memory is external process, estimate from file sizes
-                mem_estimate = (height * width * 4 * 6) / (1024 * 1024)  # rough estimate
-                return unwrapped, elapsed, mem_estimate
+                peak_mb = peak_memory_bytes / (1024 * 1024)
+                return unwrapped, elapsed, peak_mb
             else:
                 return None, None, None
 
@@ -415,12 +440,12 @@ def run_unwrapper(method, phase, correlation, timeout=3600):
 
     Returns (unwrapped, elapsed_time, peak_memory_mb) or (None, None, None) on failure/timeout.
     """
-    import tracemalloc
+    import resource
     import torch
     from insardev.Stack_unwrap2d import Stack_unwrap2d
 
-    # Start memory tracking
-    tracemalloc.start()
+    # Get baseline memory before running
+    baseline_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
     t0 = time.time()
     try:
@@ -431,15 +456,17 @@ def run_unwrapper(method, phase, correlation, timeout=3600):
             # IRLS on CPU only
             result = Stack_unwrap2d._irls_unwrap_2d(phase, weight=correlation, device='cpu')
         else:
-            tracemalloc.stop()
             return None, None, None
 
         elapsed = time.time() - t0
 
-        # Get peak memory usage
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        peak_mb = peak / (1024 * 1024)  # bytes to MB
+        # Get peak resident memory (total process memory)
+        # On macOS, ru_maxrss is in bytes; on Linux it's in kilobytes
+        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == 'darwin':
+            peak_mb = peak_rss / (1024 * 1024)  # bytes to MB
+        else:
+            peak_mb = peak_rss / 1024  # KB to MB
 
         if elapsed > timeout:
             return None, None, None
@@ -447,7 +474,6 @@ def run_unwrapper(method, phase, correlation, timeout=3600):
         return result, elapsed, peak_mb
 
     except Exception as e:
-        tracemalloc.stop()
         return None, None, None
 
 
@@ -602,11 +628,15 @@ def run_benchmarks(max_time_per_test=3600, output_dir=None, save_images=True):
                 data_file.unlink()
             break
 
-        # Run in parallel (one process per method)
-        print(f"  Testing {len(tasks)} methods in parallel...")
+        # Run sequentially in separate processes (for accurate memory measurement)
+        print(f"  Testing {len(tasks)} methods sequentially...")
 
-        with mp.Pool(processes=min(len(tasks), mp.cpu_count())) as pool:
-            task_results = pool.map(benchmark_single, tasks)
+        task_results = []
+        for task in tasks:
+            # Run each test in a fresh subprocess to get accurate memory measurement
+            with mp.Pool(processes=1) as pool:
+                result = pool.apply(benchmark_single, (task,))
+                task_results.append(result)
 
         # Clean up data file after tests complete
         if data_file.exists():
