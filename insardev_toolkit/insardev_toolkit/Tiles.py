@@ -224,14 +224,18 @@ class Tiles(datagrid, progressbar_joblib):
         
         if isinstance(da, xr.Dataset):
             da = da[list(da.data_vars)[0]]
-        # crop geometry extent        
+        # crop geometry extent
         da = da.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
+        # set CRS and spatial dimensions for rioxarray compatibility
+        da = self.spatial_ref(da, 4326)
 
         if filename is not None:
             if os.path.exists(filename):
                 os.remove(filename)
+            # convert to dataset to preserve spatial_ref variable with CRS
+            ds = da.rename('z').to_dataset()
             encoding = {'z': self.get_encoding_netcdf(da.shape)}
-            da.rename('z').to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
+            ds.to_netcdf(filename, encoding=encoding, engine=self.netcdf_engine_write)
         return da
 
     def download_landmask(self, geometry, filename=None, product='1s', skip_exist=True, n_jobs=8, debug=False):
