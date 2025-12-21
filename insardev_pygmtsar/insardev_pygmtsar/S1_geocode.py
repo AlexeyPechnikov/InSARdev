@@ -121,9 +121,10 @@ class S1_geocode(S1_align):
                          consolidated=True,
                           zarr_format=3,
                          chunks='auto')
-        # variables are stored as int32 with _FillValue=int32.max and scale_factor
+        # variables are stored as int32 with _FillValue and scale_factor
         # modern xarray applies mask_and_scale automatically (attrs become empty)
         # older versions may not - handle both cases
+        # also mask extreme values that may come from different fill_value conventions
         for v in ('azi','rng','ele'):
             fill_value = ds[v].attrs.get('_FillValue')
             scale_factor = ds[v].attrs.get('scale_factor', 1.0)
@@ -133,8 +134,10 @@ class S1_geocode(S1_align):
                 data = data.where(ds[v] != fill_value)
                 ds[v] = data * scale_factor
             else:
-                # xarray already decoded - just ensure float32
-                ds[v] = ds[v].astype('float32')
+                # xarray already decoded - ensure float32 and mask extreme values
+                # (handles cases where zarr fill_value differs from _FillValue attr)
+                data = ds[v].astype('float32')
+                ds[v] = data.where(np.abs(data) < 1e8)
         return ds
         #.dropna(dim='y', how='all')
         #.dropna(dim='x', how='all')
@@ -303,11 +306,18 @@ class S1_geocode(S1_align):
                           for (key, val) in llt2ratlook_map.items()})
 
         # scale to integers for better compression
+        # use explicit int32 fill to avoid architecture-dependent float->int overflow behavior
+        fill_value = np.int32(np.iinfo(np.int32).max)
         for varname in ['azi', 'rng', 'ele']:
-            trans[varname] = xr.where(np.isfinite(trans[varname]), (scale_factor*trans[varname]).round(), np.iinfo(np.int32).max).astype(np.int32)
+            scaled = (scale_factor * trans[varname]).round()
+            mask = np.isfinite(scaled)
+            # convert to int32 first, then fill NaN positions
+            int_data = scaled.fillna(0).astype(np.int32)
+            int_data = int_data.where(mask, fill_value)
+            trans[varname] = int_data
             trans[varname].attrs['scale_factor'] = 1/scale_factor
             trans[varname].attrs['add_offset'] = 0
-            trans[varname].attrs['_FillValue'] = np.iinfo(np.int32).max
+            # _FillValue will be set in encoding, not attrs (xarray requirement)
 
         # add georeference attributes
         trans = self.spatial_ref(trans, epsg)
@@ -319,6 +329,9 @@ class S1_geocode(S1_align):
         # use a single chunk for efficient storage
         shape = (trans.y.size, trans.x.size)
         encoding = {var: {'chunks': shape} for var in trans.data_vars}
+        # set zarr fill_value to match _FillValue for proper masking on read
+        for varname in ['azi', 'rng', 'ele']:
+            encoding[varname]['_FillValue'] = np.iinfo(np.int32).max
         trans.to_zarr(
             store=os.path.join(outdir, 'transform'),
             mode='w',
