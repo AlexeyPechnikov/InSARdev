@@ -960,6 +960,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
         for Phase Unwrapping", arXiv:2401.09961 (2024).
 
         Achieves 10-20x speedup over SNAPHU on GPU/TPU.
+
+        Default parameters are optimized for InSAR processing with float32:
+        - epsilon=1e-2: Larger than paper's 1e-6 for numerical stability.
+          Smaller values give sharper L¹ approximation but need more iterations.
+        - tol=1e-2: Stops at ~1% relative change (~0.03 rad for typical phase).
+          Use tol=1e-3 for higher precision at ~2x slower speed.
+        - max_iter=10, cg_max_iter=10: Sufficient for most InSAR data.
+          For complex scenes, try max_iter=20, cg_max_iter=15.
+
+        For higher accuracy (closer to original paper, ~2-3x slower):
+        >>> stack.unwrap2d(intf, corr, epsilon=1e-4, tol=1e-3, max_iter=20)
         """
         import torch
         from torch_dct import dct_2d, idct_2d
