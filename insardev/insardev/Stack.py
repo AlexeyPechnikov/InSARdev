@@ -898,16 +898,16 @@ class Stack(Stack_plot, BatchCore):
 
         return Batch(out)
 
-    def displacement_los(self, phase: Batch, transform: Batch) -> Batch:
+    def displacement_los(self, phase: Batch, transform: Batch = None) -> Batch:
         """Compute line-of-sight displacement (meters) from unwrapped phase.
 
         Parameters
         ----------
         phase : Batch
             Unwrapped phase grids in radar coordinates.
-        transform : Batch
+        transform : Batch, optional
             Transform batch providing mission constants; only the first burst is
-            queried for ``radar_wavelength``.
+            queried for ``radar_wavelength``. If None, uses self.transform().
 
         Returns
         -------
@@ -916,6 +916,10 @@ class Stack(Stack_plot, BatchCore):
         """
         import numpy as np
         import xarray as xr
+
+        # Default to self.transform() when not provided
+        if transform is None:
+            transform = self.transform()
 
         if not transform:
             raise ValueError('transform must contain at least one burst with radar_wavelength')
@@ -948,10 +952,20 @@ class Stack(Stack_plot, BatchCore):
 
         return Batch(out)
 
-    def _displacement_component(self, phase: Batch, transform: Batch, func, suffix: str) -> Batch:
+    def _displacement_component(self, phase: Batch, transform: Batch = None, func=None, suffix: str = '') -> Batch:
         """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin)."""
         import xarray as xr
         import numpy as np
+
+        # Default to self.transform() when not provided, decimated to match phase resolution
+        tfm_is_default = transform is None
+        if transform is None:
+            transform = self.transform()
+
+        # Decimate default transform to match input phase resolution for efficiency
+        if tfm_is_default and transform is not None:
+            transform = Batch({k: transform[k].reindex(y=phase[k].y, x=phase[k].x, method='nearest')
+                               for k in phase.keys() if k in transform})
 
         los_batch = self.displacement_los(phase, transform)
         incidence_batch = transform.incidence()
@@ -987,12 +1001,12 @@ class Stack(Stack_plot, BatchCore):
 
         return Batch(out)
 
-    def displacement_vertical(self, phase: Batch, transform: Batch) -> Batch:
+    def displacement_vertical(self, phase: Batch, transform: Batch = None) -> Batch:
         """Compute vertical displacement (meters) from unwrapped phase and incidence."""
         import xarray as xr
         return self._displacement_component(phase, transform, func=xr.ufuncs.cos, suffix='vertical')
 
-    def displacement_eastwest(self, phase: Batch, transform: Batch) -> Batch:
+    def displacement_eastwest(self, phase: Batch, transform: Batch = None) -> Batch:
         """Compute east-west displacement (meters) from unwrapped phase and incidence."""
         import xarray as xr
         return self._displacement_component(phase, transform, func=xr.ufuncs.sin, suffix='eastwest')
