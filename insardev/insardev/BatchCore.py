@@ -1836,14 +1836,31 @@ class BatchCore(dict):
             fg.fig.suptitle(f'{polarization} {caption or ''}'.strip(), y=y)
 
             # fg is the FacetGrid returned by xarray.plot.imshow
-            for ax in fg.axes.flatten():
+            for idx, ax in enumerate(fg.axes.flatten()):
                 # disable the offset text (like "1e6")
                 # force plain formatting (no scientific notation) on the y‐axis
                 ax.ticklabel_format(style='plain', axis='y', useOffset=False)
                 if stackvar == 'fake':
                     # remove 'fake = 0' title
                     ax.set_title('')
-                
+                elif stackvar in ('pair', 'date') and idx < da[stackvar].size:
+                    # Format pair/date titles nicely
+                    coord_val = da[stackvar].values[idx]
+                    if stackvar == 'pair':
+                        # pair is a tuple of (ref_date, rep_date)
+                        if hasattr(coord_val, '__iter__') and len(coord_val) == 2:
+                            ref, rep = coord_val
+                            ref_str = pd.Timestamp(ref).strftime('%Y-%m-%d')
+                            rep_str = pd.Timestamp(rep).strftime('%Y-%m-%d')
+                            ax.set_title(f'pair = {ref_str} {rep_str}')
+                        elif hasattr(coord_val, 'strftime'):
+                            ax.set_title(f'pair = {coord_val.strftime("%Y-%m-%d")}')
+                    elif stackvar == 'date':
+                        if hasattr(coord_val, 'strftime'):
+                            ax.set_title(f'date = {coord_val.strftime("%Y-%m-%d")}')
+                        else:
+                            ax.set_title(f'date = {pd.Timestamp(coord_val).strftime("%Y-%m-%d")}')
+
             return fg
 
         if quantile is not None:
