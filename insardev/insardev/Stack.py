@@ -411,6 +411,77 @@ class Stack(Stack_plot, BatchCore):
 
                 pbar.update(1)
 
+    def compute(self, *batches: BatchCore) -> tuple:
+        """Compute multiple Batch objects together efficiently.
+
+        This method materializes multiple dependent Batch objects in a single
+        dask graph execution, which is faster than computing them separately
+        because shared computations are only performed once.
+
+        Parameters
+        ----------
+        *batches : BatchCore
+            One or more Batch objects to compute together.
+
+        Returns
+        -------
+        tuple
+            Tuple of computed Batch objects in the same order as input.
+            If only one batch is provided, returns a single Batch (not a tuple).
+
+        Examples
+        --------
+        Compute two dependent batches together (faster than separate compute):
+
+        >>> intf, corr = stack.compute(
+        ...     intf.mask(landmask).downsample(100),
+        ...     corr.mask(landmask).downsample(100)
+        ... )
+
+        Instead of separate execution (about 2x slower):
+
+        >>> intf = intf.mask(landmask).downsample(100).compute()
+        >>> corr = corr.mask(landmask).downsample(100).compute()
+
+        Compute three batches:
+
+        >>> intf, corr, elevation = stack.compute(intf, corr, ele)
+        """
+        import dask
+        from insardev_toolkit.progressbar import progressbar
+
+        if not batches:
+            raise ValueError('At least one Batch must be provided')
+
+        # Convert all batches to dicts for dask.persist
+        batch_dicts = [dict(b) for b in batches]
+
+        # Persist all batches together in a single graph execution
+        progressbar(
+            result := dask.persist(*batch_dicts),
+            desc='Computing Batches...'.ljust(25)
+        )
+
+        # Convert back to Batch objects with computed coordinates
+        computed_batches = []
+        for i, batch_dict in enumerate(result):
+            computed = {}
+            for key, ds in batch_dict.items():
+                # Compute any lazy coordinates, preserving their dims
+                new_coords = {}
+                for name, coord in ds.coords.items():
+                    if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
+                        new_coords[name] = (coord.dims, coord.compute().values)
+                if new_coords:
+                    ds = ds.assign_coords(new_coords)
+                computed[key] = ds
+            # Preserve original Batch type
+            computed_batches.append(type(batches[i])(computed))
+
+        if len(computed_batches) == 1:
+            return computed_batches[0]
+        return tuple(computed_batches)
+
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
         if len(args) > 2:
