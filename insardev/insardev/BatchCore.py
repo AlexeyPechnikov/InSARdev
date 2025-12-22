@@ -1642,8 +1642,9 @@ class BatchCore(dict):
 
             return np.stack(result_slices, axis=0)
 
-        # Determine chunk sizes using float64 for consistent chunking regardless of data dtype
-        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.float64)
+        # Use complex128 (16 bytes) to account for total memory per chunk:
+        # output + 2-4 overlapping input bursts to load, crop, and merge
+        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.complex128)
         ys_blocks = np.array_split(ys, np.cumsum(chunks[0])[:-1])
         xs_blocks = np.array_split(xs, np.cumsum(chunks[1])[:-1])
 
