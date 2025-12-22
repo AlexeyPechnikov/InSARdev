@@ -68,23 +68,23 @@ class BatchCore(dict):
         #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
-    def from_dataset(self, data: xr.DataArray | xr.Dataset) -> Batch:
+    def from_dataset(self, data: xr.Dataset) -> Batch:
         """
-        Create a Batch by reindexing a Dataset (or DataArray) to each burst's coordinates.
+        Create a Batch by reindexing a Dataset to each burst's coordinates.
 
         This is memory-efficient for large rasters (e.g., landmask, DEM, correlation)
         as it creates per-burst views using nearest-neighbor interpolation.
 
         Parameters
         ----------
-        data : xr.DataArray or xr.Dataset
+        data : xr.Dataset
             The input data to reindex for each burst.
 
         Returns
         -------
         Batch
             A new Batch with the same keys as self, each containing the
-            reindexed data (DataArray if input was DataArray, Dataset if input was Dataset).
+            reindexed Dataset.
 
         Examples
         --------
@@ -96,8 +96,9 @@ class BatchCore(dict):
         """
         from .Batch import Batch
 
-        # track if input was DataArray
-        is_dataarray = isinstance(data, xr.DataArray)
+        # Validate input type
+        if not isinstance(data, xr.Dataset):
+            raise TypeError(f"data must be xr.Dataset, got {type(data).__name__}")
 
         # auto-chunk if not already chunked to avoid high memory usage
         if not data.chunks:
