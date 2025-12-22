@@ -158,6 +158,7 @@ class Stack(Stack_plot, BatchCore):
         if not isinstance(target, BatchCore):
             target = Batch(target)
         # Default to self.transform() when called on Stack and transform not provided
+        tfm_is_default = transform is None
         tfm = transform if transform is not None else self.transform()
         if tfm is not None and not isinstance(tfm, BatchCore):
             tfm = Batch(tfm)
@@ -192,17 +193,17 @@ class Stack(Stack_plot, BatchCore):
             merged = merged.to_dataset()
 
         # Get transform elevation merged via to_dataset()
+        # Decimate default transform to match input batch resolution for efficiency
         topo_merged = None
         if tfm is not None:
-            # Use [['ele']] to get a Batch of Datasets with just 'ele' variable
-            if any('ele' in ds for ds in tfm.values()):
+            if tfm_is_default:
+                # Decimate each burst's transform to match corresponding input burst
+                decimated = {k: tfm[k][['ele']].reindex(y=target[k].y, x=target[k].x, method='nearest')
+                             for k in target.keys() if k in tfm}
+                topo_merged = Batch(decimated).to_dataset()
+            else:
+                # User-provided transform: use as-is
                 topo_merged = tfm[['ele']].to_dataset()
-            elif any('z' in ds for ds in tfm.values()):
-                topo_merged = tfm[['z']].to_dataset()
-                if isinstance(topo_merged, xr.DataArray):
-                    topo_merged = topo_merged.rename('ele')
-                elif isinstance(topo_merged, xr.Dataset) and 'z' in topo_merged:
-                    topo_merged = topo_merged.rename({'z': 'ele'})
 
         # Group by data variable (polarization)
         data_vars = list(merged.data_vars)
