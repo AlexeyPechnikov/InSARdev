@@ -47,6 +47,7 @@ class S1_transform(S1_topo):
                   overwrite: bool=False,
                   append: bool=False,
                   n_jobs: int|None=None,
+                  tmpdir: str|None=None,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -71,11 +72,14 @@ class S1_transform(S1_topo):
         alignment_spacing : float, optional
             The alignment spacing in decimal degrees.
         overwrite : bool, optional
-            Overwrite existing results and process all bursts. 
+            Overwrite existing results and process all bursts.
         append : bool, optional
             Append new burstID processed with the same parameters to the existing results.
         n_jobs : int, optional
             The number of jobs to run in parallel. Default is os.cpu_count().
+        tmpdir : str, optional
+            Directory for temporary files. Use fast local storage (e.g., '/mnt' on Google Colab)
+            for better performance. Default is system temp directory.
         debug : bool, optional
             Whether to print debug information.
 
@@ -126,8 +130,8 @@ class S1_transform(S1_topo):
         if os.path.exists(metafile):
             os.remove(metafile)
 
-        # Capture temp directory now (before joblib workers spawn) to respect TMPDIR env var
-        tmpdir_base = tempfile.gettempdir()
+        # Use user-specified tmpdir or fall back to system temp directory
+        tmpdir_base = tmpdir if tmpdir is not None else tempfile.gettempdir()
 
         def process_refrep(bursts, target, tmpdir_base, debug=False):
             with tempfile.TemporaryDirectory(prefix=bursts[0][0][0], dir=tmpdir_base) as tmpdir:             
