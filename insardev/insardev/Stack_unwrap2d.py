@@ -817,6 +817,92 @@ class Stack_unwrap2d(Stack_unwrap1d):
             )
             return unwrapped
 
+    def unwrap2d_dataset(self, phase, weight=None, conncomp=False,
+                         conncomp_size=1000, conncomp_gap=None,
+                         conncomp_linksize=5, conncomp_linkcount=30, device='cpu', debug=False, **kwargs):
+        """
+        Unwrap a single phase Dataset using GPU-accelerated IRLS algorithm.
+
+        Convenience wrapper around unwrap2d() for working with merged datasets
+        instead of per-burst batches. Useful when you have already dissolved
+        and merged your data.
+
+        Parameters
+        ----------
+        phase : xr.Dataset
+            Wrapped phase dataset (from intf.align().dissolve().to_dataset()).
+        weight : xr.Dataset, optional
+            Correlation values for weighting (from corr.dissolve().to_dataset()).
+        conncomp : bool, optional
+            If False (default), link disconnected components.
+            If True, keep components separate and return conncomp labels.
+        conncomp_size : int, optional
+            Minimum pixels for a connected component. Default is 1000.
+        conncomp_gap : int or None, optional
+            Maximum pixel distance between components. Default is None.
+        conncomp_linksize : int, optional
+            Pixels for offset estimation. Default is 5.
+        conncomp_linkcount : int, optional
+            Maximum neighbor components to consider. Default is 30.
+        device : str, optional
+            PyTorch device: 'cpu', 'cuda', or 'mps'. Default is 'cpu'.
+        debug : bool, optional
+            Print diagnostic information. Default is False.
+        **kwargs
+            Additional arguments passed to unwrap2d_irls.
+
+        Returns
+        -------
+        xr.Dataset or tuple
+            If conncomp is False: Unwrapped phase Dataset.
+            If conncomp is True: tuple of (unwrapped Dataset, conncomp Dataset).
+
+        Examples
+        --------
+        Basic usage with merged datasets:
+        >>> intf_ds = intf.align().dissolve().compute().to_dataset()
+        >>> corr_ds = corr.dissolve().compute().to_dataset()
+        >>> unwrapped = stack.unwrap2d_dataset(intf_ds, corr_ds)
+
+        Get connected components:
+        >>> unwrapped, conncomp = stack.unwrap2d_dataset(intf_ds, corr_ds, conncomp=True)
+
+        Convert back to per-burst Batch:
+        >>> phase_batch = intf.from_dataset(unwrapped)
+        """
+        import xarray as xr
+        from .Batch import BatchWrap, BatchUnit
+
+        # Validate input types
+        if not isinstance(phase, xr.Dataset):
+            raise TypeError(f"phase must be xr.Dataset, got {type(phase).__name__}")
+        if weight is not None and not isinstance(weight, xr.Dataset):
+            raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
+
+        # Rechunk to single chunk for y/x dimensions (required by unwrap2d_irls)
+        phase = phase.chunk({'y': -1, 'x': -1})
+        if weight is not None:
+            weight = weight.chunk({'y': -1, 'x': -1})
+
+        # Wrap datasets in temporary batches with empty key
+        intf_batch = BatchWrap({'': phase})
+        corr_batch = BatchUnit({'': weight}) if weight is not None else None
+
+        # Call unwrap2d
+        result = self.unwrap2d(
+            intf_batch, corr_batch, conncomp=conncomp,
+            conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
+            conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
+            device=device, debug=debug, **kwargs
+        )
+
+        # Extract and return the dataset(s)
+        if conncomp:
+            unwrapped, conncomp_labels = result
+            return unwrapped[''], conncomp_labels['']
+        else:
+            return result['']
+
     # =========================================================================
     # GPU-Accelerated Phase Unwrapping Methods (PyTorch)
     # =========================================================================
