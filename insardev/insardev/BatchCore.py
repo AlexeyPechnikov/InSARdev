@@ -1575,14 +1575,14 @@ class BatchCore(dict):
         ys = np.arange(y_min, y_max + dy/2, dy)
         xs = np.arange(x_min, x_max + dx/2, dx)
 
+        fill_dtype = first_datas[0].dtype
+
         # Extract extents of all datasets once (same for all polarizations)
         extents = [(float(d.y.min()), float(d.y.max()),
                     float(d.x.min()), float(d.x.max())) for d in first_datas]
 
         # Precompute burst coverage areas for fast lookup
         burst_coords = [(d.y.values, d.x.values) for d in first_datas]
-
-        fill_dtype = first_datas[0].dtype
 
         def process_chunk(ys_block, xs_block, pol, datas):
             """Process a single output chunk for one polarization.
@@ -1642,8 +1642,8 @@ class BatchCore(dict):
 
             return np.stack(result_slices, axis=0)
 
-        # Determine chunk sizes
-        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=fill_dtype)
+        # Determine chunk sizes using float64 for consistent chunking regardless of data dtype
+        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.float64)
         ys_blocks = np.array_split(ys, np.cumsum(chunks[0])[:-1])
         xs_blocks = np.array_split(xs, np.cumsum(chunks[1])[:-1])
 
@@ -2528,9 +2528,9 @@ class BatchCore(dict):
 
             if len(pairs) == 0:
                 if degree == 0:
-                    return {bid: 0.0 for bid in ids}
+                    return {bid: np.float32(0.0) for bid in ids}
                 else:
-                    return {bid: [0.0, 0.0] for bid in ids}
+                    return {bid: [np.float32(0.0), np.float32(0.0)] for bid in ids}
 
             # Build connectivity graph
             adjacency = sparse.lil_matrix((n_bursts, n_bursts))
@@ -2569,7 +2569,7 @@ class BatchCore(dict):
                     n_comp = len(comp_ids)
 
                     if n_comp == 1:
-                        offsets_out[comp_ids[0]] = 0.0
+                        offsets_out[comp_ids[0]] = np.float32(0.0)
                         continue
 
                     comp_pairs = [(id1, id2, off, w) for id1, id2, off, w in pairs
@@ -2577,7 +2577,7 @@ class BatchCore(dict):
 
                     if len(comp_pairs) == 0:
                         for bid in comp_ids:
-                            offsets_out[bid] = 0.0
+                            offsets_out[bid] = np.float32(0.0)
                         continue
 
                     n_pairs_comp = len(comp_pairs)
@@ -2602,7 +2602,7 @@ class BatchCore(dict):
                     result = lsqr(sparse.diags(sqrt_W) @ A.tocsr(), sqrt_W * b)
 
                     for i, bid in enumerate(comp_ids):
-                        offsets_out[bid] = round(float(maybe_wrap(result[0][i])), OUTPUT_PRECISION)
+                        offsets_out[bid] = np.float32(round(float(maybe_wrap(result[0][i])), OUTPUT_PRECISION))
 
                 return offsets_out
 
@@ -2616,7 +2616,7 @@ class BatchCore(dict):
                     n_comp = len(comp_ids)
 
                     if n_comp == 1:
-                        ramps_out[comp_ids[0]] = [0.0, 0.0]
+                        ramps_out[comp_ids[0]] = [np.float32(0.0), np.float32(0.0)]
                         continue
 
                     comp_pairs = [(id1, id2, off, r, xc, w) for id1, id2, off, r, xc, w in pairs
@@ -2624,7 +2624,7 @@ class BatchCore(dict):
 
                     if len(comp_pairs) == 0:
                         for bid in comp_ids:
-                            ramps_out[bid] = [0.0, 0.0]
+                            ramps_out[bid] = [np.float32(0.0), np.float32(0.0)]
                         continue
 
                     n_pairs_comp = len(comp_pairs)
@@ -2649,8 +2649,8 @@ class BatchCore(dict):
                     result = lsqr(sparse.diags(sqrt_W) @ A.tocsr(), sqrt_W * b)
 
                     for i, bid in enumerate(comp_ids):
-                        ramp = round(float(result[0][i]), RAMP_PRECISION)
-                        intercept = round(-ramp * x_centers[bid], OUTPUT_PRECISION)
+                        ramp = np.float32(round(float(result[0][i]), RAMP_PRECISION))
+                        intercept = np.float32(round(-ramp * x_centers[bid], OUTPUT_PRECISION))
                         ramps_out[bid] = [ramp, intercept]
 
                 return ramps_out
