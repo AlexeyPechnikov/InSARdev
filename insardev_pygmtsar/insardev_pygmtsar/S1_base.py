@@ -36,7 +36,7 @@ class S1_base(progressbar_joblib, datagrid):
             # Get fullBurstIDs from reference date and filter all bursts by them
             ref_fullBurstIDs = self.df[self.df.startTime.dt.date.astype(str)==ref].index.get_level_values(0).unique()
             if len(ref_fullBurstIDs) == 0:
-                return self.df
+                raise ValueError(f"Reference date '{ref}' not found in the data")
             df = self.df[self.df.index.get_level_values(0).isin(ref_fullBurstIDs)]
         return df.set_crs(4326).to_crs(crs)
 
