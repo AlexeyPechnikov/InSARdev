@@ -46,7 +46,7 @@ class S1_transform(S1_topo):
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
                   append: bool=False,
-                  n_jobs: int=-1,
+                  n_jobs: int|None=None,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -75,7 +75,7 @@ class S1_transform(S1_topo):
         append : bool, optional
             Append new burstID processed with the same parameters to the existing results.
         n_jobs : int, optional
-            The number of jobs to run in parallel.
+            The number of jobs to run in parallel. Default is os.cpu_count().
         debug : bool, optional
             Whether to print debug information.
 
@@ -127,7 +127,7 @@ class S1_transform(S1_topo):
             os.remove(metafile)
 
         def process_refrep(bursts, target, debug=False):
-            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0]) as tmpdir:             
+            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0], dir=tempfile.gettempdir()) as tmpdir:             
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
                 # burst format is like ('021_043788_IW1', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
@@ -196,7 +196,11 @@ class S1_transform(S1_topo):
         # get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
-        
+
+        # Default n_jobs to cpu_count() for reliable parallelization (joblib's -1 can undercount on some systems)
+        if n_jobs is None:
+            n_jobs = os.cpu_count()
+
         joblib_backend = None if not debug else 'sequential'
         # for Google Colab NetCDF compatibility use threading backend
         if joblib_backend is None and 'google.colab' in sys.modules:
