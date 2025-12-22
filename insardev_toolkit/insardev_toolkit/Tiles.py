@@ -230,6 +230,10 @@ class Tiles(datagrid, progressbar_joblib):
         da = self.spatial_ref(da, 4326)
 
         if filename is not None:
+            # Create parent directory if it doesn't exist
+            dirname = os.path.dirname(filename)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
             if os.path.exists(filename):
                 os.remove(filename)
             # convert to dataset to preserve spatial_ref variable with CRS
