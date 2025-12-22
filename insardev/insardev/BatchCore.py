@@ -68,6 +68,55 @@ class BatchCore(dict):
         #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
+    def from_dataset(self, data: xr.DataArray | xr.Dataset) -> Batch:
+        """
+        Create a Batch by reindexing a Dataset (or DataArray) to each burst's coordinates.
+
+        This is memory-efficient for large rasters (e.g., landmask, DEM, correlation)
+        as it creates per-burst views using nearest-neighbor interpolation.
+
+        Parameters
+        ----------
+        data : xr.DataArray or xr.Dataset
+            The input data to reindex for each burst.
+
+        Returns
+        -------
+        Batch
+            A new Batch with the same keys as self, each containing the
+            reindexed data (DataArray if input was DataArray, Dataset if input was Dataset).
+
+        Examples
+        --------
+        # Create a BatchUnit weight from a single correlation raster
+        weight = BatchUnit(stack.from_dataset(corr))
+
+        # Create a BatchWrap phase from a single phase raster
+        phase = BatchWrap(stack.from_dataset(topo_phase))
+        """
+        from .Batch import Batch
+
+        # track if input was DataArray
+        is_dataarray = isinstance(data, xr.DataArray)
+
+        # auto-chunk if not already chunked to avoid high memory usage
+        if not data.chunks:
+            data = data.chunk('auto')
+
+        out = {}
+        for key, ds in dict.items(self):
+            # reindex to burst spatial coordinates using nearest-neighbor
+            # select by index for non-spatial dims (pair, date) to avoid coordinate mismatch
+            reindexed = data
+            for dim in data.dims:
+                if dim not in ('y', 'x') and dim in ds.dims:
+                    # select by positional index, then assign original burst coordinate
+                    reindexed = reindexed.isel({dim: slice(0, ds.sizes[dim])})
+                    reindexed = reindexed.assign_coords({dim: ds.coords[dim]})
+            reindexed = reindexed.reindex(y=ds.y, x=ds.x, method='nearest')
+            out[key] = reindexed
+        return Batch(out)
+
     # def __repr__(self):
     #     if not self:
     #         return f"{self.__class__.__name__}(empty)"
@@ -324,7 +373,13 @@ class BatchCore(dict):
                         # Single pair degree=1: [ramp, offset] or other
                         result[k] = ds - val
                 else:
-                    result[k] = ds - val
+                    # Only apply subtraction to spatial variables (y, x dims)
+                    # to avoid errors with non-spatial variables like (date,) dims
+                    new_ds = ds.copy()
+                    for var in ds.data_vars:
+                        if 'y' in ds[var].dims and 'x' in ds[var].dims:
+                            new_ds[var] = ds[var] - val
+                    result[k] = new_ds
         return type(self)(result)
 
     def __rsub__(self, other):
@@ -386,15 +441,17 @@ class BatchCore(dict):
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """
-        np.exp(-1j * intfs)
+        Support numpy ufuncs on Batch objects, e.g.:
+        - np.exp(-1j * intfs)
+        - np.isfinite(weight)
+        - np.abs(batch)
         """
-        from .Batch import BatchWrap
         # only handle the normal call
         if method != "__call__":
             return NotImplemented
 
-        # find the first BatchWrap among inputs
-        batch = next((x for x in inputs if isinstance(x, BatchWrap)), None)
+        # find the first Batch among inputs
+        batch = next((x for x in inputs if isinstance(x, BatchCore)), None)
         if batch is None:
             return NotImplemented
 
@@ -402,7 +459,7 @@ class BatchCore(dict):
         for k in batch.keys():
             # build the argument list for this key
             args = [
-                inp[k] if isinstance(inp, BatchWrap) else inp
+                inp[k] if isinstance(inp, BatchCore) else inp
                 for inp in inputs
             ]
             result[k] = ufunc(*args, **kwargs)
@@ -555,9 +612,59 @@ class BatchCore(dict):
         # DataArray case seems not usefull because Batch datasets differ in shape
         return self.map_da(lambda da: da.where(cond, other, **kwargs), **kwargs)
 
+    def mask(self, mask: xr.DataArray | xr.Dataset, other=np.nan):
+        """
+        Apply a mask to each burst.
+
+        This is memory-efficient for large masks (e.g., landmask, DEM) as it
+        reindexes the mask to each burst's coordinates using nearest-neighbor
+        interpolation instead of broadcasting the full mask.
+
+        Parameters
+        ----------
+        mask_data : xr.DataArray, xr.Dataset
+            The mask to apply. Can be:
+            - xr.DataArray: reindexed to each burst's coordinates
+            - xr.Dataset: first data variable used as mask, reindexed per burst
+            For integer/boolean masks, values == 1 or True are kept.
+            For float masks (e.g., landmask with 1.0/NaN, correlation), finite values are kept.
+        other : scalar, optional
+            Value to use for masked elements. Default is np.nan.
+
+        Returns
+        -------
+        Batch
+            Masked batch with same type as self.
+
+        Examples
+        --------
+        # Apply binary landmask
+        land = np.isfinite(xr.open_dataarray('land.nc').rio.reproject(intf.crs))
+        masked_intf = intf.mask(land)
+        """
+    
+        # extract DataArray from Dataset
+        if isinstance(mask, xr.Dataset):
+            mask = next(iter(mask.data_vars.values()))
+
+        if not np.issubdtype(mask.dtype, np.bool_):
+            raise ValueError('Batch.mask: mask must be a Dataset or DataArray of boolean type')
+
+        # auto-chunk if not already chunked to avoid high memory usage
+        if not mask.chunks:
+            mask = mask.chunk('auto')
+
+        out = {}
+        for key, ds in self.items():
+            # the fastest way to align mask to burst coordinates
+            mask_burst = mask.reindex(y=ds.y, x=ds.x, method='nearest')
+            # preserve original chunking structure for lazy computation
+            out[key] = ds.where(mask_burst, other)
+        return type(self)(out)
+
     def __pow__(self, exponent, **kwargs):
         return self.map_da(lambda da: da**exponent, **kwargs)
-    
+
     def power(self, **kwargs):
         """ element-wise |x|², i.e. signal intensity """
         return self.map_da(lambda da: xr.ufuncs.abs(da)**2, **kwargs)
@@ -1448,11 +1555,9 @@ class BatchCore(dict):
         dims = first_datas[0].dims
         stackvar = list(dims)[0] if len(dims) > 2 else None
 
-        # Handle stack dimension
-        if stackvar == 'pair':
-            stackval = [(str(ref)[:10] + ' ' + str(rep)[:10]) for ref, rep in first_datas[0][stackvar].values]
-        elif stackvar is not None:
-            stackval = first_datas[0][stackvar].astype(str)
+        # Handle stack dimension - preserve original coordinate values
+        if stackvar is not None:
+            stackval = first_datas[0][stackvar].values
         else:
             stackvar = 'fake'
             stackval = [0]
@@ -1841,9 +1946,20 @@ class BatchCore(dict):
                 # preserve original chunking
                 return out_da.chunk({d: da.chunks[i][0] for i, d in enumerate(da.dims)})
 
+            # determine weight for each variable:
+            # - if w is DataArray: use same weight for all variables
+            # - if w is Dataset: use matching variable name from weight
+            def get_weight(var):
+                if w is None:
+                    return None
+                if isinstance(w, xr.DataArray):
+                    return w
+                # Dataset: use matching variable if exists
+                return w[var] if var in w.data_vars else None
+
             # apply to every 2D or 3D (yx) var in the Dataset
             new_ds = xr.Dataset({
-                var: gaussian_da(ds[var], w[var] if w is not None else None)
+                var: gaussian_da(ds[var], get_weight(var))
                 for var in ds.data_vars
                 if (ds[var].ndim in (2,3) and ds[var].dims[-2:] == ('y','x'))
             })
@@ -1941,8 +2057,9 @@ class BatchCore(dict):
             da = ds[polarization]
             if 'pair' in da.dims:
                 da = da.isel(pair=0)
-            y_coords = da.coords['y'].values
-            x_coords = da.coords['x'].values
+            # Get coordinates from Dataset if not on DataArray
+            y_coords = da.coords['y'].values if 'y' in da.coords else ds.coords['y'].values
+            x_coords = da.coords['x'].values if 'x' in da.coords else ds.coords['x'].values
             extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
 
         def extents_overlap(e1, e2):
@@ -2219,8 +2336,9 @@ class BatchCore(dict):
             da = ds[polarization]
             if 'pair' in da.dims:
                 da = da.isel(pair=0)
-            y_coords = da.coords['y'].values
-            x_coords = da.coords['x'].values
+            # Get coordinates from Dataset if not on DataArray
+            y_coords = da.coords['y'].values if 'y' in da.coords else ds.coords['y'].values
+            x_coords = da.coords['x'].values if 'x' in da.coords else ds.coords['x'].values
             extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
             x_centers[bid] = float(np.mean(x_coords))
 
@@ -2882,7 +3000,7 @@ class BatchCore(dict):
                         weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
                         weight_sum += np.where(valid, w_other, 0.0)
                     valid_weights = weight_sum > 0
-                    normalized = np.where(valid_weights, weighted_sum / weight_sum, 0.0)
+                    normalized = np.divide(weighted_sum, weight_sum, out=np.zeros_like(weighted_sum), where=valid_weights)
                     out = np.where(valid_weights, np.arctan2(normalized.imag, normalized.real), np.nan)
                 else:
                     weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
