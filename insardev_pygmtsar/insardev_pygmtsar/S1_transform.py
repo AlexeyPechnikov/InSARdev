@@ -126,8 +126,11 @@ class S1_transform(S1_topo):
         if os.path.exists(metafile):
             os.remove(metafile)
 
-        def process_refrep(bursts, target, debug=False):
-            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0], dir=tempfile.gettempdir()) as tmpdir:             
+        # Capture temp directory now (before joblib workers spawn) to respect TMPDIR env var
+        tmpdir_base = tempfile.gettempdir()
+
+        def process_refrep(bursts, target, tmpdir_base, debug=False):
+            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0], dir=tmpdir_base) as tmpdir:             
                 #print('working in:', basedir)
                 # polarization does not matter for geometry alignment, any polarization reference burst can be used
                 # burst format is like ('021_043788_IW1', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
@@ -206,7 +209,7 @@ class S1_transform(S1_topo):
         if joblib_backend is None and 'google.colab' in sys.modules:
             joblib_backend = 'threading'
         with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(process_refrep)(refrep, target, debug=debug) for refrep in refreps)
+            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(process_refrep)(refrep, target, tmpdir_base, debug=debug) for refrep in refreps)
 
         # consolidate zarr metadata for the resolution directory
         self.consolidate_metadata(target, resolution=resolution)
