@@ -372,14 +372,17 @@ class BatchCore(dict):
                     else:
                         # Single pair degree=1: [ramp, offset] or other
                         result[k] = ds - val
-                else:
-                    # Only apply subtraction to spatial variables (y, x dims)
+                elif isinstance(val, (int, float, np.floating, np.integer)):
+                    # Scalar subtraction: only apply to spatial variables (y, x dims)
                     # to avoid errors with non-spatial variables like (date,) dims
                     new_ds = ds.copy()
                     for var in ds.data_vars:
                         if 'y' in ds[var].dims and 'x' in ds[var].dims:
                             new_ds[var] = ds[var] - val
                     result[k] = new_ds
+                else:
+                    # Dataset/DataArray subtraction: apply normally
+                    result[k] = ds - val
         return type(self)(result)
 
     def __rsub__(self, other):
