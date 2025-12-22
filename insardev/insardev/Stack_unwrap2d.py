@@ -749,8 +749,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
             connections but increase computation. Default is 30.
             Only used when conncomp=False.
         device : str, optional
-            PyTorch device to use: 'cpu' (default), 'cuda', or 'mps'.
+            PyTorch device to use: 'cpu' (default), 'cuda', 'mps', or 'tpu'.
             None selects the best available GPU or falls back to CPU.
+            Use 'tpu' on Google Colab/Cloud TPU instances (experimental).
         debug : bool, optional
             If True, print diagnostic information. Default is False.
         **kwargs
@@ -766,9 +767,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         Notes
         -----
-        GPU acceleration:
+        GPU/TPU acceleration:
+        - tpu on Google Cloud TPU (experimental, requires torch_xla)
+        - cuda on NVIDIA GPUs and AMD GPUs (via ROCm)
         - mps on Apple Silicon (M1/M2/M3/M4)
-        - cuda on NVIDIA GPUs
         - cpu fallback otherwise
 
         Component Linking (when conncomp=False):
@@ -845,7 +847,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         conncomp_linkcount : int, optional
             Maximum neighbor components to consider. Default is 30.
         device : str, optional
-            PyTorch device: 'cpu', 'cuda', or 'mps'. Default is 'cpu'.
+            PyTorch device: 'cpu', 'cuda', 'mps', or 'tpu'. Default is 'cpu'.
         debug : bool, optional
             Print diagnostic information. Default is False.
         **kwargs
@@ -911,14 +913,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
     def _irls_unwrap_2d(phase, weight=None, device=None, max_iter=10, tol=1e-2,
                         cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
-        Unwrap 2D phase using GPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
+        Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
 
         This algorithm solves the L¹ phase unwrapping problem:
             min Σ w_ij |∇φ_ij - wrap(∇ψ_ij)|
 
         by iteratively solving weighted L² problems using preconditioned
-        conjugate gradient. GPU-accelerated using PyTorch (MPS on Apple Silicon,
-        CUDA on NVIDIA, or CPU fallback).
+        conjugate gradient. Accelerated using PyTorch (TPU via XLA, CUDA on NVIDIA/AMD,
+        MPS on Apple Silicon, or CPU fallback).
 
         Parameters
         ----------
@@ -957,7 +959,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         Based on: Dubois-Taine et al., "Iteratively Reweighted Least Squares
         for Phase Unwrapping", arXiv:2401.09961 (2024).
 
-        Achieves 10-20x speedup over SNAPHU on GPU.
+        Achieves 10-20x speedup over SNAPHU on GPU/TPU.
         """
         import torch
         from torch_dct import dct_2d, idct_2d
@@ -973,15 +975,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
             else:
                 device = torch.device('cpu')
         elif isinstance(device, str):
-            device = torch.device(device)
+            if device == 'tpu':
+                # TPU uses torch_xla device
+                import torch_xla.core.xla_model as xm
+                device = xm.xla_device()
+            else:
+                device = torch.device(device)
 
         # Check GPU availability for explicit device requests
-        if device.type == 'cuda' and not torch.cuda.is_available():
+        device_type = device.type if hasattr(device, 'type') else str(device)
+        if device_type == 'cuda' and not torch.cuda.is_available():
             raise RuntimeError(
                 f"CUDA device requested but not available. "
                 f"Use device='cpu' or device='auto' instead."
             )
-        if device.type == 'mps' and not torch.backends.mps.is_available():
+        if device_type == 'mps' and not torch.backends.mps.is_available():
             raise RuntimeError(
                 f"MPS device requested but not available. "
                 f"Use device='cpu' or device='auto' instead."
@@ -1322,8 +1330,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
             Minimum number of pixels for a connected component to be processed.
             Components smaller than this are left as NaN. Default is 100.
         device : str, optional
-            Device for computation: 'auto' (default), 'cpu', 'cuda', or 'mps'.
+            Device for computation: 'auto' (default), 'cpu', 'cuda', 'mps', or 'tpu'.
             'auto' selects the best available GPU, falling back to CPU.
+            Use 'tpu' on Google Colab/Cloud TPU instances (experimental).
         max_iter : int, optional
             Maximum IRLS iterations. Default is 10.
         tol : float, optional
@@ -1346,8 +1355,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         Notes
         -----
-        - GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA, or CPU)
-        - Uses GPU-accelerated DCT for fast initialization
+        - GPU/TPU-accelerated using PyTorch (TPU via XLA, CUDA/ROCm, MPS, or CPU)
+        - Uses accelerated DCT for fast initialization
         - L¹ norm preserves discontinuities better than L² (DCT)
         - Correlation weighting handles phase residues properly
         - Provides consistent results across multi-burst data
@@ -1373,6 +1382,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
             else:
                 device = 'cpu'
                 device_name = "CPU"
+        elif device == 'tpu':
+            device_name = "TPU (Google Cloud TPU via XLA)"
         else:
             device_name = device.upper()
 
