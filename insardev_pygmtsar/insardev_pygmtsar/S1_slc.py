@@ -91,7 +91,7 @@ class S1_slc(S1_base):
                     'burst': os.path.splitext(meta)[0],
                     'startTime': start_time,
                     'polarization': annotation['product']['adsHeader']['polarisation'],
-                    'flightDirection': annotation['product']['generalAnnotation']['productInformation']['pass'].upper(),
+                    'flightDirection': annotation['product']['generalAnnotation']['productInformation']['pass'],
                     'pathNumber': ((int(annotation['product']['adsHeader']['absoluteOrbitNumber']) - 73) % 175) + 1,
                     'subswath': annotation['product']['adsHeader']['swath'],
                     'mission': annotation['product']['adsHeader']['missionId'],
