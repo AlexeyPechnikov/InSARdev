@@ -509,6 +509,171 @@ class PRM(datagrid, PRM_gmtsar):
 
         return df
 
+    def read_tops_params(self) -> dict:
+        """
+        Read TOPS-specific parameters from burst XML annotation for phase ramp computation.
+
+        These parameters are required to compute the TOPS azimuthal phase ramp between
+        adjacent bursts. The phase ramp formula is:
+
+            phase = -π * kt * (η - η_ref)² - 2π * fnc * η
+
+        where:
+            kt = ka * ks / (ka - ks)  (effective Doppler rate)
+            ks = 2 * v * fc * kψ / c  (steering rate contribution)
+            ka = azimuthFmRate polynomial evaluated at slant range time
+            fnc = Doppler centroid polynomial evaluated at slant range time
+            η = azimuth time relative to burst center
+            η_ref = reference time = -fnc/ka + fnc[0]/ka[0]
+
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - azimuthSteeringRate: Antenna steering rate in degrees/second
+            - azimuthFmRatePolynomial: FM rate coefficients [c0, c1, c2] at burst center time
+            - azimuthFmRateT0: Reference slant range time for FM rate polynomial
+            - azimuthFmRateAzimuthTime: Azimuth time for FM rate record
+            - dcPolynomial: Doppler centroid coefficients [c0, c1, c2] at burst center time
+            - dcT0: Reference slant range time for DC polynomial
+            - dcAzimuthTime: Azimuth time for DC estimate record
+
+        Notes
+        -----
+        The FM rate and DC polynomials are time-varying. This method selects the record
+        closest to the burst center time, following the same approach as GMTSAR's
+        make_s1a_tops.c dramp_dmod() function.
+
+        The XML annotation file is derived from the input_file path by replacing .tiff with .xml.
+
+        References
+        ----------
+        GMTSAR make_s1a_tops.c: https://github.com/gmtsar/gmtsar
+        ESA Sentinel-1 TOPS SLC Deramping: https://sentinels.copernicus.eu/documents/247904/1653442/Sentinel-1-TOPS-SLC_Deramping
+        """
+        from datetime import datetime
+        import xmltodict
+
+        # Derive XML path from input_file (replace .tiff with .xml)
+        input_file = self.get('input_file')
+        xml_file = input_file.replace('measurement','annotation').replace('.tiff', '.xml')
+
+        # Read annotation XML
+        with open(xml_file) as fd:
+            annotation = xmltodict.parse(fd.read())
+
+        product = annotation['product']
+
+        # Get azimuth steering rate (constant for entire burst)
+        azimuth_steering_rate = float(product['generalAnnotation']['productInformation']['azimuthSteeringRate'])
+
+        # Get azimuth time interval for computing burst center time
+        dta = float(product['imageAnnotation']['imageInformation']['azimuthTimeInterval'])
+
+        # Get lines per burst
+        lpb = int(product['swathTiming']['linesPerBurst'])
+
+        # Get burst azimuth time and compute burst center time
+        burst_list = product['swathTiming']['burstList']['burst']
+        if isinstance(burst_list, list):
+            burst_info = burst_list[0]  # Single burst file has only one burst
+        else:
+            burst_info = burst_list
+        burst_azimuth_time_str = burst_info['azimuthTime']
+        burst_azimuth_time = datetime.strptime(burst_azimuth_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+        # Burst center time (as fractional day for comparison)
+        t_brst = (burst_azimuth_time.hour * 3600 + burst_azimuth_time.minute * 60 +
+                  burst_azimuth_time.second + burst_azimuth_time.microsecond / 1e6)
+        t_brst += dta * lpb / 2.0  # Add half burst duration
+
+        # Parse firstValidSample to get ksr (first valid line) and ker (last valid line)
+        # These are needed for GMTSAR-style overlap boundary computation
+        first_valid = burst_info['firstValidSample']
+        if isinstance(first_valid, dict):
+            fvs_str = first_valid['#text']
+        else:
+            fvs_str = first_valid
+        fvs = [int(x) for x in fvs_str.split()]
+
+        ksr = None  # First valid line index within burst
+        ker = None  # Last valid line index within burst
+        for j, flag in enumerate(fvs):
+            if flag >= 0:
+                if ksr is None:
+                    ksr = j
+                ker = j
+
+        # Azimuth ANX time for computing overlap with adjacent bursts
+        azimuth_anx_time = float(burst_info['azimuthAnxTime'])
+
+        # Find azimuthFmRate record closest to burst center
+        fm_rate_list = product['generalAnnotation']['azimuthFmRateList']['azimuthFmRate']
+        if not isinstance(fm_rate_list, list):
+            fm_rate_list = [fm_rate_list]
+
+        best_fm_idx = 0
+        best_fm_diff = float('inf')
+        for i, fm_rate in enumerate(fm_rate_list):
+            fm_time_str = fm_rate['azimuthTime']
+            fm_time = datetime.strptime(fm_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+            fm_t = fm_time.hour * 3600 + fm_time.minute * 60 + fm_time.second + fm_time.microsecond / 1e6
+            diff = abs(fm_t - t_brst)
+            if diff < best_fm_diff:
+                best_fm_diff = diff
+                best_fm_idx = i
+
+        fm_rate_record = fm_rate_list[best_fm_idx]
+        fm_t0 = float(fm_rate_record['t0'])
+        fm_azimuth_time = fm_rate_record['azimuthTime']
+
+        # Parse FM rate polynomial - handle both old and new XML formats
+        if 'azimuthFmRatePolynomial' in fm_rate_record:
+            fm_poly_str = fm_rate_record['azimuthFmRatePolynomial']['#text'] if isinstance(fm_rate_record['azimuthFmRatePolynomial'], dict) else fm_rate_record['azimuthFmRatePolynomial']
+            fm_poly = [float(x) for x in fm_poly_str.split()]
+        else:
+            # New format with c0, c1, c2 elements
+            fm_poly = [float(fm_rate_record['c0']), float(fm_rate_record['c1']), float(fm_rate_record['c2'])]
+
+        # Find dcEstimate record closest to burst center
+        dc_list = product['dopplerCentroid']['dcEstimateList']['dcEstimate']
+        if not isinstance(dc_list, list):
+            dc_list = [dc_list]
+
+        best_dc_idx = 0
+        best_dc_diff = float('inf')
+        for i, dc_est in enumerate(dc_list):
+            dc_time_str = dc_est['azimuthTime']
+            dc_time = datetime.strptime(dc_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+            dc_t = dc_time.hour * 3600 + dc_time.minute * 60 + dc_time.second + dc_time.microsecond / 1e6
+            diff = abs(dc_t - t_brst)
+            if diff < best_dc_diff:
+                best_dc_diff = diff
+                best_dc_idx = i
+
+        dc_record = dc_list[best_dc_idx]
+        dc_t0 = float(dc_record['t0'])
+        dc_azimuth_time = dc_record['azimuthTime']
+
+        # Parse DC polynomial
+        dc_poly_str = dc_record['dataDcPolynomial']['#text'] if isinstance(dc_record['dataDcPolynomial'], dict) else dc_record['dataDcPolynomial']
+        dc_poly = [float(x) for x in dc_poly_str.split()]
+
+        return {
+            'azimuthSteeringRate': azimuth_steering_rate,
+            'azimuthFmRatePolynomial': fm_poly,
+            'azimuthFmRateT0': fm_t0,
+            'azimuthFmRateAzimuthTime': fm_azimuth_time,
+            'dcPolynomial': dc_poly,
+            'dcT0': dc_t0,
+            'dcAzimuthTime': dc_azimuth_time,
+            # GMTSAR-style overlap boundary parameters
+            'linesPerBurst': lpb,
+            'ksr': ksr,  # First valid line index within burst
+            'ker': ker,  # Last valid line index within burst
+            'azimuthAnxTime': azimuth_anx_time,  # Azimuth ANX time for overlap computation
+            #'prf': float(product['imageAnnotation']['imageInformation']['azimuthFrequency']),
+        }
+
     # my replacement function for GMT based robust 2D trend coefficient calculations:
     # gmt trend2d r.xyz -Fxyzmw -N1r -V
     # gmt trend2d r.xyz -Fxyzmw -N2r -V

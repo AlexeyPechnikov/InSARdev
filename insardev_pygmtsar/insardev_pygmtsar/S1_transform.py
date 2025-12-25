@@ -285,6 +285,10 @@ class S1_transform(S1_topo):
             if name not in ['input_file', 'SLC_file', 'led_file']:
                 data_proj.attrs[name] = value
 
+        # add TOPS-specific parameters for phase ramp computation (already read above)
+        for name, value in prm_rep.read_tops_params().items():
+            data_proj.attrs[name] = value
+
         # add calculated attributes
         BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
         # prevent confusing -0.0
@@ -308,12 +312,7 @@ class S1_transform(S1_topo):
         # remove spatial_ref variable to limit zarray files count
         data_proj = data_proj.drop_vars('spatial_ref')
 
-        # transfer attributes to the output variables
-        #print ('data_proj.attrs', data_proj.attrs)
-        data_proj.im.attrs = data_proj.attrs
-        data_proj.re.attrs = data_proj.attrs
-
-        # add storage specific attributes
+        # add storage specific attributes to variables only
         for varname in ['re', 'im']:
             data_proj[varname].attrs['scale_factor'] = scale
             data_proj[varname].attrs['add_offset'] = 0
