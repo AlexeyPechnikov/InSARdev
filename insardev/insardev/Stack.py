@@ -619,16 +619,29 @@ class Stack(Stack_plot, BatchCore):
             import xarray as xr
             import numpy as np
             #print ('ds_preprocess', ds)
+            # TOPS parameters that must be per-date data variables for differential phase computation
+            tops_attrs = ['azimuthSteeringRate', 'azimuthFmRatePolynomial', 'azimuthFmRateT0',
+                         'azimuthFmRateAzimuthTime', 'dcPolynomial', 'dcT0', 'dcAzimuthTime']
             process_attr = True if debug else False
             for key in ds.attrs:
                 if key==attr_start:
                     process_attr = True
-                if not process_attr and not key in ['SLC_scale']:
+                # Include TOPS parameters AND attributes from attr_start onwards
+                if not process_attr and key not in ['SLC_scale'] + tops_attrs:
                     continue
                 #print ('key', key)
                 if key not in ['Conventions', 'spatial_ref']:
                     # Create a new DataArray with the original value
-                    ds[key] = xr.DataArray(ds.attrs[key], dims=[])
+                    val = ds.attrs[key]
+                    # Handle array values (e.g., polynomial coefficients)
+                    if isinstance(val, (list, tuple)):
+                        val = np.array(val)
+                    val_arr = np.asarray(val)
+                    if val_arr.ndim == 0:
+                        ds[key] = xr.DataArray(val_arr, dims=[])
+                    else:
+                        # For 1D arrays (like polynomial coefficients), create with 'coef' dim
+                        ds[key] = xr.DataArray(val_arr, dims=['coef'])
                     # remove the attribute
                     del ds.attrs[key]
             
