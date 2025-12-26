@@ -1094,3 +1094,164 @@ class Stack(Stack_plot, BatchCore):
         """Compute east-west displacement (meters) from unwrapped phase and incidence."""
         import xarray as xr
         return self._displacement_component(phase, transform, func=xr.ufuncs.sin, suffix='eastwest')
+
+    def align_tops(self, debug: bool = False) -> "Stack":
+        """Apply elevation correction for TOPS burst processing.
+
+        Corrects for satellite height variation along track when processing
+        per-burst (as opposed to GMTSAR's approach of stitching before
+        interferometry).
+
+        Parameters
+        ----------
+        debug : bool, optional
+            Print debug information including elevation corrections.
+
+        Returns
+        -------
+        Stack
+            New Stack with corrected elevation values.
+
+        Notes
+        -----
+        The satellite height varies along the orbit (30-60m between adjacent
+        bursts). This causes an apparent elevation offset between bursts
+        when they are processed independently. This function computes and
+        applies cumulative elevation corrections to align the bursts.
+
+        The elevation correction is computed from the satellite height
+        difference using radar geometry (incidence angle, Earth radius,
+        slant range).
+        """
+        import numpy as np
+        import xarray as xr
+
+        if not self:
+            return type(self)({})
+
+        # Group bursts by (pathNumber, subswath) and sort by burst number
+        # NOTE: Extract pathNumber and subswath from burst ID string, not from
+        # per-date data variables which may vary (e.g., S1A vs S1B satellites).
+        # Burst ID format: "{pathNumber}_{burstNumber}_{subswath}"
+        ids = sorted(self.keys())
+        groups = {}
+        for bid in ids:
+            parts = bid.split('_')
+            if len(parts) >= 3:
+                path_num = int(parts[0])
+                burst_num = int(parts[1])
+                subswath = parts[2]
+            else:
+                # Fallback to data variable if burst ID format is unexpected
+                ds = self[bid]
+                path_num = int(ds['pathNumber'].values[0])
+                subswath = str(ds['subswath'].values[0])
+                burst_num = int(parts[1]) if len(parts) >= 2 else 0
+            key = (path_num, subswath)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((bid, burst_num))
+
+        for key in groups:
+            groups[key].sort(key=lambda x: x[1])
+
+        if debug:
+            print(f"align_tops(): {len(ids)} bursts")
+
+        def compute_elevation_correction(ds_prev, ds_curr):
+            """Compute elevation correction from satellite height difference.
+
+            Returns the apparent elevation offset (meters) to add to current burst.
+            """
+            prf = float(ds_prev.attrs['PRF'])
+            lpb = int(ds_prev.attrs['linesPerBurst'])
+            clock_start_prev = float(ds_prev.attrs['clock_start'])
+            clock_start_curr = float(ds_curr.attrs['clock_start'])
+
+            ksr_prev = int(ds_prev.attrs['ksr'])
+            ker_prev = int(ds_prev.attrs['ker'])
+            ksr_curr = int(ds_curr.attrs['ksr'])
+            ker_curr = int(ds_curr.attrs['ker'])
+
+            # Lines from burst1 start to burst2 start
+            nl = int(np.floor((clock_start_curr - clock_start_prev) * 86400.0 * prf + 0.5))
+
+            # Overlap of valid regions
+            valid_overlap_start = max(ksr_prev, nl + ksr_curr)
+            valid_overlap_end = min(ker_prev, nl + ker_curr)
+
+            # Stitch at middle of valid overlap
+            azi_prev = round((valid_overlap_start + valid_overlap_end) / 2)
+            azi_curr = azi_prev - nl
+
+            # Satellite height at overlap midpoint for each burst
+            H_prev_start = float(ds_prev.attrs['SC_height_start'])
+            H_prev_end = float(ds_prev.attrs['SC_height_end'])
+            H_curr_start = float(ds_curr.attrs['SC_height_start'])
+            H_curr_end = float(ds_curr.attrs['SC_height_end'])
+
+            H_prev = H_prev_start + (H_prev_end - H_prev_start) * azi_prev / lpb
+            H_curr = H_curr_start + (H_curr_end - H_curr_start) * azi_curr / lpb
+            dH_satellite = H_prev - H_curr
+
+            # Compute apparent elevation difference from satellite height change
+            # Using radar geometry: range, Earth radius, incidence angle
+            earth_radius = float(ds_prev.attrs['earth_radius'])
+            near_range = float(ds_prev.attrs['near_range'])
+            H_avg = (H_prev + H_curr) / 2
+            c = earth_radius + H_avg
+            ret = earth_radius
+            cos_theta = (c**2 + ret**2 - near_range**2) / (2 * c * ret)
+            drho_dH = (c - ret * cos_theta) / near_range
+            drho_dh = (ret - c * cos_theta) / near_range
+            dh_elevation = -dH_satellite * drho_dH / drho_dh
+
+            return dh_elevation
+
+        # Compute cumulative elevation corrections per burst
+        burst_ele_corrections = {}
+
+        for (path_num, subswath), burst_list in groups.items():
+            if debug:
+                print(f"\n=== Path {path_num}, Subswath {subswath} ===")
+
+            ref_bid = burst_list[0][0]
+            burst_ele_corrections[ref_bid] = 0.0
+
+            if debug:
+                print(f"{ref_bid}: reference burst (ele_corr=0)")
+
+            cumulative_ele = 0.0
+
+            for i in range(1, len(burst_list)):
+                prev_bid = burst_list[i - 1][0]
+                curr_bid = burst_list[i][0]
+                ds_prev = self[prev_bid]
+                ds_curr = self[curr_bid]
+
+                dh_elevation = compute_elevation_correction(ds_prev, ds_curr)
+                cumulative_ele += dh_elevation
+                burst_ele_corrections[curr_bid] = cumulative_ele
+
+                if debug:
+                    print(f"{curr_bid}: dh={dh_elevation:.2f}m, cumulative={cumulative_ele:.2f}m")
+
+        # Apply elevation corrections
+        output = {}
+        for bid, ds in self.items():
+            ele_corr = burst_ele_corrections.get(bid, 0.0)
+
+            # Skip if no correction needed
+            if abs(ele_corr) < 1e-6:
+                output[bid] = ds
+                continue
+
+            new_ds = ds.copy()
+
+            # Apply elevation correction
+            if 'ele' in ds.data_vars:
+                new_ds['ele'] = ds['ele'] + ele_corr
+
+            output[bid] = new_ds
+
+        return type(self)(output)
