@@ -858,6 +858,8 @@ class Stack(Stack_plot, BatchCore):
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
 
+        return self
+
     def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
         """Compute elevation (meters) from unwrapped phase grids in radar coordinates.
 
