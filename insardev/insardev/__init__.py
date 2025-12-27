@@ -14,3 +14,4 @@ __version__ = '2025.12.21.dev'
 from .Stack import Stack
 from .BatchCore import BatchCore
 from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+from .Baseline import Baseline

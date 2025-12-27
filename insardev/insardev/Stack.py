@@ -1236,3 +1236,106 @@ class Stack(Stack_plot, BatchCore):
             output[bid] = new_ds
 
         return type(self)(output)
+
+    def baseline(self, days: int | None = None, meters: float | None = None,
+                 invert: bool = False) -> "Baseline":
+        """Generate baseline pairs table from the Stack.
+
+        Creates a Baseline DataFrame containing all valid interferometric pairs
+        with their temporal and spatial baselines.
+
+        Parameters
+        ----------
+        days : int, optional
+            Maximum temporal separation in days. If None, no temporal limit.
+        meters : float, optional
+            Maximum perpendicular baseline difference in meters. If None, no limit.
+        invert : bool, optional
+            If True, invert reference and repeat dates. Default is False.
+
+        Returns
+        -------
+        Baseline
+            DataFrame subclass with columns: ref, rep, ref_baseline, rep_baseline,
+            pair, baseline, duration. Has custom plot() and hist() methods.
+
+        Examples
+        --------
+        >>> # Get all baseline pairs
+        >>> bl = stack.baseline()
+        >>> bl.plot()  # Plot baseline network
+        >>> bl.hist()  # Plot duration histogram
+
+        >>> # Filter by temporal separation
+        >>> bl = stack.baseline(days=48)
+
+        >>> # Filter by baseline
+        >>> bl = stack.baseline(meters=100)
+        """
+        import numpy as np
+        import pandas as pd
+        from .Baseline import Baseline
+
+        if days is None:
+            days = int(1e6)
+
+        # Get baseline table: date -> BPR
+        # Extract BPR per date from first burst (all bursts have same dates)
+        if not self:
+            return Baseline()
+
+        first_key = next(iter(self.keys()))
+        first_ds = self[first_key]
+
+        if 'date' not in first_ds.dims:
+            raise ValueError("Stack must have 'date' dimension to compute baselines")
+
+        # Normalize to date only (no time component)
+        dates = pd.DatetimeIndex(first_ds.coords['date'].values).normalize()
+
+        # Get BPR values - they are stored as a data variable along date dimension
+        if 'BPR' in first_ds.data_vars:
+            bpr_values = first_ds['BPR'].values
+        elif 'BPR' in first_ds.coords:
+            bpr_values = first_ds.coords['BPR'].values
+        else:
+            raise ValueError("Stack must have 'BPR' variable to compute baselines")
+
+        # Build baseline table
+        tbl = pd.DataFrame({'date': dates, 'BPR': bpr_values}).set_index('date')
+
+        # Generate pairs
+        data = []
+        for line1 in tbl.itertuples():
+            for line2 in tbl.itertuples():
+                if not (line1.Index < line2.Index and (line2.Index - line1.Index).days <= days):
+                    continue
+                if meters is not None and not (abs(line1.BPR - line2.BPR) <= meters):
+                    continue
+
+                if not invert:
+                    data.append({
+                        'ref': line1.Index,
+                        'rep': line2.Index,
+                        'ref_baseline': np.round(line1.BPR, 2),
+                        'rep_baseline': np.round(line2.BPR, 2)
+                    })
+                else:
+                    data.append({
+                        'ref': line2.Index,
+                        'rep': line1.Index,
+                        'ref_baseline': np.round(line2.BPR, 2),
+                        'rep_baseline': np.round(line1.BPR, 2)
+                    })
+
+        if not data:
+            return Baseline(burst_id=first_key, dates=dates)
+
+        df = pd.DataFrame(data).sort_values(['ref', 'rep']).reset_index(drop=True)
+        df = df.assign(
+            pair=[f'{ref.date()} {rep.date()}' for ref, rep in zip(df['ref'], df['rep'])],
+            baseline=df['rep_baseline'] - df['ref_baseline'],
+            duration=(df['rep'] - df['ref']).dt.days
+        )
+
+        return Baseline(df, burst_id=first_key, dates=dates)
