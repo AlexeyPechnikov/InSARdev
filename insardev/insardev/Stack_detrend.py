@@ -45,6 +45,115 @@ class Stack_detrend(Stack_unwrap2d):
         data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, compute=compute, wrap=wrap, **kwarg)
         return BatchWrap(data) if wrap else Batch(data)
 
+    def trend2d_dataset(self, phase, weight=None, transform=None, **kwargs):
+        """
+        Compute 2D trend from phase Dataset using regression.
+
+        Convenience wrapper around trend2d() for working with merged datasets
+        instead of per-burst batches. Useful when you have already dissolved
+        and merged your data.
+
+        Parameters
+        ----------
+        phase : xr.Dataset
+            Phase dataset (from phase.to_dataset() or unwrap2d_dataset()).
+        weight : xr.Dataset, optional
+            Correlation/weight dataset (from corr.to_dataset()).
+        transform : xr.Dataset, optional
+            Transform dataset with 'azi' and 'rng' variables.
+        **kwargs
+            Additional arguments passed to regression2d (degree, algorithm, etc.).
+
+        Returns
+        -------
+        xr.Dataset
+            Trend dataset with same structure as input phase.
+
+        Examples
+        --------
+        Basic usage with merged datasets:
+        >>> phase_ds = phase.to_dataset()
+        >>> corr_ds = corr.to_dataset()
+        >>> transform_ds = transform[['azi','rng']].to_dataset()
+        >>> trend = stack.trend2d_dataset(phase_ds, corr_ds, transform_ds, degree=1, algorithm='linear')
+
+        Convert back to per-burst Batch:
+        >>> trend_batch = phase.from_dataset(trend)
+        """
+        import xarray as xr
+        import numpy as np
+
+        # Validate input types
+        if not isinstance(phase, xr.Dataset):
+            raise TypeError(f"phase must be xr.Dataset, got {type(phase).__name__}")
+        if weight is not None and not isinstance(weight, xr.Dataset):
+            raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
+        if transform is not None and not isinstance(transform, xr.Dataset):
+            raise TypeError(f"transform must be xr.Dataset, got {type(transform).__name__}")
+
+        # Helper to chunk only dimensions that exist in a dataset
+        def safe_chunk(ds, base_spec):
+            valid_spec = {k: v for k, v in base_spec.items() if k in ds.dims}
+            return ds.chunk(valid_spec)
+
+        # Rechunk: 1 pair per chunk, full y/x
+        chunk_spec = {'y': -1, 'x': -1}
+        if 'pair' in phase.dims:
+            chunk_spec['pair'] = 1
+        phase = safe_chunk(phase, chunk_spec)
+        if weight is not None:
+            weight = safe_chunk(weight, chunk_spec)
+
+        # Get polarization variables
+        polarizations = [v for v in phase.data_vars if v != 'spatial_ref']
+
+        # Detect stack dimension
+        sample_da = phase[polarizations[0]]
+        dims = sample_da.dims
+        stackvar = dims[0] if len(dims) > 2 else None
+        n_stack = sample_da.sizes[stackvar] if stackvar else 1
+
+        # Prepare transform variables list
+        transform_vars = [transform[v] for v in transform.data_vars] if transform is not None else []
+
+        results = {}
+        for pol in polarizations:
+            phase_da = phase[pol]
+            weight_da = weight[pol] if weight is not None else None
+
+            if stackvar and n_stack > 1:
+                # Process each stack element using regression2d directly
+                trend_slices = []
+                for i in range(n_stack):
+                    phase_slice = phase_da.isel({stackvar: i})
+                    weight_slice = weight_da.isel({stackvar: i}) if weight_da is not None else None
+
+                    # Call regression2d directly - it handles dask arrays properly via apply_ufunc
+                    trend_slice = regression2d(
+                        phase_slice,
+                        variables=transform_vars,
+                        weight=weight_slice,
+                        **kwargs
+                    )
+                    trend_slices.append(trend_slice.expand_dims({stackvar: [phase_da[stackvar].values[i]]}))
+
+                # Concatenate along stack dimension and rechunk
+                result_da = xr.concat(trend_slices, dim=stackvar).chunk({stackvar: 1, 'y': -1, 'x': -1})
+            else:
+                # Single 2D case - call regression2d directly
+                result_da = regression2d(
+                    phase_da,
+                    variables=transform_vars,
+                    weight=weight_da,
+                    **kwargs
+                )
+
+            results[pol] = result_da.rename(pol)
+
+        output = xr.merge(list(results.values()))
+        output.attrs = phase.attrs
+        return output
+
     def _polyfit(self, data, weight=None, degree=0, days=None, count=None, wrap=False):
         print ('NOTE: Function is deprecated. Use Stack.regression_pairs() instead.')
         return self.regression_pairs(data=data, weight=weight, degree=degree, days=days, count=count, wrap=wrap)
