@@ -334,6 +334,7 @@ class Stack_lstsq(Stack_sbas):
         >>> displacement = stack.lstsq(detrend)  # unweighted
         """
         import xarray as xr
+        import rioxarray  # for .rio accessor
 
         results = {}
         for key in data.keys():
@@ -353,6 +354,9 @@ class Stack_lstsq(Stack_sbas):
             # Build result Dataset for this burst
             result_ds = xr.Dataset(result_vars)
             result_ds.attrs = ds.attrs
+            # Preserve CRS
+            if ds.rio.crs is not None:
+                result_ds = result_ds.rio.write_crs(ds.rio.crs)
             results[key] = result_ds
 
         return Batch(results)
