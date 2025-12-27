@@ -46,11 +46,21 @@ class UI:
             .widget-dropdown,
             .jp-InputPrompt,
             .cell-output-ipywidget-background,
-            .cell-output-ipywidget-background * {
+            .cell-output-ipywidget-background *:not([class*="leaflet"]):not([class*="pv-"]):not(canvas):not(svg):not(svg *) {
                 background-color: #333333 !important;
                 color: lightgray !important;
                 border-color: #555555 !important;
                 outline: none !important;
+            }
+
+            /* Exclude leaflet and pyvista elements from dark theme override */
+            .leaflet-container,
+            .leaflet-container *,
+            [class*="leaflet-"],
+            [class*="pv-"] {
+                background-color: unset !important;
+                color: unset !important;
+                border-color: unset !important;
             }
 
             /* Widget labels remain white */
