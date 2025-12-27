@@ -1799,6 +1799,89 @@ class BatchCore(dict):
             progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
         return output
 
+    def to_geojson(self) -> dict:
+        """
+        Convert batch data to GeoJSON with pixel rectangles.
+
+        Creates a GeoJSON FeatureCollection where each pixel is represented
+        as a polygon rectangle. All data variables (VV, VH, etc.) are preserved
+        as properties in each feature.
+
+        Returns
+        -------
+        dict
+            GeoJSON dictionary with FeatureCollection containing polygon features.
+            Each feature has properties: lat, lon, and all data variables.
+
+        Examples
+        --------
+        >>> geojson = velocity.to_geojson()
+        >>> with open('velocity.geojson', 'w') as f:
+        ...     json.dump(geojson, f)
+        """
+        import geopandas as gpd
+        import shapely.geometry
+
+        # Merge to single dataset
+        ds = self.to_dataset()
+
+        # Get data variables (excluding spatial_ref)
+        data_vars = [v for v in ds.data_vars if v != 'spatial_ref']
+
+        # Convert to dataframe and drop NaN rows
+        df = ds.to_dataframe().dropna().reset_index()
+
+        if df.empty:
+            return {"type": "FeatureCollection", "features": []}
+
+        # Get pixel spacing
+        dy, dx = self.spacing
+
+        # Create rectangles in projected coordinates
+        def point_to_rectangle(row, half_y, half_x):
+            return shapely.geometry.Polygon([
+                (row.x - half_x, row.y - half_y),
+                (row.x + half_x, row.y - half_y),
+                (row.x + half_x, row.y + half_y),
+                (row.x - half_x, row.y + half_y)
+            ])
+
+        # Build GeoDataFrame with rectangles
+        gdf = gpd.GeoDataFrame(
+            df[['y', 'x'] + data_vars],
+            geometry=[point_to_rectangle(row, abs(dy)/2, abs(dx)/2) for _, row in df.iterrows()],
+            crs=self.crs
+        )
+
+        # Reproject to WGS84
+        gdf = gdf.to_crs('EPSG:4326')
+        gdf['lon'] = gdf.geometry.centroid.x
+        gdf['lat'] = gdf.geometry.centroid.y
+
+        # Convert to GeoJSON dict
+        geojson_dict = {
+            "type": "FeatureCollection",
+            "features": []
+        }
+
+        for _, row in gdf.iterrows():
+            properties = {
+                "lat": float(row['lat']),
+                "lon": float(row['lon'])
+            }
+            # Add all data variables
+            for var in data_vars:
+                properties[var] = float(row[var])
+
+            feature = {
+                "type": "Feature",
+                "geometry": shapely.geometry.mapping(row['geometry']),
+                "properties": properties
+            }
+            geojson_dict["features"].append(feature)
+
+        return geojson_dict
+
     def to_vtk(self, path: str, mask: bool = True):
         """
         Export the batch data to VTK files.
