@@ -9,6 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from .Stack_sbas import Stack_sbas
+from .Batch import Batch
 
 class Stack_lstsq(Stack_sbas):
 
@@ -84,7 +85,7 @@ class Stack_lstsq(Stack_sbas):
         # mask produced cumsum zeroes by NaNs where model[0] is the timeseries values
         return np.where(~np.isnan(model[0]), np.nancumsum(model[0], axis=0), np.nan)
 
-    def _lstsq_matrix(self, pairs):
+    def lstsq_matrix(self, pairs):
         """
         Create a matrix for use in the least squares computation based on interferogram date pairs.
 
@@ -162,22 +163,18 @@ class Stack_lstsq(Stack_sbas):
         if debug:
             print ('DEBUG: data', data)
 
+        # Auto-chunk if not already chunked
+        # Use complex128 (16 bytes) to account for memory used by internal variables
+        if data.chunks is None:
+            import dask.array.core
+            chunks = dask.array.core.normalize_chunks('auto', data.shape, dtype=np.complex128)
+            data = data.chunk(dict(zip(data.dims, chunks)))
+
+        # Get chunk sizes from data
         if not 'stack' in data.dims:
-            chunks_z, chunks_y, chunks_x = data.chunks if data.chunks is not None else np.inf, np.inf, np.inf
-            if np.max(chunks_y) > self.netcdf_chunksize or np.max(chunks_x) > self.netcdf_chunksize:
-                print (f'Note: data chunk size ({np.max(chunks_y)}, {np.max(chunks_x)}) is too large for stack processing')
-                chunks_y = chunks_x = self.netcdf_chunksize//2
-                print (f'Note: auto tune data chunk size to a half of NetCDF chunk: ({chunks_y}, {chunks_x})')
-            chunks = {'y': chunks_y, 'x': chunks_x}
+            chunks_z, chunks_y, chunks_x = data.chunks
         else:
-            chunks_z, chunks_stack = data.chunks if data.chunks is not None else np.inf, np.inf
-            if np.max(chunks_stack) > self.chunksize1d:
-                print (f'Note: data chunk size ({np.max(chunks_stack)} is too large for stack processing')
-                # 1D chunk size can be defined straightforward
-                chunks_stack = self.chunksize1d
-                print (f'Note: auto tune data chunk size to 1D chunk: ({chunks_stack})')
-            chunks = {'stack': chunks_stack}
-        data = data.chunk(chunks)
+            chunks_z, chunks_stack = data.chunks
 
         if weight is None:
             # this case should be processed inside lstq_block function
@@ -196,9 +193,7 @@ class Stack_lstsq(Stack_sbas):
         elif isinstance(weight, xr.DataArray) and len(weight.dims) == 3:
             # this case should be processed inside lstq_block function
             assert weight.shape == data.shape, 'ERROR: data and weight dataarrays should have the same dimensions'
-            #if np.max(chunks_y) > self.netcdf_chunksize or np.max(chunks_x) > self.netcdf_chunksize:
-            #    print ('Note: auto tune weight chunk size to a half of NetCDF chunk')
-            #    weight = weight.chunk({'y': chunks_y, 'x': chunks_x})
+            # align weight chunks with data chunks
             weight = weight.chunk({'y': chunks_y, 'x': chunks_x})
         elif 'stack' in weight.dims:
             # this case should be processed inside lstq_block function
@@ -218,7 +213,7 @@ class Stack_lstsq(Stack_sbas):
         if isinstance(matrix, str) and matrix == 'auto':
             if debug:
                 print ('DEBUG: Generate default matrix')
-            matrix = self._lstsq_matrix(pairs)
+            matrix = self.lstsq_matrix(pairs)
         else:
             if debug:
                 print ('DEBUG: Use user-supplied matrix')
@@ -307,10 +302,65 @@ class Stack_lstsq(Stack_sbas):
 
         return model
 
-    def _rmse(self, data, solution, weight=None):
+    def lstsq(self, data, weight=None, cumsum=True, debug=False):
         """
-        Calculate difference between pairs and dates
-    
+        Perform least squares (weighted or unweighted) computation on Batch objects.
+
+        Converts interferogram pairs to date-based time series using least squares
+        inversion. Each burst in the Batch is processed independently.
+
+        Parameters
+        ----------
+        data : Batch
+            Batch of unwrapped/detrended phase with 'pair' dimension.
+        weight : Batch, optional
+            Batch of correlation values for weighted least squares.
+            If None, unweighted least squares is used.
+        cumsum : bool, optional
+            If True (default), return cumulative sum (displacement time series).
+            If False, return incremental values.
+        debug : bool, optional
+            Print debug information.
+
+        Returns
+        -------
+        Batch
+            Batch with 'date' dimension containing the time series solution.
+
+        Examples
+        --------
+        >>> detrend = stack.trend2d(unwrap, corr, transform)
+        >>> displacement = stack.lstsq(detrend, corr)
+        >>> displacement = stack.lstsq(detrend)  # unweighted
+        """
+        import xarray as xr
+
+        results = {}
+        for key in data.keys():
+            ds = data[key]
+            w_ds = weight[key] if weight is not None else None
+
+            # Process each polarization variable
+            result_vars = {}
+            for pol in [v for v in ds.data_vars if v != 'spatial_ref']:
+                da = ds[pol]
+                w_da = w_ds[pol] if w_ds is not None else None
+
+                # Call internal _lstsq on DataArray
+                result = self._lstsq(da, w_da, cumsum=cumsum, debug=debug)
+                result_vars[pol] = result
+
+            # Build result Dataset for this burst
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = ds.attrs
+            results[key] = result_ds
+
+        return Batch(results)
+
+    def rmse(self, data, solution, weight=None):
+        """
+        Calculate RMSE difference between pairs and dates.
+
         Use to calculate solution vs pair unwrapped phases difference as
         diff = sbas.stack_vs_cube(phase_unwrap, solution)
         error = np.sqrt(sbas.wrap(diff)**2).sum('pair')
