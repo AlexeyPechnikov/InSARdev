@@ -198,8 +198,38 @@ class Stack(Stack_plot, BatchCore):
         if tfm is not None:
             if tfm_is_default:
                 # Decimate each burst's transform to match corresponding input burst
-                decimated = {k: tfm[k][['ele']].reindex(y=target[k].y, x=target[k].x, method='nearest')
-                             for k in target.keys() if k in tfm}
+                # Use index-based nearest neighbor selection (much faster than reindex)
+                def _nearest_indices(source_coords, target_coords):
+                    """Find indices in source_coords nearest to target_coords."""
+                    # Handle descending coordinates (e.g., y going north to south)
+                    descending = len(source_coords) > 1 and source_coords[0] > source_coords[-1]
+                    if descending:
+                        source_coords = source_coords[::-1]
+                    indices = np.searchsorted(source_coords, target_coords)
+                    indices = np.clip(indices, 0, len(source_coords) - 1)
+                    # Check if previous index is closer
+                    prev_indices = np.clip(indices - 1, 0, len(source_coords) - 1)
+                    prev_diff = np.abs(source_coords[prev_indices] - target_coords)
+                    curr_diff = np.abs(source_coords[indices] - target_coords)
+                    indices = np.where(prev_diff < curr_diff, prev_indices, indices)
+                    # Convert back to original order if descending
+                    if descending:
+                        indices = len(source_coords) - 1 - indices
+                    return indices
+
+                decimated = {}
+                for k in target.keys():
+                    if k not in tfm:
+                        continue
+                    tfm_ds = tfm[k][['ele']]
+                    tgt_ds = target[k]
+                    # Find nearest indices for y and x coordinates
+                    y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
+                    x_idx = _nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
+                    # Select using indices and assign target coordinates
+                    selected = tfm_ds.isel(y=y_idx, x=x_idx)
+                    selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
+                    decimated[k] = selected
                 topo_merged = Batch(decimated).to_dataset()
             else:
                 # User-provided transform: use as-is
@@ -1011,8 +1041,8 @@ class Stack(Stack_plot, BatchCore):
             disp_vars: dict[str, xr.DataArray] = {}
             for var_name, data in phase_ds.data_vars.items():
                 disp = (data * scale).astype('float32')
-                name = 'los' if len(phase_ds.data_vars) == 1 else f'{var_name}_los'
-                disp_vars[name] = disp
+                #name = 'los' if len(phase_ds.data_vars) == 1 else f'{var_name}_los'
+                disp_vars[var_name] = disp
             out[key] = xr.Dataset(disp_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
 
         return Batch(out)

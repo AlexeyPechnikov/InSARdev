@@ -70,29 +70,28 @@ class BatchCore(dict):
 
     def from_dataset(self, data: xr.Dataset) -> Batch:
         """
-        Create a Batch by reindexing a Dataset to each burst's coordinates.
+        Create a Batch by selecting each burst's coordinates from a merged Dataset.
 
-        This is memory-efficient for large rasters (e.g., landmask, DEM, correlation)
-        as it creates per-burst views using nearest-neighbor interpolation.
+        The input Dataset should have been created via to_dataset() or have
+        coordinates that are supersets of each burst's coordinates.
 
         Parameters
         ----------
         data : xr.Dataset
-            The input data to reindex for each burst.
+            The input data to split back into per-burst datasets.
 
         Returns
         -------
         Batch
             A new Batch with the same keys as self, each containing the
-            reindexed Dataset.
+            selected subset of the Dataset.
 
         Examples
         --------
-        # Create a BatchUnit weight from a single correlation raster
-        weight = BatchUnit(stack.from_dataset(corr))
-
-        # Create a BatchWrap phase from a single phase raster
-        phase = BatchWrap(stack.from_dataset(topo_phase))
+        # Round-trip: merge, process, split
+        merged = batch.to_dataset()
+        processed = some_processing(merged)
+        result = batch.from_dataset(processed)
         """
         from .Batch import Batch
 
@@ -100,22 +99,19 @@ class BatchCore(dict):
         if not isinstance(data, xr.Dataset):
             raise TypeError(f"data must be xr.Dataset, got {type(data).__name__}")
 
-        # auto-chunk if not already chunked to avoid high memory usage
-        if not data.chunks:
-            data = data.chunk('auto')
-
         out = {}
         for key, ds in dict.items(self):
-            # reindex to burst spatial coordinates using nearest-neighbor
-            # select by index for non-spatial dims (pair, date) to avoid coordinate mismatch
-            reindexed = data
+            # Select burst's spatial extent - coordinates match exactly
+            selected = data.sel(y=ds.y, x=ds.x)
+
+            # Align non-spatial dims (pair, date) if needed
             for dim in data.dims:
                 if dim not in ('y', 'x') and dim in ds.dims:
-                    # select by positional index, then assign original burst coordinate
-                    reindexed = reindexed.isel({dim: slice(0, ds.sizes[dim])})
-                    reindexed = reindexed.assign_coords({dim: ds.coords[dim]})
-            reindexed = reindexed.reindex(y=ds.y, x=ds.x, method='nearest')
-            out[key] = reindexed
+                    # Select matching size and assign burst's coordinates
+                    selected = selected.isel({dim: slice(0, ds.sizes[dim])})
+                    selected = selected.assign_coords({dim: ds.coords[dim]})
+
+            out[key] = selected
         return Batch(out)
 
     # def __repr__(self):
@@ -714,16 +710,127 @@ class BatchCore(dict):
     #         keys = [keys]
     #     return type(self)({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
 
-    def sel(self, keys: dict|list|str| pd.DataFrame):
+    def sel(self, keys: dict|list|str|pd.DataFrame|None = None, **indexers):
+        """
+        Select data by burst keys or coordinate values.
+
+        Parameters
+        ----------
+        keys : str, list, dict, DataFrame, or None
+            - str: Single burst key to select
+            - list: List of burst keys to select
+            - dict/Batch: Align dimensions between batches
+            - DataFrame: Complex filtering by dates/polarizations
+            - None: Use only keyword indexers
+        **indexers : slice or value
+            Coordinate-based selection applied to each dataset.
+            Example: x=slice(650_000, 700_000), y=slice(4_100_000, 4_150_000)
+
+        Returns
+        -------
+        Batch
+            New Batch with selected data.
+
+        Examples
+        --------
+        Select by burst keys:
+        >>> subset = batch.sel(['burst1', 'burst2'])
+
+        Select by spatial coordinates:
+        >>> subset = batch.sel(x=slice(650_000, 700_000))
+        >>> subset = batch.sel(x=slice(650_000, 700_000), y=slice(4_100_000, 4_150_000))
+
+        Combine both:
+        >>> subset = batch.sel(['burst1'], x=slice(650_000, 700_000))
+        """
         import pandas as pd
         import numpy as np
+
+        # Handle coordinate-based selection via keyword indexers
+        if indexers:
+            result = self if keys is None else self
+            # First apply key selection if provided
+            if keys is not None:
+                result = result.sel(keys)
+
+            # Convert slices to index-based selection (fast, order-agnostic)
+            def select_with_slices(ds, indexers):
+                for dim, idx in indexers.items():
+                    if dim not in ds.coords:
+                        continue
+                    if isinstance(idx, slice):
+                        coord_vals = ds.coords[dim].values
+                        # Get bounds from slice, use coord min/max as defaults
+                        start = idx.start if idx.start is not None else coord_vals.min()
+                        stop = idx.stop if idx.stop is not None else coord_vals.max()
+                        min_val, max_val = min(start, stop), max(start, stop)
+                        # Find indices within range (order-agnostic)
+                        mask = (coord_vals >= min_val) & (coord_vals <= max_val)
+                        indices = np.where(mask)[0]
+                        if len(indices) > 0:
+                            # Use isel with index slice (fast)
+                            ds = ds.isel({dim: slice(indices[0], indices[-1] + 1)})
+                        else:
+                            # No matching coordinates - return empty
+                            ds = ds.isel({dim: slice(0, 0)})
+                    else:
+                        # Non-slice indexer (exact value, list, etc.)
+                        ds = ds.sel({dim: idx})
+                return ds
+
+            # Apply coordinate selection to each dataset
+            # Bursts outside the range get NaN-filled with the target coordinates
+            out = {}
+            target_coords = {}  # Will store target y/x from first non-empty result
+
+            for k, ds in result.items():
+                selected = select_with_slices(ds, indexers)
+                if all(selected.sizes[d] > 0 for d in ('y', 'x') if d in selected.sizes):
+                    out[k] = selected
+                    # Capture target coordinates from first non-empty result
+                    if not target_coords:
+                        for dim in ('y', 'x'):
+                            if dim in selected.coords:
+                                target_coords[dim] = selected.coords[dim].values
+
+            # If no burst had data, compute target coords from slice bounds and spacing
+            if not target_coords and result:
+                sample_ds = next(iter(result.values()))
+                for dim in ('y', 'x'):
+                    if dim in indexers and isinstance(indexers[dim], slice) and dim in sample_ds.coords:
+                        coord_vals = sample_ds.coords[dim].values
+                        # Get spacing from original data
+                        spacing = abs(coord_vals[1] - coord_vals[0]) if len(coord_vals) > 1 else 1
+                        # Get bounds from slice
+                        start = indexers[dim].start if indexers[dim].start is not None else coord_vals.min()
+                        stop = indexers[dim].stop if indexers[dim].stop is not None else coord_vals.max()
+                        min_val, max_val = min(start, stop), max(start, stop)
+                        # Create target coordinates
+                        is_descending = len(coord_vals) > 1 and coord_vals[0] > coord_vals[-1]
+                        if is_descending:
+                            target_coords[dim] = np.arange(max_val, min_val - spacing/2, -spacing)
+                        else:
+                            target_coords[dim] = np.arange(min_val, max_val + spacing/2, spacing)
+
+            # Fill empty bursts with NaN using target coordinates
+            if target_coords:
+                for k, ds in result.items():
+                    if k not in out:
+                        # Reindex to target coords with NaN fill
+                        out[k] = ds.reindex(**target_coords, fill_value=np.nan)
+
+            return type(result)(out)
+
+        # Original key-based selection logic
+        if keys is None:
+            return self
 
         if not isinstance(keys, pd.DataFrame):
             if isinstance(keys, str):
                 keys = [keys]
             if isinstance(keys, list):
                 return type(self)({k: self[k] for k in keys})
-            
+
             # keys is dict-like (e.g., BatchWrap, BatchUnit)
             # Select matching burst IDs and align dimensions (like 'pair') per key
             result = {}
@@ -732,7 +839,7 @@ class BatchCore(dict):
                     continue
                 ds = self[k]
                 other_ds = keys[k]
-                
+
                 # Align 'pair' dimension if both have it (per burst key)
                 if hasattr(other_ds, 'dims') and 'pair' in getattr(other_ds, 'dims', []):
                     if hasattr(ds, 'dims') and 'pair' in ds.dims:
@@ -743,7 +850,7 @@ class BatchCore(dict):
                         if matching:
                             ds = ds.sel(pair=matching)
                         # If no matching pairs, keep ds as-is (will have 0 after filtering)
-                
+
                 result[k] = ds
             return type(self)(result)
 
@@ -1826,15 +1933,17 @@ class BatchCore(dict):
                 _vmax =  minmax
             
             # note: multi-plots ineffective for linked lazy data
-            fg = (self.wrap(da) if wrap else da)\
-                .plot.imshow(
+            # Convert coordinates to kilometers for cleaner display
+            da_plot = (self.wrap(da) if wrap else da)
+            da_plot = da_plot.assign_coords(x=da_plot.x / 1000, y=da_plot.y / 1000)
+            fg = da_plot.plot.imshow(
                 col=stackvar,
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax,
                 cmap=cmap, alpha=alpha,
                 cbar_kwargs={'label': caption or polarization},
             )
-            fg.set_axis_labels('easting [m]', 'northing [m]')
+            fg.set_axis_labels('easting [km]', 'northing [km]')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
             fg.fig.suptitle(f'{polarization} {caption or ''}'.strip(), y=y)
 
@@ -1855,14 +1964,14 @@ class BatchCore(dict):
                             ref, rep = coord_val
                             ref_str = pd.Timestamp(ref).strftime('%Y-%m-%d')
                             rep_str = pd.Timestamp(rep).strftime('%Y-%m-%d')
-                            ax.set_title(f'pair = {ref_str} {rep_str}')
+                            ax.set_title(f'pair={ref_str} {rep_str}')
                         elif hasattr(coord_val, 'strftime'):
-                            ax.set_title(f'pair = {coord_val.strftime("%Y-%m-%d")}')
+                            ax.set_title(f'pair={coord_val.strftime("%Y-%m-%d")}')
                     elif stackvar == 'date':
                         if hasattr(coord_val, 'strftime'):
-                            ax.set_title(f'date = {coord_val.strftime("%Y-%m-%d")}')
+                            ax.set_title(f'date={coord_val.strftime("%Y-%m-%d")}')
                         else:
-                            ax.set_title(f'date = {pd.Timestamp(coord_val).strftime("%Y-%m-%d")}')
+                            ax.set_title(f'date={pd.Timestamp(coord_val).strftime("%Y-%m-%d")}')
 
             return fg
 

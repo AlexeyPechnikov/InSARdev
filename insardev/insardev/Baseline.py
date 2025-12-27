@@ -265,6 +265,7 @@ class Baseline(pd.DataFrame):
         ax.set_ylabel('Number of Interferograms')
         ax.set_title(caption)
         ax.grid(True, zorder=0)
+        ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
         return ax
 

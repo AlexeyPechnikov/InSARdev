@@ -16,11 +16,11 @@ class UI:
 
         plt.rcParams['figure.figsize'] = [12, 4]
         plt.rcParams['figure.dpi'] = dpi
-        plt.rcParams['figure.titlesize'] = 24
-        plt.rcParams['axes.titlesize'] = 14
-        plt.rcParams['axes.labelsize'] = 12
-        plt.rcParams['xtick.labelsize'] = 12
-        plt.rcParams['ytick.labelsize'] = 12
+        plt.rcParams['figure.titlesize'] = 16
+        plt.rcParams['axes.titlesize'] = 10
+        plt.rcParams['axes.labelsize'] = 10
+        plt.rcParams['xtick.labelsize'] = 10
+        plt.rcParams['ytick.labelsize'] = 10
 
         if mode != 'dark':
             return

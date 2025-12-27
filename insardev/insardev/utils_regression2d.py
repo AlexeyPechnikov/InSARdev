@@ -42,6 +42,9 @@ def regression2d(data, variables, weight=None, algorithm='linear', degree=1, wra
     shape2d = data.shape[1:] if len(data.dims) == 3 else data.shape
     #print ('shape2d', shape2d)
     chunk2d = data.chunks[1:] if len(data.dims) == 3 else data.chunks
+    # Handle non-chunked data (e.g., when called inside dask.delayed)
+    if chunk2d is None:
+        chunk2d = shape2d
     #print ('chunk2d', chunk2d)
 
     def regression_block(data, weight, *args, **kwargs):
