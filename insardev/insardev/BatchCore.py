@@ -1668,6 +1668,9 @@ class BatchCore(dict):
                 blocks_total.append(blocks_row)
 
             data = da.block(blocks_total)
+            # Rechunk stack dimension to 1 (one pair/date per chunk)
+            if n_stack > 1:
+                data = data.rechunk({0: 1})
 
             result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
                 .rename(pol)\
@@ -1793,7 +1796,7 @@ class BatchCore(dict):
                 stackvar = 'fake'
                 da = self[[polarization]].to_dataset()[polarization].expand_dims({stackvar: [0]})
             else:
-                da = self[[polarization]].isel({stackvar: slice(0, rows)}).to_dataset()[polarization]
+                da = self[[polarization]].isel({stackvar: slice(0, rows*cols)}).to_dataset()[polarization]
             #print ('da', da)
             if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
                 da = da.unstack('stack')
@@ -3079,7 +3082,8 @@ class BatchCore(dict):
                         delayed_slices.append(delayed_slice)
 
                     # Concatenate along axis 0 - each slice is already (1, y, x)
-                    delayed_array = da.concatenate(delayed_slices, axis=0)
+                    # Rechunk to ensure (1, -1, -1) chunking is preserved
+                    delayed_array = da.concatenate(delayed_slices, axis=0).rechunk({0: 1, 1: -1, 2: -1})
                 else:
                     # 2D case - single delayed array
                     delayed_array = da.from_delayed(
