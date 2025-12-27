@@ -61,15 +61,71 @@ class Batch(BatchCore):
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
+    def velocity(self) -> "Batch":
+        """
+        Compute velocity (linear trend) from time series.
+
+        Calculates the slope per year for each pixel using linear regression
+        on the 'date' dimension.
+
+        Returns
+        -------
+        Batch
+            Batch with velocity (slope per year) for each pixel.
+
+        Examples
+        --------
+        >>> displacement = stack.lstsq(detrend, corr)
+        >>> velocity = displacement.velocity()
+        """
+        import numpy as np
+        import rioxarray  # for .rio accessor
+
+        nanoseconds_per_year = 365.25 * 24 * 60 * 60 * 1e9
+
+        def _velocity_da(data):
+            """Compute velocity for a single DataArray."""
+            return (nanoseconds_per_year * data.polyfit('date', 1)
+                    .polyfit_coefficients.sel(degree=1)
+                    .astype(np.float32).rename('velocity'))
+
+        # Get CRS from input batch
+        crs = self.crs
+
+        results = {}
+        for key, ds in self.items():
+            result_vars = {}
+            for var in [v for v in ds.data_vars if v != 'spatial_ref']:
+                da = ds[var]
+                result_vars[var] = _velocity_da(da)
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = ds.attrs
+            # Preserve CRS
+            if crs is not None:
+                result_ds = result_ds.rio.write_crs(crs)
+            results[key] = result_ds
+
+        return Batch(results)
+
     def incidence(self) -> "Batch":
         """Compute incidence angle from look vector components."""
+        import rioxarray  # for .rio accessor
+
+        # Get CRS from input batch
+        crs = self.crs
+
         out: dict[str, xr.Dataset] = {}
         for key, tfm in self.items():
             look_E = tfm["look_E"]
             look_N = tfm["look_N"]
             look_U = tfm["look_U"]
             incidence = xr.ufuncs.atan2(xr.ufuncs.sqrt(look_E ** 2 + look_N ** 2), look_U) * xr.ufuncs.sign(look_E).astype("float32")
-            out[key] = xr.Dataset({"incidence": incidence})
+            result_ds = xr.Dataset({"incidence": incidence})
+            result_ds.attrs = tfm.attrs
+            # Preserve CRS
+            if crs is not None:
+                result_ds = result_ds.rio.write_crs(crs)
+            out[key] = result_ds
         return Batch(out)
 
 class BatchWrap(BatchCore):
