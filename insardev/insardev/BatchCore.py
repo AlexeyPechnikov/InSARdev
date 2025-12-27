@@ -2061,17 +2061,17 @@ class BatchCore(dict):
         n_pairs = sample_da.sizes.get('pair', 1)
         has_pair_dim = 'pair' in sample_da.dims
 
-        # Extract pathNumber and subswath attributes for each burst (required for stats)
+        # Extract pathNumber and subswath from burst ID (format: "123_262883_IW2")
         burst_subswath = {}
         burst_track = {}  # pathNumber + subswath for detailed debug output
         for bid in ids:
-            ds = self[bid]
-            if 'subswath' not in ds.attrs:
-                raise ValueError(f"Burst '{bid}' missing required 'subswath' attribute")
-            if 'pathNumber' not in ds.attrs:
-                raise ValueError(f"Burst '{bid}' missing required 'pathNumber' attribute")
-            burst_subswath[bid] = ds.attrs['subswath']
-            burst_track[bid] = f"{ds.attrs['pathNumber']}{ds.attrs['subswath']}"
+            parts = bid.split('_')
+            if len(parts) < 3:
+                raise ValueError(f"Burst '{bid}' has invalid format, expected 'pathNumber_burstNumber_subswath'")
+            path_num = parts[0]
+            subswath = parts[2]
+            burst_subswath[bid] = subswath
+            burst_track[bid] = f"{path_num}{subswath}"
 
         extents = {}
         for bid in ids:
@@ -2335,20 +2335,18 @@ class BatchCore(dict):
         if debug:
             print(f'fit(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s), pol={polarization}', flush=True)
 
-        # Extract pathNumber and subswath attributes for each burst (required for degree=1)
+        # Extract pathNumber and subswath from burst ID (format: "123_262883_IW2")
         # Used to skip same-path different-subswath overlaps (small x-extent, diagonal connection)
         # but allow cross-path overlaps which can have large x-extent with significant iono ramps
         burst_path = {}  # pathNumber (e.g., '33')
         burst_subswath = {}  # subswath (e.g., 'IW3')
         for bid in ids:
-            ds = self[bid]
             if degree == 1:
-                if 'subswath' not in ds.attrs:
-                    raise ValueError(f"Burst '{bid}' missing required 'subswath' attribute for ramp estimation")
-                if 'pathNumber' not in ds.attrs:
-                    raise ValueError(f"Burst '{bid}' missing required 'pathNumber' attribute for ramp estimation")
-                burst_path[bid] = ds.attrs['pathNumber']
-                burst_subswath[bid] = ds.attrs['subswath']
+                parts = bid.split('_')
+                if len(parts) < 3:
+                    raise ValueError(f"Burst '{bid}' has invalid format, expected 'pathNumber_burstNumber_subswath'")
+                burst_path[bid] = parts[0]
+                burst_subswath[bid] = parts[2]
 
         extents = {}
         x_centers = {}
