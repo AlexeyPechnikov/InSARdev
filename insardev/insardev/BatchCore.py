@@ -1799,25 +1799,58 @@ class BatchCore(dict):
             progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
         return output
 
-    def to_geojson(self) -> dict:
+    def to_geojson(self, filename: str = None, crs: str = None, decimals: int = 3) -> str:
         """
         Convert batch data to GeoJSON with pixel rectangles.
 
         Creates a GeoJSON FeatureCollection where each pixel is represented
         as a polygon rectangle. All data variables (VV, VH, etc.) are preserved
-        as properties in each feature.
+        as properties in each feature. Coordinates are rounded to 6 digits.
+
+        Parameters
+        ----------
+        filename : str, optional
+            Path to save the GeoJSON file. If None (default), returns the
+            GeoJSON string.
+        crs : str, optional
+            Target CRS (e.g., 'EPSG:4326'). If None (default), uses the data's
+            original CRS.
+        decimals : int, optional
+            Number of decimal places for rounding values. Default is 3.
 
         Returns
         -------
-        dict
-            GeoJSON dictionary with FeatureCollection containing polygon features.
-            Each feature has properties: lat, lon, and all data variables.
+        str or None
+            GeoJSON string if filename is None, otherwise None (saves to file).
 
         Examples
         --------
-        >>> geojson = velocity.to_geojson()
-        >>> with open('velocity.geojson', 'w') as f:
-        ...     json.dump(geojson, f)
+        Save to file in WGS84:
+
+        >>> velocity.to_geojson('velocity.geojson', crs='EPSG:4326')
+
+        Save in original CRS:
+
+        >>> velocity.to_geojson('velocity.geojson')
+
+        Read from file:
+
+        >>> import geopandas as gpd
+        >>> gdf = gpd.read_file('velocity.geojson')
+
+        Or get as string:
+
+        >>> geojson_str = velocity.to_geojson()
+
+        Or create GeoDataFrame from string:
+
+        >>> import geopandas as gpd
+        >>> gdf = gpd.read_file(velocity.to_geojson(), driver='GeoJSON')
+
+        Or parse to dict:
+
+        >>> import json
+        >>> geojson = json.loads(velocity.to_geojson())
         """
         import geopandas as gpd
         import shapely.geometry
@@ -1832,7 +1865,7 @@ class BatchCore(dict):
         df = ds.to_dataframe().dropna().reset_index()
 
         if df.empty:
-            return {"type": "FeatureCollection", "features": []}
+            return None
 
         # Get pixel spacing
         dy, dx = self.spacing
@@ -1853,34 +1886,27 @@ class BatchCore(dict):
             crs=self.crs
         )
 
-        # Reproject to WGS84
-        gdf = gdf.to_crs('EPSG:4326')
-        gdf['lon'] = gdf.geometry.centroid.x
-        gdf['lat'] = gdf.geometry.centroid.y
+        # Drop projected x, y columns and ensure column names are plain strings
+        gdf = gdf.drop(columns=['x', 'y'])
+        gdf.columns = [str(c) for c in gdf.columns]
 
-        # Convert to GeoJSON dict
-        geojson_dict = {
-            "type": "FeatureCollection",
-            "features": []
-        }
+        # Reproject if CRS specified, round values to 3 digits and coordinates to 6 digits
+        if crs is not None:
+            gdf = gdf.to_crs(crs)
+        for col in data_vars:
+            gdf[col] = gdf[col].astype(float).round(decimals)
+        gdf.geometry = shapely.set_precision(gdf.geometry, grid_size=1e-6)
 
-        for _, row in gdf.iterrows():
-            properties = {
-                "lat": float(row['lat']),
-                "lon": float(row['lon'])
-            }
-            # Add all data variables
-            for var in data_vars:
-                properties[var] = float(row[var])
+        # Add CRS for GIS software compatibility
+        crs_urn = gdf.crs.to_string().replace(':', '::')
+        crs_str = f'"crs": {{"type": "name", "properties": {{"name": "urn:ogc:def:crs:{crs_urn}"}}}}, '
+        geojson = gdf.to_json(drop_id=True).replace('"type": "FeatureCollection", ', '"type": "FeatureCollection", ' + crs_str)
 
-            feature = {
-                "type": "Feature",
-                "geometry": shapely.geometry.mapping(row['geometry']),
-                "properties": properties
-            }
-            geojson_dict["features"].append(feature)
-
-        return geojson_dict
+        if filename is not None:
+            with open(filename, 'w') as f:
+                f.write(geojson)
+            return
+        return geojson
 
     def to_vtk(self, path: str, mask: bool = True):
         """
