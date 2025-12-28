@@ -76,6 +76,11 @@ class Stack_phasediff(Stack_base):
             )
 
         pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
+        # Check for duplicate pairs
+        unique, counts = np.unique(pairs, axis=0, return_counts=True)
+        if (counts > 1).any():
+            duplicates = unique[counts > 1]
+            raise ValueError(f'Input pairs contain duplicates: {duplicates.tolist()}')
         ref_dates = pairs[:,0]
         rep_dates = pairs[:,1]
 
