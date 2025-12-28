@@ -646,14 +646,12 @@ class Stack(Stack_plot, BatchCore):
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
 
         def burst_preprocess(ds, attr_start:str='BPR', debug:bool=False):
-            import xarray as xr
-            import numpy as np
             #print ('ds_preprocess', ds)
             # TOPS parameters that must be per-date data variables for differential phase computation
             tops_attrs = ['azimuthSteeringRate', 'azimuthFmRatePolynomial', 'azimuthFmRateT0',
                          'azimuthFmRateAzimuthTime', 'dcPolynomial', 'dcT0', 'dcAzimuthTime']
             process_attr = True if debug else False
-            for key in ds.attrs:
+            for key in list(ds.attrs.keys()):
                 if key==attr_start:
                     process_attr = True
                 # Include TOPS parameters AND attributes from attr_start onwards
@@ -692,8 +690,6 @@ class Stack(Stack_plot, BatchCore):
             )
 
         def _bursts_transform_preprocess(bursts, transform):
-            import xarray as xr
-            import numpy as np
             #print ('_bursts_transform_preprocess')
             
             # in case of multiple polarizations, merge them into a single dataset
@@ -726,8 +722,6 @@ class Stack(Stack_plot, BatchCore):
             Combine bursts and transform into a single dataset.
             Only reference burst for every polarization has attributes (see burst_preprocess)
             """
-            import xarray as xr
-            import numpy as np
             #print ('bursts_transform_preprocess')
 
             polarizations = np.unique([ds.polarization for ds in dss])
@@ -794,7 +788,7 @@ class Stack(Stack_plot, BatchCore):
             grp = root[group]
             # get all subgroups (bursts) except transform
             grp_bursts = [grp[k] for k in grp.keys() if k!='transform']
-            dss = [xr.open_zarr(grp.store, group=grp.path, consolidated=True, zarr_format=3) for grp in grp_bursts]
+            dss = [xr.open_zarr(_grp.store, group=_grp.path, consolidated=True, zarr_format=3) for _grp in grp_bursts]
             dss = [burst_preprocess(ds) for ds in dss]
             # get transform subgroup
             grp_transform = grp['transform']
@@ -813,7 +807,6 @@ class Stack(Stack_plot, BatchCore):
                     (joblib.delayed(store_open_group)(root, group) for group in list(root.group_keys()))
             # list of key - dataset converted to dict and appended to the existing dict
             self.update(dss)
-            return self
         # elif isinstance(urls, FsspecStore):
         #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
         #     dss = []
@@ -867,6 +860,15 @@ class Stack(Stack_plot, BatchCore):
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
 
+        # Check for duplicate dates in each burst
+        for key, ds in self.items():
+            dates = ds.date.values
+            unique, counts = np.unique(dates, return_counts=True)
+            if (counts > 1).any():
+                duplicates = unique[counts > 1]
+                raise ValueError(f'Burst {key} contains duplicate dates: {duplicates}. '
+                                 'This may be caused by corrupted data or library issues. '
+                                 'Try restarting the runtime and reloading the data.')
         return self
 
     def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
