@@ -1108,7 +1108,7 @@ class Stack(Stack_plot, BatchCore):
         import xarray as xr
         return self._displacement_component(phase, transform, func=xr.ufuncs.sin, suffix='eastwest')
 
-    def align_tops(self, debug: bool = False) -> "Stack":
+    def align_elevation(self, debug: bool = False) -> "Stack":
         """Apply elevation correction for TOPS burst processing.
 
         Corrects for satellite height variation along track when processing
