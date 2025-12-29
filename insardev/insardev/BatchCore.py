@@ -1990,6 +1990,7 @@ class BatchCore(dict):
         import numpy as np
         import pandas as pd
         import matplotlib.ticker as mticker
+        from matplotlib.ticker import FuncFormatter
         import matplotlib.pyplot as plt
         from .Batch import BatchWrap
         from insardev_toolkit import progressbar
@@ -2044,7 +2045,6 @@ class BatchCore(dict):
             # note: multi-plots ineffective for linked lazy data
             # Convert coordinates to kilometers for cleaner display
             da_plot = (self.wrap(da) if wrap else da)
-            da_plot = da_plot.assign_coords(x=da_plot.x / 1000, y=da_plot.y / 1000)
             fg = da_plot.plot.imshow(
                 col=stackvar,
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
@@ -2058,9 +2058,10 @@ class BatchCore(dict):
 
             # fg is the FacetGrid returned by xarray.plot.imshow
             for idx, ax in enumerate(fg.axes.flatten()):
-                # disable the offset text (like "1e6")
-                # force plain formatting (no scientific notation) on the y‐axis
-                ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+                # format tick labels in km
+                km_formatter = FuncFormatter(lambda v, _: f'{v/1000:.0f}')
+                ax.xaxis.set_major_formatter(km_formatter)
+                ax.yaxis.set_major_formatter(km_formatter)
                 if stackvar == 'fake':
                     # remove 'fake = 0' title
                     ax.set_title('')
