@@ -2168,7 +2168,6 @@ def _subtract_date_from_pair(first, second):
     # dim0 chunks (63,63,...,31) while first has merged (1165,) chunks.
     # Without this, the multiply triggers an implicit rechunk of first
     # that re-reads the full upstream graph 19× per spatial tile.
-    key0 = list(first.keys())[0]
     ref_var = next(v for v in first[key0].data_vars if first[key0][v].ndim >= 3)
     ref_chunks = first[key0][ref_var].data.chunks
     for batch in (screen_ref, screen_rep):
