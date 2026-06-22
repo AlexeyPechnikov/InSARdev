@@ -960,8 +960,9 @@ class S1_transform(S1_align):
             del topo, transform, prm_cache
             self.consolidate_metadata(target, record_id=all_dates[-1][-1])
 
-        # Get reference and repeat bursts as groups
-        refrep_dict = self.get_repref(ref=ref)
+        # Get reference and repeat bursts as groups (forward the records subset so records= actually
+        # windows the processed scenes; previously records was accepted but dropped here -> full archive)
+        refrep_dict = self.get_repref(ref=ref, records=records)
         refreps = [v for v in refrep_dict.values()]
 
         # Default n_jobs to cpu_count()
