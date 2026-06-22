@@ -1770,11 +1770,15 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
     # Alpha should vary smoothly along the scene (< 5° variation is reasonable for ~2.5s burst)
     # Exception: when baseline is nearly vertical (|alpha| near 90°), small bh changes can flip sign
     def alpha_variation(a1, a2):
-        """Compute alpha variation, handling ±90° wraparound for vertical baselines."""
+        """Compute alpha variation, handling the ±180° angle wraparound and the
+        ±90° vertical-baseline sign flip."""
         diff = abs(a1 - a2)
+        # alpha is a circular angle in (-180°, 180°]: e.g. 179.99° and -180.00° are
+        # 0.01° apart, not 359.99°. Take the shorter arc before any further checks.
+        if diff > 180:
+            diff = 360 - diff
         # For nearly vertical baselines, +90° and -90° are effectively the same
-        # (both mean bh≈0, just different sign). Check wrapped difference.
-        # If both alphas are near ±90° and diff is large, it's a vertical baseline flip
+        # (both mean bh≈0, just different sign): a 180° gap is a benign vertical flip.
         near_vertical = (abs(abs(a1) - 90) < 15) and (abs(abs(a2) - 90) < 15)
         if near_vertical and diff > 90:
             diff = 180 - diff  # Wrapped difference for vertical baseline flip
