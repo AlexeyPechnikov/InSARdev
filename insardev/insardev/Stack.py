@@ -181,19 +181,25 @@ class Stack(Stack_plot, BatchCore):
         """Compute incidence angle for each burst via linear polynomial fit."""
         return self.transform().incidence()
 
-    def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Stack":
+    def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5,
+                  window: tuple = None, device: str = 'auto') -> "Stack":
         """
-        Polarimetric amplitude optimization with original co-pol phase.
+        Polarimetric optimization of amplitude and phase for dual-pol data.
 
         NOTE: Requires insardev_polsar extension.
 
-        Finds optimal VV/VH combination that minimizes ADI, then returns
-        a Stack with optimized amplitude and original VV phase:
+        AMPLITUDE: the VV/VH combination minimizing ADI over the stack.
+        PHASE:     the VV/VH combination maximizing coherence over the chain of
+                   consecutive acquisitions (each date with the previous and next).
+                   Needs no temporal parameter: the chain follows the real dates,
+                   so gaps and uneven sampling are covered by construction.
+                   window=None skips it and keeps the original co-pol phase,
+                   the previous behaviour.
 
-            S_opt(t) = |cos(ψ)·VV(t) + sin(ψ)·exp(iφ)·VH(t)| · exp(i·arg(VV(t)))
-
-        Preserves the original VV phase so standard interferometric processing
-        works directly on the result.
+        Both mechanisms are one per pixel, shared across dates (Equal Scattering
+        Mechanism), so every interferogram is a difference of per-date phases and
+        triplet closure is exactly zero — unlike per-pair optimization
+        (interferogram2), which does not close.
 
         Parameters
         ----------
@@ -201,6 +207,10 @@ class Stack(Stack_plot, BatchCore):
             Coarse grid step in degrees. Default 15°.
         angle_fine : float
             Fine grid step in degrees. Default 5°.
+        window : tuple of int or None
+            Spatial window (azimuth, range) for the coherence estimate used by the
+            phase search. None (default) skips it and keeps the original co-pol
+            phase — unchanged behaviour. Pass e.g. (3, 12) to optimize the phase.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
@@ -243,7 +253,9 @@ class Stack(Stack_plot, BatchCore):
         batch_complex = self[pols]
 
         # Call internal optimize2 implementation
-        s_opt_batch = _optimize2_impl(batch_complex, angle_coarse, angle_fine, device)
+        s_opt_batch = _optimize2_impl(batch_complex, angle_coarse=angle_coarse,
+                                      angle_fine=angle_fine, window=window,
+                                      device=device)
 
         # Merge S_opt back into original stack structure (preserves BPR, etc.)
         output_pol = pols[0]  # VV or HH
