@@ -198,8 +198,9 @@ class Stack_unwrap1d(BatchCore):
             Use ``phase.unwrap1d(weight=corr)`` on BatchWrap instead.
             This Stack method will be removed in a future version.
 
-        Uses triplet phase closure pre-filtering to identify consistent pairs,
-        then IRLS unwrapping on selected pairs. Rejected pairs are set to NaN.
+        Integer-aware IRLS unwrapping on the per-pixel pair network, followed by a
+        triplet closure check: pixels whose per-pair integer ambiguities do not
+        close are NaN-filled, since their unwrapping is provably wrong.
 
         Parameters
         ----------
