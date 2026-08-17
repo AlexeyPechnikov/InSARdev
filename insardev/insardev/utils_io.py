@@ -442,11 +442,25 @@ def open(store: str, storage_options: dict[str, str] | None = None,
 
     root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
     from .Batch import Batch, BatchComplex, BatchUnit, BatchWrap
+    from .Stack import Stack
     _class_map = {
         'Batch': Batch, 'BatchComplex': BatchComplex,
         'BatchUnit': BatchUnit, 'BatchWrap': BatchWrap,
+        'Stack': Stack,
     }
-    classes = [_class_map.get(c.rsplit('.', 1)[-1], Batch) for c in root.attrs.get('__class__')]
+
+    def _resolve(name):
+        # Never default silently: an unknown name falling back to Batch
+        # downgrades a stored Stack and only surfaces at the next method call.
+        cls = _class_map.get(name.rsplit('.', 1)[-1])
+        if cls is None:
+            raise TypeError(
+                f"Unknown stored class {name!r} in {store!r}. "
+                f"Known: {sorted(_class_map)}."
+            )
+        return cls
+
+    classes = [_resolve(c) for c in root.attrs.get('__class__')]
     interleave = len(classes) > 1
     groups = list(root.group_keys())
 
