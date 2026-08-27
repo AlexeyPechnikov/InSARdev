@@ -9,6 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from __future__ import annotations
+from .utils_torch import serialize_gpu
 from . import utils_io,  utils_xarray
 import operator
 import numpy as np
@@ -258,6 +259,7 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
                           device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
 
 
+@serialize_gpu
 def _neighbors_kernel_2d_for_dask(data_chunk, window_y, window_x, half_y, half_x, device):
     """Count valid neighbors for 2D data.
 
@@ -355,8 +357,14 @@ class BatchCore(dict):
         """
         Check if batch data is lazy (dask arrays).
 
-        Returns True if all data variables are dask arrays (lazy/deferred computation).
-        Returns False if data has been computed to numpy arrays.
+        Only GRIDDED variables count -- those carrying y and x. chunk1d() and
+        chunk2d() rechunk exactly those and leave per-date metadata (BPR,
+        startTime, fullBurstID, ...) alone, so requiring the metadata to be
+        dask too would make the check unsatisfiable however the user chunks.
+        Every operation that asks for lazy data works on the gridded arrays.
+
+        Returns True if all gridded variables are dask arrays (lazy/deferred
+        computation). Returns False if any has been computed to numpy.
 
         Returns
         -------
@@ -373,6 +381,8 @@ class BatchCore(dict):
 
         for key, ds in self.items():
             for var in ds.data_vars:
+                if 'y' not in ds[var].dims or 'x' not in ds[var].dims:
+                    continue
                 if not isinstance(ds[var].data, da.Array):
                     return False
             break  # Only check first burst
@@ -396,14 +406,20 @@ class BatchCore(dict):
             If data is not a dask array (e.g., numpy array from .compute(load=True)).
         """
         if not batch.is_lazy:
-            # Get type name for error message
+            # name the OFFENDING variable: reporting the first one prints the
+            # type of a perfectly lazy array and hides which is materialised
+            import dask.array as da
+            offenders = []
             for key, ds in batch.items():
                 for var in ds.data_vars:
-                    data_type = type(ds[var].data).__name__
-                    break
+                    if 'y' not in ds[var].dims or 'x' not in ds[var].dims:
+                        continue
+                    if not isinstance(ds[var].data, da.Array):
+                        offenders.append(f"{var} ({type(ds[var].data).__name__})")
                 break
             raise TypeError(
-                f"{func_name}() requires lazy (dask) data, got {data_type}. "
+                f"{func_name}() requires lazy (dask) data; these gridded "
+                f"variables are materialised: {', '.join(offenders) or 'unknown'}. "
                 f"Use .chunk('auto') to convert to dask arrays before calling {func_name}()."
             )
 
@@ -485,6 +501,40 @@ class BatchCore(dict):
                         rechunked_vars[var_name] = arr.chunk(chunks)
             if rechunked_vars:
                 selected = selected.assign(rechunked_vars)
+
+            # RESTORE THE PER-BURST METADATA FROM SELF. to_dataset() merges the
+            # bursts into ONE raster, and only the grids can survive that: the
+            # 1D geometry is per burst and per date, so a merged raster has
+            # nowhere to put it. This Batch still holds it, and the split back
+            # is where it belongs -- nothing else in the round trip knows both
+            # halves.
+            #
+            # Without this an unwrapped phase comes back carrying no
+            # radar_wavelength, near_range, earth_radius, SC_height_start,
+            # rng_samp_rate or BPR, and nothing notices until a fit asks for
+            # them: `KeyError: radar_wavelength` out of fit1d(), several cells
+            # after the step that actually dropped it.
+            #
+            # Only what the merged Dataset did NOT bring back is restored, so
+            # anything the processing computed keeps precedence over the
+            # original, and only where the dims still line up.
+            carry = {v: ds[v] for v in ds.data_vars
+                     if v not in selected.data_vars
+                     and not ('y' in ds[v].dims and 'x' in ds[v].dims)
+                     and all(d in selected.sizes
+                             and selected.sizes[d] == ds.sizes[d]
+                             for d in ds[v].dims)}
+            if carry:
+                selected = selected.assign(carry)
+            carry_coords = {c: ds.coords[c] for c in ds.coords
+                            if c not in selected.coords
+                            and all(d in selected.sizes
+                                    and selected.sizes[d] == ds.sizes[d]
+                                    for d in ds.coords[c].dims)}
+            if carry_coords:
+                selected = selected.assign_coords(carry_coords)
+            for a_, v_ in ds.attrs.items():
+                selected.attrs.setdefault(a_, v_)
             out[key] = selected
         return Batch(out)
 
@@ -700,21 +750,101 @@ class BatchCore(dict):
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    @staticmethod
+    def _binary_vars(ds, other, op):
+        """Apply `op` to the DATA variables, carrying metadata through.
+
+        A Batch keeps per-date metadata beside the grids -- burst ids, orbit
+        polynomials, strings -- and numpy raises TypeError on subtracting two
+        <U43 arrays, so whole-Dataset arithmetic cannot simply be handed the
+        Dataset.
+
+        THE DISTINCTION IS DTYPE, NOT DIMENSIONALITY. An earlier attempt at
+        this restricted the operation to variables carrying both `y` and `x`,
+        which made every non-gridded quantity a silent pass-through of the LEFT
+        operand: `data2[['BPR']] - data1[['BPR']]` in `pairs()` returned data2's
+        own BPR rather than the difference, so the perpendicular baseline came
+        back as 0 for every pair and every height downstream as -inf or NaN. A
+        numeric variable is data whatever its dims; a string is metadata
+        whatever its dims.
+
+        Splitting on dtype also lets xarray perform the arithmetic itself, so
+        alignment, broadcasting and the treatment of variables missing from one
+        side keep exactly the meanings they had before `_binary_vars`.
+        """
+        import xarray as _xr
+        # WHICH NUMERIC VARIABLES ARE *DATA*. Two rules have been tried here and
+        # both were wrong on their own:
+        #   gridded-only   -- made every non-gridded quantity a pass-through of
+        #                     the LEFT operand, so `data2[['BPR']] -
+        #                     data1[['BPR']]` in pairs() returned data2's BPR and
+        #                     every perpendicular baseline came back 0.
+        #   dtype-only     -- applies the op to the radar metadata as well, so
+        #                     `ref * rep.conj()` returned radar_wavelength
+        #                     SQUARED (0.0555 -> 0.003077). meter2rad then came
+        #                     out 4084.7 instead of 226.4, max_dv=100 mm/yr
+        #                     mapped to +-408 rad/yr, and velocity() returned a
+        #                     flat histogram of pure lattice noise.
+        # A Dataset's DATA is its gridded variables WHEN IT HAS ANY; the rest is
+        # metadata riding along and is carried from the left operand. A Dataset
+        # with no grids at all -- `data2[['BPR']]` -- is nothing but the quantity
+        # the caller selected, so there the op applies to all of it.
+        # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
+        # Everything shaped (..., y, x) is data; everything else is metadata
+        # riding along, and is carried from the LEFT operand unchanged.
+        #
+        # Applying arithmetic by DTYPE instead returned radar_wavelength SQUARED
+        # from `ref * rep.conj()` (0.0555 -> 0.003077). meter2rad then came out
+        # 4084.7 rather than 226.4, max_dv=100 mm/yr mapped to +-408 rad/yr, and
+        # velocity() produced a flat histogram of pure lattice noise.
+        #
+        # A caller who wants arithmetic on a non-gridded quantity uses a
+        # DataArray, where it is unambiguous -- see pairs(), which differences
+        # BPR as `data2[k]['BPR'] - data1[k]['BPR']`.
+        num = [v for v in ds.data_vars
+               if ds[v].dtype.kind in 'biufc'
+               and 'y' in ds[v].dims and 'x' in ds[v].dims]
+        rest = [v for v in ds.data_vars if v not in num]
+        if isinstance(other, _xr.Dataset):
+            onum = [v for v in other.data_vars
+                    if other[v].dtype.kind in 'biufc']
+            rhs = other[onum]
+            gridded = [v for v in onum
+                       if 'y' in other[v].dims and 'x' in other[v].dims]
+            if len(onum) == 1 and len(gridded) == 1 and onum[0] not in num:
+                # a lone gridded field applies to every polarisation, which is
+                # how a mask or a per-pixel weight is used
+                rhs = other[onum[0]]
+        else:
+            rhs = other
+        res = op(ds[num], rhs)
+        for v in rest:
+            res[v] = ds[v]
+        res.attrs = ds.attrs
+        return res
+
     def __add__(self, other):
-        # scalar + batch → map scalar + each dataset
+        # scalar + batch. Routed through _binary_vars like the Dataset case:
+        # a bare `v + other` hits the string metadata and raises UFuncTypeError
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: v + other for k, v in self.items()})
+            import operator as _operator
+            return type(self)({k: BatchCore._binary_vars(v, other, _operator.add)
+                               for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
+        import operator as _operator
+        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.add)
+                              if k in other else self[k]) for k in keys})
 
     def __radd__(self, other):
         # scalar + batch → same as batch + scalar
         return self.__add__(other)
 
     def __sub__(self, other):
-        # scalar - batch → map scalar - each dataset
+        # batch - scalar
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: v - other for k, v in self.items()})
+            import operator as _operator
+            return type(self)({k: BatchCore._binary_vars(v, other, _operator.sub)
+                               for k, v in self.items()})
         keys = self.keys()
         result = {}
         for k in keys:
@@ -758,37 +888,50 @@ class BatchCore(dict):
                             new_ds[var] = ds[var] - val
                     result[k] = new_ds
                 else:
-                    result[k] = ds - val
+                    import operator as _operator
+                    result[k] = BatchCore._binary_vars(ds, val, _operator.sub)
         return type(self)(result)
 
     def __rsub__(self, other):
-        # scalar - batch
+        # scalar - batch: the operand order is flipped, the metadata rule is not
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: other - v for k, v in self.items()})
+            return type(self)({k: BatchCore._binary_vars(v, other, lambda a, b: b - a)
+                               for k, v in self.items()})
         return NotImplemented
 
     def __mul__(self, other):
-        # scalar * batch → map scalar * each dataset
+        # batch * scalar
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: v * other for k, v in self.items()})
+            import operator as _operator
+            return type(self)({k: BatchCore._binary_vars(v, other, _operator.mul)
+                               for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: (self[k] * other[k] if k in other else self[k]) for k in keys})
+        import operator as _operator
+        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.mul)
+                              if k in other else self[k]) for k in keys})
 
     def __rmul__(self, other):
-        # scalar * batch  → map scalar * each dataset
-        return type(self)({k: other * v for k, v in self.items()})
+        # scalar * batch
+        import operator as _operator
+        return type(self)({k: BatchCore._binary_vars(v, other, _operator.mul)
+                           for k, v in self.items()})
 
     def __truediv__(self, other):
-        # batch / scalar → map each dataset / scalar
+        # batch / scalar
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: v / other for k, v in self.items()})
+            import operator as _operator
+            return type(self)({k: BatchCore._binary_vars(v, other, _operator.truediv)
+                               for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: (self[k] / other[k] if k in other else self[k]) for k in keys})
+        import operator as _operator
+        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.truediv)
+                              if k in other else self[k]) for k in keys})
 
     def __rtruediv__(self, other):
-        # scalar / batch
+        # scalar / batch: flipped operands, same metadata rule
         if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: other / v for k, v in self.items()})
+            return type(self)({k: BatchCore._binary_vars(v, other, lambda a, b: b / a)
+                               for k, v in self.items()})
         return NotImplemented
 
     def __neg__(self):
@@ -1047,7 +1190,19 @@ class BatchCore(dict):
 
                 mask_da = mask_da.reindex_like(ref_da, method='nearest')
 
-                out[k] = ds.where(mask_da, other, **kwargs)
+                if isinstance(ds, xr.Dataset):
+                    # Mask ONLY spatial variables. Dataset.where broadcasts the
+                    # (y, x) mask into EVERY variable, silently inflating
+                    # non-spatial ones -- e.g. BPR (date,) becomes a
+                    # (date, y, x) NaN cube, which then breaks pairs() when it
+                    # assigns BPR as a per-pair coordinate.
+                    new_ds = ds.copy()
+                    for var in ds.data_vars:
+                        if 'y' in ds[var].dims and 'x' in ds[var].dims:
+                            new_ds[var] = ds[var].where(mask_da, other, **kwargs)
+                    out[k] = new_ds
+                else:
+                    out[k] = ds.where(mask_da, other, **kwargs)
             return type(self)(out)
 
         # fallback: single scalar or DataArray broadcast
@@ -1655,6 +1810,148 @@ class BatchCore(dict):
 
         if is_complex:
             return BatchComplex(result)
+        return Batch(result)
+
+    @staticmethod
+    def _resolve_stride_static(stride, win_y, win_x):
+        if stride is None:
+            return max(1, win_y // 2), max(1, win_x // 2)
+        if isinstance(stride, (tuple, list)):
+            return max(1, int(stride[0])), max(1, int(stride[1]))
+        return max(1, int(stride)), max(1, int(stride))
+
+
+    def unwrap3d(self, duration: float = 90.0, max_iter: int = 40,
+                 search: int = 2, short_days: float = 40.0,
+                 n_short: int = 6, min_disagree: int = 2,
+                 min_dates: int = 3, n_trend: int = 3) -> 'Batch':
+        """
+        Unwrapped per-date phase DIRECTLY from the complex scenes.
+
+        Replaces pairs() -> interferogram() -> unwrap2d() -> lstsq(). Single-look
+        pair phase is exactly phi_ref - phi_rep, so the pair ambiguities are not
+        free: k_ij = n_i - n_j. The network has one unknown integer per DATE
+        instead of one per pair, every triplet closes by construction, and the
+        dates are the unknowns, so no network inversion follows.
+
+        Requires closure-exact input -- single-look scenes carrying per-date
+        corrections only.
+        Any per-PAIR correction upstream (e.g. detrend2d) breaks closure and
+        makes the per-date form invalid.
+
+        Dates that cannot be reconciled with their neighbours are dropped to
+        NaN and bridged with the longer interval to the next good date, so one
+        bad acquisition does not corrupt everything after it.
+
+        Rates outside the range the sampling can represent, +-lambda/(4 dt_min)
+        taken over each pixel's surviving dates, come back as NaN rather than
+        as a folded value: wrapped phase pins the rate only modulo 2*pi/dt_min
+        and the siblings fit the observations exactly, so a solution is only
+        knowable when its siblings are outside what the acquisition plan can
+        express. No user prior is involved -- dt_min decides it.
+
+        Parameters
+        ----------
+        duration : float
+            Temporal baseline of the date pairs used as smoothness
+            constraints. Default 90.
+        max_iter : int
+            Coordinate-descent sweeps over the integers. Default 40.
+        search : int
+            Integer offsets tried per date per sweep, +-search. Default 2.
+        short_days, n_short, min_disagree :
+            The recoverability test. Each of the up-to-n_short partners within
+            short_days predicts the date's integer from its wrapped
+            difference, which is right whenever the motion over that interval
+            stays inside a half cycle; the date is dropped when at least
+            min_disagree of them dissent from the majority. This assumes
+            nothing about the shape of the trajectory, unlike a smoothness or
+            curvature test, so an accelerating site is not read as defective.
+            Widening short_days admits intervals where real motion can exceed
+            a half cycle and drops more.
+        min_dates : int
+            Floor on surviving dates per pixel (default 3). Closure is
+            structural here, so a resolved triplet is usable; there is no
+            sample-size argument for a larger floor. Dropping stops at this
+            floor, and since at most one date goes per pass it also bounds the
+            work -- there is no separate max_drop to contradict it.
+        n_trend : int
+            Trend refinement passes (default 3). The rate is seeded from the
+            shortest available intervals -- long gaps are excluded because a
+            wrapped increment over dt only resolves rates below
+            lambda/(4 dt), so a 120-day winter gap aliases anything above
+            42 mm/yr while a 12-day one holds to 422 -- then re-fit over the
+            whole unwrapped span and re-solved. Without this the smoothness
+            objective drags fast pixels toward zero: a synthetic -150 mm/yr
+            site was recovered as +19.
+
+        Returns
+        -------
+        Batch
+            Unwrapped per-date phase in radians; use displacement_los().
+
+        Examples
+        --------
+        >>> disp = (stack.chunk1d('0.5GB').fit3d()
+        ...              .unwrap3d()
+        ...              .displacement_los(stack.transform()))
+        """
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        from .Batch import Batch
+        from . import utils_unwrap3d
+
+        BatchCore._require_lazy(self, 'unwrap3d')
+
+        result = {}
+        for key in self.keys():
+            ds = self[key]
+            for v in ds.data_vars:
+                if 'pair' in ds[v].dims:
+                    raise TypeError(
+                        'unwrap3d() operates on the per-DATE stack, not on '
+                        'per-pair data. It replaces the per-pair unwrap + lstsq route.')
+            pols = [v for v in ds.data_vars
+                    if ds[v].dtype.kind == 'c' and 'date' in ds[v].dims
+                    and 'y' in ds[v].dims and 'x' in ds[v].dims]
+            if not pols:
+                raise TypeError(
+                    f'unwrap3d() found no complex (date, y, x) variables in '
+                    f'burst {key}')
+            date_values = np.asarray(ds.coords['date'].values)
+            out_vars = {}
+            for pol in pols:
+                da_xr = ds[pol]
+                if da_xr.dims[0] != 'date':
+                    da_xr = da_xr.transpose('date', ...)
+                if len(da_xr.data.chunks[0]) != 1:
+                    raise ValueError(
+                        "unwrap3d() requires the date dimension in one chunk. "
+                        "Use chunk1d() first.")
+
+                def _make(_d, _bd, _mi, _se, _sd, _ns, _mdis, _mdt, _ntr):
+                    def kernel(block):
+                        return utils_unwrap3d.unwrap3d_dates_array(
+                            block, _d, duration=_bd, max_iter=_mi,
+                            search=_se, short_days=_sd, n_short=_ns,
+                            min_disagree=_mdis, min_dates=_mdt,
+                            n_trend=_ntr)
+                    return kernel
+
+                out = da.map_blocks(
+                    _make(date_values, float(duration), int(max_iter),
+                          int(search), float(short_days),
+                          int(n_short), int(min_disagree), int(min_dates),
+                          int(n_trend)),
+                    da_xr.data, dtype=np.float32,
+                    meta=np.empty((0, 0, 0), dtype=np.float32))
+                out_vars[pol] = xr.DataArray(out, dims=da_xr.dims,
+                                             coords=da_xr.coords, name=pol)
+            new_ds = xr.Dataset(out_vars, attrs=ds.attrs)
+            if 'spatial_ref' in ds.coords:
+                new_ds = new_ds.assign_coords(spatial_ref=ds.spatial_ref)
+            result[key] = new_ds
         return Batch(result)
 
     def trend2d_chunk(self, *args, **kwargs):
@@ -3737,7 +4034,27 @@ class BatchCore(dict):
                 output_budget_mb = cy0 * cx0 * 8 / (1024 * 1024) / yscale / xscale
                 break
 
-        result = self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
+        # Coarsen the (y, x) planes only. .mean() over the whole Dataset would
+        # also hit the 1D radar metadata -- and 'burst' is a STRING, so it dies
+        # with "could not convert string to float". The metadata is re-attached
+        # unchanged afterwards: downsampling a grid says nothing about the
+        # wavelength that grid was measured at.
+        meta_keys = {}
+        spatial = {}
+        for key, ds in self.items():
+            m = [v for v in ds.data_vars
+                 if not (ds[v].ndim >= 2 and tuple(ds[v].dims[-2:]) == ('y', 'x'))]
+            meta_keys[key] = ds[m] if m else None
+            spatial[key] = ds[[v for v in ds.data_vars if v not in m]]
+        result = type(self)(spatial).coarsen(
+            {'y': yscale, 'x': xscale}, boundary='trim').mean()
+        for key in list(result.keys()):
+            md = meta_keys.get(key)
+            if md is not None and len(md.data_vars):
+                attrs = result[key].attrs
+                result[key] = result[key].assign(
+                    {v: md[v] for v in md.data_vars})
+                result[key].attrs = attrs
 
         # Rechunk output to preserve input spatial granularity
         if output_budget_mb is not None:
@@ -5055,8 +5372,13 @@ class BatchCore(dict):
             new_vars = {}
             for var in ds.data_vars:
                 data_arr = ds[var]
-                # Skip non-spatial variables
+                # Non-spatial variables are CARRIED, not dropped. They are the
+                # radar metadata -- radar_wavelength, near_range, earth_radius,
+                # SC_height_start, rng_samp_rate, BPR -- and dropping them here
+                # stranded every downstream unit conversion and ele2phase build.
+                # Smoothing does not apply to them; passing them through does.
                 if not (data_arr.ndim in (2, 3) and data_arr.dims[-2:] == ('y', 'x')):
+                    new_vars[var] = data_arr
                     continue
 
                 is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
@@ -5174,7 +5496,7 @@ class BatchCore(dict):
         Measure phase offset discrepancy across all burst overlaps.
 
         Computes the weighted mean of absolute median phase differences
-        across all overlapping regions. After offset correction with fit(),
+        across all overlapping regions. After offset correction with align(),
         these median differences should be close to zero.
 
         Parameters
@@ -5392,7 +5714,7 @@ class BatchCore(dict):
             return discrepancies[0]
         return discrepancies
 
-    def fit(self,
+    def _align_coeffs(self,
             degree: int = 0,
             method: str = 'median',
             polarization: str | None = None,
@@ -5438,13 +5760,13 @@ class BatchCore(dict):
         --------
         >>> # 3-step alignment for best results (0.028 rad discrepancy):
         >>> # Step 1: Estimate offsets
-        >>> offsets1 = intfs.fit(degree=0)
+        >>> offsets1 = intfs._align_coeffs(degree=0)
         >>> intfs1 = intfs - offsets1
         >>> # Step 2: Estimate ramps
-        >>> ramps = intfs1.fit(degree=1)
+        >>> ramps = intfs1._align_coeffs(degree=1)
         >>> intfs2 = intfs1 - intfs1.polyval(ramps)
         >>> # Step 3: Re-estimate offsets
-        >>> offsets2 = intfs2.fit(degree=0)
+        >>> offsets2 = intfs2._align_coeffs(degree=0)
         >>> # Combine coefficients (for single pair)
         >>> coeffs = {b: [ramps[b][0], ramps[b][1] + offsets1[b] + offsets2[b]] for b in offsets1}
         >>> aligned = intfs - intfs.polyval(coeffs)
@@ -5461,7 +5783,7 @@ class BatchCore(dict):
         elif isinstance(self, Batch):
             use_circular = False
         else:
-            raise TypeError(f"fit() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
+            raise TypeError(f"_align_coeffs() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
 
         # Constants
         MIN_OVERLAP_PIXELS = 50
@@ -5515,7 +5837,7 @@ class BatchCore(dict):
         has_pair_dim = 'pair' in sample_da.dims
 
         if debug:
-            print(f'fit(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s), pol={polarization}', flush=True)
+            print(f'_align_coeffs(degree={degree}): {n_bursts} bursts, {n_pairs} pair(s), pol={polarization}', flush=True)
 
         # Extract pathNumber and subswath from burst ID (format: "123_262883_IW2")
         # Used to skip same-path different-subswath overlaps (small x-extent, diagonal connection)
@@ -5686,7 +6008,7 @@ class BatchCore(dict):
 
         # Single delayed task: receives resolved burst numpy arrays,
         # computes overlaps + diffs internally, then solves.
-        def _fit_all(*burst_data_arrays):
+        def _align_coeffs_all(*burst_data_arrays):
             import xarray as xr
             from scipy import sparse as _sparse
             from scipy.sparse.linalg import lsqr as _lsqr
@@ -5842,7 +6164,7 @@ class BatchCore(dict):
 
         # Single delayed call — dask resolves burst data arrays before calling.
         # Graph has ~N_bursts layers (not ~N_overlaps*3 from xarray diffs).
-        solve_result = dask.delayed(_fit_all, pure=True)(*burst_data)
+        solve_result = dask.delayed(_align_coeffs_all, pure=True)(*burst_data)
 
         # Extract per-burst dask 0-d arrays from delayed solve result
         offsets_part = solve_result['offsets']
@@ -5871,7 +6193,7 @@ class BatchCore(dict):
 
         if return_residuals:
             # Residuals require concrete values — triggers the solve chain
-            print('fit(return_residuals=True): computing residuals breaks lazy chain, use for diagnostics only', flush=True)
+            print('_align_coeffs(return_residuals=True): computing residuals breaks lazy chain, use for diagnostics only', flush=True)
             residuals_out = solve_result['residuals'].compute()
             if debug:
                 print(f'Input residuals: {residuals_out}', flush=True)
@@ -5979,7 +6301,7 @@ class BatchCore(dict):
                 res_in = self.residuals(polarization=polarization)
                 print(f'Input residuals: {res_in}', flush=True)
 
-            offsets = self.fit(degree=0, method=method, polarization=polarization, debug=debug)
+            offsets = self._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
             aligned = self - offsets
 
             if debug or return_residuals:
@@ -6001,7 +6323,7 @@ class BatchCore(dict):
             # Step 1: Estimate offsets
             if debug:
                 print('\nStep 1: Estimate offsets...', flush=True)
-            offsets1 = self.fit(degree=0, method=method, polarization=polarization, debug=debug)
+            offsets1 = self._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
             intfs1 = self - offsets1
             if debug:
                 res1 = intfs1.residuals(polarization=polarization)
@@ -6010,7 +6332,7 @@ class BatchCore(dict):
             # Step 2: Estimate ramps (uses same-track overlaps only)
             if debug:
                 print('\nStep 2: Estimate ramps...', flush=True)
-            ramps = intfs1.fit(degree=1, method=method, polarization=polarization, debug=debug)
+            ramps = intfs1._align_coeffs(degree=1, method=method, polarization=polarization, debug=debug)
             intfs2 = intfs1 - intfs1.polyval(ramps)
             if debug:
                 res2 = intfs2.residuals(polarization=polarization)
@@ -6019,7 +6341,7 @@ class BatchCore(dict):
             # Step 3: Re-estimate offsets
             if debug:
                 print('\nStep 3: Re-estimate offsets...', flush=True)
-            offsets2 = intfs2.fit(degree=0, method=method, polarization=polarization, debug=debug)
+            offsets2 = intfs2._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
 
             # Combine coefficients: [ramp, offset1 + ramp_intercept + offset2]
             # Detect if multi-pair

@@ -9,6 +9,45 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 
+import threading
+import functools
+import inspect as _inspect
+
+# Metal/CUDA graph and allocator state is process-global, but dask drives this
+# library from several worker threads at once (the notebooks use
+# threads_per_worker=2). Concurrent non-CPU work corrupts that shared state and
+# kills the interpreter outright -- an MPSGraph "over-released" warning, then a
+# segfault or an NSException from nan_to_num_out_mps / arange_mps_out.
+#
+# ONE lock for the whole process. Per-module locks do not compose: a thread in
+# the gaussian path and a thread in the IRLS path would hold different locks and
+# still collide. Re-entrant, because these entry points call each other.
+GPU_LOCK = threading.RLock()
+
+
+def serialize_gpu(fn):
+    """Serialize a GPU entry point. CPU calls run unlocked and stay parallel."""
+    sig = _inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            dev = bound.arguments.get('device', 'cpu')
+        except TypeError:
+            dev = kwargs.get('device', 'cpu')
+        dev = str(getattr(dev, 'type', dev))
+        if dev == 'auto':
+            dev = get_torch_device('auto')
+            dev = str(getattr(dev, 'type', dev))
+        if dev == 'cpu':
+            return fn(*args, **kwargs)
+        with GPU_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 def get_torch_device(device='auto', debug=False):
     """
     Get PyTorch device for GPU-accelerated operations.

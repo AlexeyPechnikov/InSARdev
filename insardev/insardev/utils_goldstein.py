@@ -8,6 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
+from .utils_torch import serialize_gpu
 
 def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5):
     """
@@ -154,6 +155,7 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5):
     return out
 
 
+@serialize_gpu
 def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5):
     """
     Goldstein adaptive filter using PyTorch with vectorized unfold/fold.

@@ -14,6 +14,7 @@ Static utility functions for 2D phase unwrapping.
 These functions contain the core algorithms for 2D phase unwrapping,
 component detection, and component linking.
 """
+from .utils_torch import serialize_gpu
 import numpy as np
 import numba as nb
 
@@ -1079,6 +1080,7 @@ def wrapped_gradient(phase):
     return dx, dy
 
 
+@serialize_gpu
 def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
                    cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, conncomp_size=30, debug=False):
     """

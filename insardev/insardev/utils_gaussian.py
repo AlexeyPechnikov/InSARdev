@@ -9,6 +9,10 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 
+from .utils_torch import serialize_gpu as _serialize_gpu
+
+
+@_serialize_gpu
 def nanconvolve2d_gaussian_pytorch(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='cpu'):
     """
     2D Gaussian convolution using PyTorch with separable kernels.
@@ -224,6 +228,7 @@ def _get_torch_device(device='auto', debug=False):
     return Batch._get_torch_device(device, debug)
 
 
+@_serialize_gpu
 def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
                    pixel_sizes=None, resolution=67.0):
     """
@@ -308,6 +313,17 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
     use_decimation = (scale_y > 1 and scale_x > 1 and wavelength is not None
                       and wavelength / resolution > (2 if dev.type == 'cpu' else 24))
     if use_decimation:
+        # Complex input on the GPU decimation path: the rest of this branch works
+        # in float32 and would drop the imaginary part. A Gaussian is linear, so
+        # filtering the parts separately is exact.
+        if is_complex and dev.type != 'cpu':
+            kw = dict(weight_np=weight_np, sigma=sigma, truncate=truncate,
+                      threshold=threshold, device=device, pixel_sizes=pixel_sizes,
+                      resolution=resolution)
+            re_ = gaussian_numpy(np.ascontiguousarray(data_np.real), **kw)
+            im_ = gaussian_numpy(np.ascontiguousarray(data_np.imag), **kw)
+            return (re_ + 1j * im_).astype(np.complex64)
+
         original_shape = data_np.shape
 
         # AA sigma from resolution wavelength (same for both dimensions like PyGMTSAR)
