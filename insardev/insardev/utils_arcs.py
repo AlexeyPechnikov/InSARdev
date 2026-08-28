@@ -2174,14 +2174,17 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # enough to order it, and the refinement cannot leave its
                     # own lattice cell, so it reorders neighbours at most.
                     #
-                    # ONE PASS, NOT ZERO. The lattice alone scores every
-                    # candidate at a QUANTISED model: neighbours can land on
-                    # the same grid point and tie exactly, and even untied the
-                    # score is a grid-resolution estimate rather than the
-                    # candidate's own optimum. One pass moves each off its
-                    # shared point into its own cell, which is what separates
-                    # them; further passes converge inside a cell already
-                    # separated and reorder nothing.
+                    # ONE PASS, AND THAT IS A CORRECTNESS FLOOR RATHER THAN
+                    # A SETTING. The lattice scores every candidate at a
+                    # QUANTISED model, so what is compared is not each
+                    # candidate's own fit: neighbours can share a grid point
+                    # and tie exactly, and even apart they are scored at
+                    # whatever the grid rounded them to. One pass takes each
+                    # off the grid and onto its own optimum, which is what
+                    # makes the comparison mean anything -- it removes the
+                    # lattice artefact, no more. Further passes converge inside
+                    # a cell whose ordering is already settled, so they cannot
+                    # change which candidates are chosen.
                     ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
                         arc2, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
                         budget, 0.0, device, iterations=1)
