@@ -1712,6 +1712,221 @@ def _3d_krige(vals, py, px, ny, nx, spacing, window, nlags=24):
 
 
 
+def _3d_arc_batch(Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
+                  step_dh, step_dv, budget, device, iterations):
+    """Fit every (src, tgt) arc between two phasor sets, in budgeted batches.
+
+    NO DIFFERENTIAL ANNUAL. Both callers attach a pixel to a neighbour tens of
+    metres away, and there is no seasonal GRADIENT at that scale: stratified
+    and thermal delay vary with elevation and over kilometres, not across a
+    courtyard. Fitting one is fitting noise, and two free parameters on a
+    marginal arc buy enough coherence to carry the rate a whole sideband away.
+    """
+    n = Us.shape[0]
+    ga = np.empty(len(src), np.float32)
+    dha = np.empty(len(src)); dva = np.empty(len(src))
+    dsa = np.empty(len(src), np.complex128)
+    step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 16, 1)))
+    for b0 in range(0, len(src), step):
+        sl = slice(b0, min(b0 + step, len(src)))
+        arc = np.ascontiguousarray(
+            (Us[:, src[sl]] * np.conj(Ut[:, tgt[sl]])).astype(np.complex64))
+        ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
+            arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
+            budget, 0.0, device, iterations=iterations)
+    return ga, dha, dva, dsa
+
+
+def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
+                          meter2rad, max_dh, max_dv, step_dh, step_dv, budget,
+                          device, iterations, min_agreeing, threshold,
+                          stats=None, prefix='ds_', debug=False):
+    """Rank every arc, name ONE component, refine the best `min_agreeing`.
+
+    RANK FIRST, REFINE THE SHORTLIST. Only `min_agreeing` partners are used, so
+    refining all of them spends the larger half of the fit on candidates that
+    are discarded. Ranking needs the model only well enough to order it, and
+    the refinement cannot leave its own lattice cell, so it reorders
+    neighbours at most.
+
+    ONE PASS TO RANK, AND THAT IS A CORRECTNESS FLOOR RATHER THAN A SETTING.
+    The lattice scores every candidate at a QUANTISED model, so neighbours can
+    share a grid point and tie exactly. One pass takes each onto its own
+    optimum, which is what makes the comparison mean anything.
+
+    Returns (ga, dha, dva, dsa, good).
+    """
+    ga, dha, dva, dsa = _3d_arc_batch(
+        Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
+        step_dh, step_dv, budget, device, 1)
+    _lab = base_lab[tgt].astype(np.int64)
+    if min_agreeing is not None and len(np.unique(base_lab)) > 1:
+        # THE BEST PARTNER NAMES THE COMPONENT, AND THEN ONLY ITS NODES ARE
+        # USED. Components carry unrelated datums, so partners drawn from two
+        # of them disagree by that offset however good every arc is. The
+        # single most coherent arc says which network this pixel belongs to;
+        # if that component then cannot field `min_agreeing` partners, or they
+        # disagree, the pixel is unmeasured -- no other component is tried.
+        # Arc coherence is settled before any velocity is read, so the best
+        # arc cannot be picked to produce a result.
+        _gf = np.where(np.isfinite(ga), ga, -np.inf)
+        _top1 = np.full(nsrc, -np.inf)
+        np.maximum.at(_top1, src, _gf)
+        _is1 = (_gf >= _top1[src]) & (_gf > -np.inf)
+        _win = np.full(nsrc, -1, dtype=np.int64)
+        _win[src[_is1]] = _lab[_is1]
+        if debug and stats is not None:
+            # what the restriction forbids, counted before it acts: shortlists
+            # that would have spanned two components. Not "saw more than one",
+            # which nearly every pixel does once a second one exists in reach.
+            _so = np.lexsort((-_gf, src))
+            _sn = np.bincount(src[_so], minlength=nsrc)
+            _sf = np.r_[0, np.cumsum(_sn)[:-1]]
+            _tp = _so[(np.arange(len(_so)) - np.repeat(_sf, _sn)) < min_agreeing]
+            _lo = np.full(nsrc, np.iinfo(np.int64).max, np.int64)
+            _hi = np.full(nsrc, -1, dtype=np.int64)
+            np.minimum.at(_lo, src[_tp], _lab[_tp])
+            np.maximum.at(_hi, src[_tp], _lab[_tp])
+            stats[prefix + 'shortlist_straddled'] = int(
+                np.count_nonzero((_hi >= 0) & (_hi != _lo)))
+            stats[prefix + 'multi_component'] = int(np.count_nonzero(
+                np.bincount(src[_lab != _win[src]], minlength=nsrc) > 0))
+        ga[_lab != _win[src]] = np.nan
+    _short = int(min_agreeing) if min_agreeing is not None else len(src)
+    _ord = np.lexsort((-np.where(np.isfinite(ga), ga, -np.inf), src))
+    _cnt0 = np.bincount(src[_ord], minlength=nsrc)
+    _off0 = np.r_[0, np.cumsum(_cnt0)[:-1]]
+    _col0 = np.arange(len(_ord)) - np.repeat(_off0, _cnt0)
+    # ADMISSIBLE ONLY. Ranking puts NaN last, but taking the first `_short`
+    # POSITIONS still reaches them when a pixel has fewer admissible
+    # candidates -- and refitting one hands it a fresh finite coherence, so an
+    # arc ruled out before the ranking would come back holding a vote.
+    _keep = _ord[(_col0 < _short) & np.isfinite(ga[_ord])]
+    if len(_keep):
+        g2, h2, v2, s2 = _3d_arc_batch(
+            Us, Ut, src[_keep], tgt[_keep], ele2phase, t, meter2rad,
+            max_dh, max_dv, step_dh, step_dv, budget, device, iterations)
+        ga[_keep], dha[_keep], dva[_keep], dsa[_keep] = g2, h2, v2, s2
+    # anything not refined cannot be used, whatever its lattice value
+    _unref = np.ones(len(src), dtype=bool)
+    _unref[_keep] = False
+    ga[_unref] = np.nan
+    good = np.isfinite(ga) & (ga >= float(threshold)) & np.isfinite(dha)
+    return ga, dha, dva, dsa, good
+
+
+def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
+                          reject_sigma, passes, labels=None, stats=None,
+                          prefix='ds_'):
+    """Do a pixel's best `min_agreeing` partners agree? Returns (first, votes, ok).
+
+    ONLY THE BEST `min_agreeing` PARTNERS ENTER, AND NOTHING ELSE DOES. A pixel
+    sees tens of candidates spanning every quality from just above `threshold`
+    upwards, and a median across that mixture estimates nothing: it summarises
+    several populations, so it describes neither the good arcs nor the bad.
+    Robustness is not what makes it meaningless -- the mixture is.
+
+    So the partners are CHOSEN first, by arc coherence, which is settled before
+    any value is read and so cannot be picked to suit the answer. Everything
+    downstream -- the centre, the scale, the rejection -- then sees one
+    homogeneous set of comparable measurements, which is the only situation
+    where a robust scale means anything.
+    """
+    _ma, _ar, _ii = min_agreeing, reject_sigma, passes
+    o2 = np.lexsort((-np.where(good, ga, -np.inf), src))
+    o2 = o2[good[o2]]
+    cnt = np.bincount(src[o2], minlength=nsrc)
+    if not len(cnt) or not cnt.max():
+        return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int32),
+                np.zeros(nsrc, dtype=bool))
+    off = np.r_[0, np.cumsum(cnt)[:-1]]
+    col = np.arange(len(o2)) - np.repeat(off, cnt)
+    # columns are gamma-descending, so the first `_ma` ARE the best `_ma`; a
+    # row with fewer admissible arcs cannot fill them and is rejected for
+    # having too few
+    if _ma is not None:
+        take = col < _ma
+        o2, col = o2[take], col[take]
+        cnt = np.minimum(cnt, _ma)
+    kmax = int(cnt.max())
+    row = src[o2]
+    V = np.full((nsrc, kmax), np.nan)
+    G = np.zeros((nsrc, kmax))
+    IDX = np.full((nsrc, kmax), -1, dtype=np.int64)
+    V[row, col] = v_abs[o2]
+    G[row, col] = ga[o2]
+    IDX[row, col] = o2
+    fin = np.isfinite(V)
+    # rows with no admissible arc are all NaN and are rejected below; taking a
+    # median of one would only warn
+    anyf = fin.any(axis=1)
+    e = np.zeros(nsrc)
+    if anyf.any():
+        e[anyf] = np.nanmedian(np.where(fin, V, np.nan)[anyf], axis=1)
+    d0 = np.abs(V - e[:, None])
+    floor = max(_SIGMA_FLOOR * float(np.nanmedian(d0[fin])), 1e-9) \
+        if fin.any() else 1e-9
+    for _ in range(_ii):
+        w = np.where(fin, G / np.maximum(np.abs(V - e[:, None]), floor), 0.0)
+        sw = w.sum(axis=1)
+        e = np.where(sw > 0, (w * np.where(fin, V, 0.0)).sum(axis=1)
+                     / np.maximum(sw, 1e-30), e)
+    r = np.abs(V - e[:, None])
+    # PER PIXEL, from its own partners: they are what say how much this
+    # pixel's measurements scatter. The floor keeps a row whose partners
+    # happen to land identically from rejecting everything else on a zero
+    # scale.
+    sig = np.full(nsrc, floor)
+    if fin.any():
+        rr = np.where(fin, r, np.nan)
+        enough = fin.sum(axis=1) >= (_ma if _ma is not None else 1)
+        if enough.any():
+            sig[enough] = np.maximum(
+                1.4826 * np.nanmedian(rr[enough], axis=1), floor)
+    keep = fin & (r <= _ar * sig[:, None]) if _ar is not None else fin
+    nkeep = keep.sum(axis=1)
+    if _ma is not None:
+        # ALL `min_agreeing` OF THEM, UNANIMOUSLY. Naming WHICH partners have
+        # to agree is what makes it a test rather than "some few of many",
+        # which any unimodal scatter passes on its shape alone. Allowing one
+        # dissenter is not the mild relaxation it reads as: there are only
+        # `_ma` columns, so a pixel holding `_ma - 1` admissible partners
+        # fills every column it has and passes, spending the tolerance meant
+        # for one partner DISAGREEING on one being ABSENT.
+        ok = keep[:, :_ma].sum(axis=1) == _ma
+    else:
+        ok = nkeep >= 1
+    # rows are gamma-descending, so the first survivor is the best arc of the
+    # consistent set
+    sel_col = np.argmax(keep, axis=1)
+    first = IDX[np.flatnonzero(ok), sel_col[ok]]
+    votes = nkeep[ok].astype(np.int32)
+    if stats is not None:
+        reach = int(np.count_nonzero(cnt))
+        stats[prefix + 'admissible'] = reach
+        stats[prefix + 'no_consensus'] = reach - len(first)
+        stats[prefix + 'too_few'] = int(
+            reach - np.count_nonzero(fin[:, :_ma].sum(axis=1) >= _ma)
+            if _ma is not None else 0)
+        if labels is not None:
+            # THE INVARIANT, CHECKED RATHER THAN ARGUED. The shortlist behind
+            # an attached pixel must lie in ONE component: components carry
+            # unrelated datums, so a decision taken across two is a numerical
+            # error, not a noisier answer. Must read 0 on any scene with any
+            # parameters. On `fin`, NOT on `keep` -- a cross-component partner
+            # differs by the datum offset, which is what makes it an outlier,
+            # so the rejection discards it before `keep` exists.
+            _rw = np.flatnonzero(ok)
+            _ix2 = IDX[_rw]
+            _lb2 = np.where(fin[_rw] & (_ix2 >= 0),
+                            labels[np.clip(_ix2, 0, None)].astype(np.int64), -1)
+            _hi2 = _lb2.max(axis=1)
+            _lo2 = np.where(_lb2 >= 0, _lb2, np.iinfo(np.int64).max).min(axis=1)
+            stats[prefix + 'cross_component_votes'] = int(
+                np.count_nonzero((_hi2 >= 0) & (_hi2 != _lo2)))
+    return first, votes, ok
+
+
 def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                        window=(32, 128), threshold=0.5, cell=(2, 8),
                        geometry, budget=None, densify=True,
@@ -2195,172 +2410,20 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             _3d_fit_ps_array.stats['ds_candidates'] = int(len(dy_))
             _3d_fit_ps_array.stats['ds_reached'] = int(len(np.unique(src)))
             _3d_fit_ps_array.stats['ds_arcs'] = int(len(src))
+            # unit phasors once for the candidates and once for the nodes,
+            # rather than re-slicing the scene inside every batch
+            _ad = np.abs(S[:, dy_, dx_])
+            Ud_all = np.ascontiguousarray(
+                np.where(_ad > 0, S[:, dy_, dx_] / np.where(_ad > 0, _ad, 1),
+                         0).astype(np.complex64))
+            del _ad
+            Ups = np.ascontiguousarray(Un[:, sel][:, kk])
             if len(src):
-                ga = np.empty(len(src), np.float32)
-                dha = np.empty(len(src)); dva = np.empty(len(src))
-                dsa = np.empty(len(src), np.complex128)
-                step2 = max(1, int(_3d_budget_mb(budget) * 1024 * 1024
-                                   // max(n * 16, 1)))
-                for b0 in range(0, len(src), step2):
-                    sl = slice(b0, min(b0 + step2, len(src)))
-                    ad = np.abs(S[:, dy_[src[sl]], dx_[src[sl]]])
-                    ud = np.where(ad > 0, S[:, dy_[src[sl]], dx_[src[sl]]]
-                                  / np.where(ad > 0, ad, 1), 0)
-                    arc2 = np.ascontiguousarray(
-                        (ud * np.conj(Un[:, sel][:, kk][:, tgt[sl]])
-                         ).astype(np.complex64))
-                    # NO DIFFERENTIAL ANNUAL ON THE ATTACHING ARC. The DS
-                    # sits inside its partner's own DS window, tens of metres
-                    # away, and there is no seasonal GRADIENT at that scale:
-                    # stratified and thermal delay vary with elevation and over
-                    # kilometres, not across a courtyard. So the differential
-                    # annual is physically ~0 and fitting it is fitting noise
-                    # -- two free parameters on a marginal arc buy enough
-                    # coherence to carry the rate a whole sideband away, and
-                    # attachments then alias at many times the rate they do
-                    # without it.
-                    #
-                    # The DS still GETS an annual -- it inherits its partner's,
-                    # which was fitted on the network arcs where the baseline is
-                    # long enough for a real differential to exist. That is the
-                    # physically right split: the network measures the seasonal,
-                    # the attachment transfers it.
-                    # RANK FIRST, REFINE THE SHORTLIST. Only `min_agreeing`
-                    # partners are used, so refining all of them spends the
-                    # larger half of the fit on candidates that are discarded a
-                    # few lines below. Ranking needs the model only well
-                    # enough to order it, and the refinement cannot leave its
-                    # own lattice cell, so it reorders neighbours at most.
-                    #
-                    # ONE PASS, AND THAT IS A CORRECTNESS FLOOR RATHER THAN
-                    # A SETTING. The lattice scores every candidate at a
-                    # QUANTISED model, so what is compared is not each
-                    # candidate's own fit: neighbours can share a grid point
-                    # and tie exactly, and even apart they are scored at
-                    # whatever the grid rounded them to. One pass takes each
-                    # off the grid and onto its own optimum, which is what
-                    # makes the comparison mean anything -- it removes the
-                    # lattice artefact, no more. Further passes converge inside
-                    # a cell whose ordering is already settled, so they cannot
-                    # change which candidates are chosen.
-                    ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
-                        arc2, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-                        budget, 0.0, device, iterations=1)
-                # ONE COMPONENT PER DS. Every component carries its own
-                # free datum, so partners drawn from two of them disagree by
-                # that offset however good each arc is. A DS at a seam would
-                # then see its best partners contradict one another and be
-                # rejected for a disagreement that is bookkeeping rather than
-                # measurement -- and a seam is precisely where the network is
-                # thinnest and the extra reach matters most. So the candidates
-                # are cut to a single component first and the consensus is
-                # sought inside it, which is what makes the surviving votes
-                # comparable at all.
-                #
-                # WHICH component is decided by the quantity the answer will
-                # rest on: the coherence of its `min_agreeing`-th best arc,
-                # the weakest partner the consensus would be built from. One
-                # that cannot field that many cannot answer, and is not asked.
-                # With a single component -- what an uncapped network gives on
-                # connected ground -- none of this runs.
-                if _ma is not None and len(comps) > 1:
-                    # THE BEST PARTNER NAMES THE COMPONENT, AND THEN ONLY ITS
-                    # NODES ARE USED. A DS reaches every node inside its
-                    # extent regardless of which component that node belongs
-                    # to; the single most coherent arc says which network this
-                    # pixel belongs to, and the consensus is then sought among
-                    # that component's nodes alone.
-                    #
-                    # It is the ONE criterion available before any value is
-                    # read. Scoring a component by whether it can field
-                    # `min_agreeing` good partners -- what this did first --
-                    # picks the component most likely to PASS, which is
-                    # choosing to suit the answer: a DS whose best arc by far
-                    # sits in a small component would be handed to a larger
-                    # one it agrees with less, purely because the larger one
-                    # could fill the shortlist. Arc coherence is settled
-                    # before any velocity is looked at, so the best arc cannot
-                    # be picked to produce a result.
-                    #
-                    # If the named component then cannot field `min_agreeing`
-                    # partners, or they disagree, the DS is unmeasured. That
-                    # is the honest outcome -- not a reason to go back and
-                    # choose a different network.
-                    #
-                    # Spatial position plays no part. Components are not
-                    # regions; an island and a far river bank interleave with
-                    # the main network across the raster.
-                    _lab = lab_all[tgt].astype(np.int64)
-                    _gf = np.where(np.isfinite(ga), ga, -np.inf)
-                    _top1 = np.full(len(dy_), -np.inf)
-                    np.maximum.at(_top1, src, _gf)
-                    _is1 = (_gf >= _top1[src]) & (_gf > -np.inf)
-                    _win = np.full(len(dy_), -1, dtype=np.int64)
-                    _win[src[_is1]] = _lab[_is1]
-                    if debug:
-                        # WHAT THE RESTRICTION FORBIDS, counted before it
-                        # acts: shortlists that would have spanned two
-                        # components. Not "saw more than one component" --
-                        # nearly every DS does once a second one exists in
-                        # reach. Only a straddling SHORTLIST would have
-                        # differenced partners against unrelated datums.
-                        _so = np.lexsort((-_gf, src))
-                        _sn = np.bincount(src[_so], minlength=len(dy_))
-                        _sf = np.r_[0, np.cumsum(_sn)[:-1]]
-                        _tp = _so[(np.arange(len(_so))
-                                   - np.repeat(_sf, _sn)) < _ma]
-                        _lo = np.full(len(dy_), np.iinfo(np.int64).max, np.int64)
-                        _hi = np.full(len(dy_), -1, dtype=np.int64)
-                        np.minimum.at(_lo, src[_tp], _lab[_tp])
-                        np.maximum.at(_hi, src[_tp], _lab[_tp])
-                        _3d_fit_ps_array.stats['ds_shortlist_straddled'] = int(
-                            np.count_nonzero((_hi >= 0) & (_hi != _lo)))
-                        del _so, _sn, _sf, _tp, _lo, _hi
-                    _3d_fit_ps_array.stats['ds_multi_component'] = int(
-                        np.count_nonzero(
-                            np.bincount(src[_lab != _win[src]],
-                                        minlength=len(dy_)) > 0))
-                    ga[_lab != _win[src]] = np.nan
-                    del _lab, _gf, _top1, _is1, _win
-
-                # REFINE EXACTLY WHAT WILL BE USED. `consensus` says how many
-                # partners the answer rests on, so that is how many are worth
-                # refining -- no separate width to choose or keep in step. The
-                # lattice ranking is what picks them, and it can do that because
-                # the refinement never leaves its own lattice cell: it reorders
-                # neighbours rather than moving a candidate across the field.
-                _short = int(_ma) if _ma is not None else len(src)
-                _ord = np.lexsort((-np.where(np.isfinite(ga), ga, -np.inf), src))
-                _cnt0 = np.bincount(src[_ord], minlength=len(dy_))
-                _off0 = np.r_[0, np.cumsum(_cnt0)[:-1]]
-                _col0 = np.arange(len(_ord)) - np.repeat(_off0, _cnt0)
-                # ADMISSIBLE ONLY. Ranking puts NaN last, but taking the
-                # first `_short` POSITIONS still reaches them when a DS has
-                # fewer admissible candidates than that -- and refitting one
-                # hands it a fresh finite coherence, so an arc ruled out
-                # before the ranking would come back holding a vote. That is
-                # how a DS assigned to one component could still be scored
-                # against another's nodes, which is the whole thing the
-                # restriction above is for. A DS left with too few is left
-                # with too few; the consensus rejects it for that.
-                _keep = _ord[(_col0 < _short) & np.isfinite(ga[_ord])]
-                if len(_keep):
-                    ad = np.abs(S[:, dy_[src[_keep]], dx_[src[_keep]]])
-                    ud = np.where(ad > 0, S[:, dy_[src[_keep]], dx_[src[_keep]]]
-                                  / np.where(ad > 0, ad, 1), 0)
-                    arc3 = np.ascontiguousarray(
-                        (ud * np.conj(Un[:, sel][:, kk][:, tgt[_keep]])
-                         ).astype(np.complex64))
-                    ga[_keep], dha[_keep], dva[_keep], dsa[_keep] = _3d_arc_fit(
-                        arc3, ele2phase, t, meter2rad, max_dh, max_dv,
-                        step_dh, step_dv, budget, 0.0, device,
-                        iterations=iterations)
-                    del arc3, ud, ad
-                # anything not refined cannot be used, whatever its lattice value
-                _unref = np.ones(len(src), dtype=bool)
-                _unref[_keep] = False
-                ga[_unref] = np.nan
-                good = np.isfinite(ga) & (ga >= float(threshold)) & np.isfinite(dha)
+                ga, dha, dva, dsa, good = _3d_partner_shortlist(
+                    Ud_all, Ups, src, tgt, lab_all, len(dy_),
+                    ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
+                    budget, device, iterations, _ma, threshold,
+                    stats=_3d_fit_ps_array.stats, prefix='ds_', debug=debug)
                 # THE PARTNERS ARE MEASUREMENTS, SO THEY ARE SOLVED THE WAY
                 # THE ARCS ARE. Each partner gives the DS a complete answer, so
                 # several partners are repeated measurements of one quantity --
@@ -2383,168 +2446,10 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                 # changes. A fitted centre would sit between partners and be
                 # backed by none of them.
                 v_abs = vel[sel][kk][tgt] + dva
-                o2 = np.lexsort((-np.where(good, ga, -np.inf), src))
-                o2 = o2[good[o2]]
-                nds = len(dy_)
-                cnt = np.bincount(src[o2], minlength=nds)
-                if cnt.max() if len(cnt) else 0:
-                    off = np.r_[0, np.cumsum(cnt)[:-1]]
-                    col = np.arange(len(o2)) - np.repeat(off, cnt)
-                    # ONLY THE BEST `_ma` PARTNERS ENTER, AND NOTHING ELSE DOES.
-                    # At the PS extent a DS has tens of candidates spanning
-                    # every quality from just above `threshold` upwards, and a
-                    # median across that mixture estimates nothing: it is a
-                    # summary of several populations, so it neither describes
-                    # the good arcs nor the bad ones. Robustness is not what
-                    # makes it meaningless -- the mixture is.
-                    #
-                    # So the partners are CHOSEN first, by arc coherence, which
-                    # is settled before any value is read and so cannot be
-                    # picked to suit the answer. Everything downstream -- the
-                    # centre, the scale, the rejection -- then sees one
-                    # homogeneous set of comparable measurements, which is the
-                    # only situation where a robust scale means anything.
-                    #
-                    # Columns are gamma-descending, so the first `_ma` ARE the
-                    # best `_ma`; a row with fewer admissible arcs cannot fill
-                    # them and is rejected for having too few.
-                    if _ma is not None:
-                        take = col < _ma
-                        o2, col = o2[take], col[take]
-                        cnt = np.minimum(cnt, _ma)
-                    kmax = int(cnt.max())
-                    row = src[o2]
-                    V = np.full((nds, kmax), np.nan)
-                    G = np.zeros((nds, kmax))
-                    IDX = np.full((nds, kmax), -1, dtype=np.int64)
-                    V[row, col] = v_abs[o2]
-                    G[row, col] = ga[o2]
-                    IDX[row, col] = o2
-                    fin = np.isfinite(V)
-                    # rows for a DS with no admissible arc are all NaN and are
-                    # rejected below; taking a median of one would only warn
-                    anyf = fin.any(axis=1)
-                    e = np.zeros(nds)
-                    if anyf.any():
-                        e[anyf] = np.nanmedian(
-                            np.where(fin, V, np.nan)[anyf], axis=1)
-                    d0 = np.abs(V - e[:, None])
-                    floor = max(_SIGMA_FLOOR * float(np.nanmedian(d0[fin])), 1e-9) \
-                        if fin.any() else 1e-9
-                    for _ in range(_ii):
-                        w = np.where(fin, G / np.maximum(np.abs(V - e[:, None]),
-                                                         floor), 0.0)
-                        sw = w.sum(axis=1)
-                        e = np.where(sw > 0, (w * np.where(fin, V, 0.0)).sum(axis=1)
-                                     / np.maximum(sw, 1e-30), e)
-                    r = np.abs(V - e[:, None])
-                    # PER DS, from its own partners: they are what say how much
-                    # this pixel's measurements scatter. The floor keeps a row
-                    # whose partners happen to land identically from rejecting
-                    # everything else on a zero scale.
-                    sig = np.full(nds, floor)
-                    if fin.any():
-                        rr = np.where(fin, r, np.nan)
-                        enough = fin.sum(axis=1) >= (_ma if _ma is not None else 1)
-                        if enough.any():
-                            sig[enough] = np.maximum(
-                                1.4826 * np.nanmedian(rr[enough], axis=1), floor)
-                    keep = (fin & (r <= _ar * sig[:, None])
-                            if _ar is not None else fin)
-                    nkeep = keep.sum(axis=1)
-                    # THE BEST `_ma` PARTNERS MUST AGREE -- not any `_ma` of
-                    # them. At the PS extent a DS sees tens of candidates, and
-                    # "some three of them agree" is close to vacuous: the
-                    # weighted median finds the densest cluster of whatever is
-                    # there, and any unimodal scatter has three near its mode.
-                    # The test would then pass on the SHAPE of the sample
-                    # rather than on the quality of the pixel, and raising the
-                    # count does not repair it -- it asks the same weak
-                    # question of a bigger subset.
-                    #
-                    # Naming WHICH partners have to agree is what makes it a
-                    # test. They are chosen by arc coherence, which is settled
-                    # before any value is looked at, so the choice cannot be
-                    # made to suit the answer. Columns are gamma-descending, so
-                    # the first `_ma` of them ARE the best `_ma`, and a row
-                    # holding fewer than `_ma` admissible arcs cannot fill them.
-                    #
-                    # It also stops the mixing of partners of very different
-                    # quality: a strong arc and a barely-admitted one carried
-                    # equal standing in a count, and the count was what decided.
-                    if _ma is not None:
-                        # ALL `min_agreeing` OF THEM, UNANIMOUSLY. The
-                        # selection names WHICH partners are asked -- that is
-                        # what stops the test being "some few of many" and
-                        # therefore vacuous -- and every one of them has to
-                        # agree.
-                        #
-                        # Allowing a single dissenter is not the mild
-                        # relaxation it reads as. There are only `_ma` columns,
-                        # so a DS holding `_ma - 1` admissible partners fills
-                        # every column it has and passes: the tolerance meant
-                        # for one partner DISAGREEING is spent instead on one
-                        # partner being ABSENT, and a pixel that never had the
-                        # asked-for redundancy is reported as though it did.
-                        # Those two failures are not interchangeable -- one is
-                        # a measurement that was contradicted, the other is a
-                        # measurement that was never made.
-                        #
-                        # Requiring the full count keeps them apart. A row with
-                        # too few partners cannot reach `_ma` and is rejected
-                        # for being too few, which is what it is.
-                        okds = keep[:, :_ma].sum(axis=1) == _ma
-                    else:
-                        okds = nkeep >= 1
-                    # rows are gamma-descending, so the first survivor is the
-                    # best arc of the consistent set
-                    sel_col = np.argmax(keep, axis=1)
-                    first = IDX[np.flatnonzero(okds), sel_col[okds]]
-                    if debug:
-                        # THE INVARIANT, CHECKED RATHER THAN ARGUED. The
-                        # SHORTLIST behind an attached DS -- the partners
-                        # whose agreement was tested -- must lie in ONE
-                        # component. Components carry unrelated datums, so a
-                        # decision taken across two is a numerical error, not
-                        # a noisier answer. Must read 0 on any scene with any
-                        # parameters; it is an assertion, not a quality
-                        # measure. It exists because the restriction HAS been
-                        # reversed downstream once already, silently, by a
-                        # shortlist that selected by position and let nulled
-                        # arcs be refitted back into votes.
-                        #
-                        # On `fin`, NOT on `keep`. A cross-component partner
-                        # differs by the datum offset, which is precisely what
-                        # makes it an outlier, so the sigma rejection discards
-                        # it before `keep` exists -- a check there asks a
-                        # question the preceding code already answered, and
-                        # reads 0 even with the restriction switched off.
-                        _rw = np.flatnonzero(okds)
-                        _ix2 = IDX[_rw]
-                        _lb2 = np.where(fin[_rw] & (_ix2 >= 0),
-                                        lab_all[tgt[np.clip(_ix2, 0, None)]
-                                                ].astype(np.int64), -1)
-                        _hi2 = _lb2.max(axis=1)
-                        _lo2 = np.where(_lb2 >= 0, _lb2,
-                                        np.iinfo(np.int64).max).min(axis=1)
-                        _3d_fit_ps_array.stats['ds_cross_component_votes'] = int(
-                            np.count_nonzero((_hi2 >= 0) & (_hi2 != _lo2)))
-                        del _rw, _ix2, _lb2, _hi2, _lo2
-                    votes = nkeep[okds].astype(np.int32)
-                    reach = int(np.count_nonzero(cnt))
-                    # DS holding at least one admissible arc -- the population
-                    # the consensus is actually asked about. `ds_no_consensus`
-                    # is the whole shortfall from it and CONTAINS
-                    # `ds_too_few`; the two are nested, not side by side.
-                    _3d_fit_ps_array.stats['ds_admissible'] = reach
-                    _3d_fit_ps_array.stats['ds_no_consensus'] = reach - len(first)
-                    _3d_fit_ps_array.stats['ds_too_few'] = int(
-                        reach - np.count_nonzero(
-                            fin[:, :_ma].sum(axis=1) >= _ma)
-                        if _ma is not None else 0)
-                else:
-                    first = np.zeros(0, dtype=np.int64)
-                    votes = np.zeros(0, dtype=np.int32)
+                first, votes, _okds = _3d_partner_consensus(
+                    src, ga, good, v_abs, len(dy_), _ma, _ar, _ii,
+                    labels=(lab_all[tgt] if debug else None),
+                    stats=_3d_fit_ps_array.stats, prefix='ds_')
                 if len(first):
                     ds_i, ps_i = src[first], tgt[first]
                     yy2, xx2 = dy_[ds_i], dx_[ds_i]
@@ -2576,6 +2481,93 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                                          + 1j * (ani[sel][kk][ps_i]
                                                  + dsa[first].imag)
                                          ).astype(np.complex64))
+        # ---- ROUND 2: DS TO DS, THE SAME WAY DS ATTACHED TO PS -----------
+        # A pixel can be plainly connectable and still fail round 1 -- not
+        # because anything contradicts it, but because the PS are too sparse
+        # there to field `min_agreeing` of them. That is a property of the
+        # ground, not of the pixel.
+        #
+        # So round 2 offers the ATTACHED DS as partners, under exactly the
+        # rules round 1 used: the best `min_agreeing` by arc coherence, one
+        # component, IRLS to find the consistent set, rejection beyond
+        # `reject_sigma`, unanimity among all of them, and then the value from
+        # the best SURVIVING arc rather than from the fitted centre.
+        #
+        # The partners are worth trusting because of what they already
+        # survived: every one of them was itself carried by `min_agreeing`
+        # agreeing PS. And they are near -- inside the DS window arcs are
+        # short and coherent where the reach to a PS is not.
+        #
+        # REACH DIFFERS BY WHAT EACH SIDE PROVED. A PS is the pixel certified
+        # to hold an arc out to the PS extent, which is why round 1 may reach
+        # that far. A DS carries no such certificate, so it may only vouch
+        # inside the window it was itself measured in.
+        _st = _3d_fit_ps_array.stats
+        if _ma is not None and int(_st.get('ds_attached', 0)):
+            _by, _bx = _st['ds_iy'], _st['ds_ix']
+            _done = np.zeros((ny, nx), dtype=bool)
+            _done[iy[sel][kk], ix[sel][kk]] = True
+            _done[_by, _bx] = True
+            vy, vx = np.where(cand_ds & ~_done)
+            _st['vouch_candidates'] = int(len(vy))
+            if len(vy):
+                _av = np.abs(S[:, vy, vx])
+                Uv = np.ascontiguousarray(
+                    np.where(_av > 0, S[:, vy, vx] / np.where(_av > 0, _av, 1),
+                             0).astype(np.complex64))
+                del _av
+                _hy2, _hx2 = max(wy // 2, 1), max(wx // 2, 1)
+                _d2 = cKDTree(np.c_[_by / _hy2, _bx / _hx2]).query_ball_point(
+                    np.c_[vy / _hy2, vx / _hx2], 1.0, p=np.inf)
+                ds_s = np.repeat(np.arange(len(vy)),
+                                 [len(v) for v in _d2]).astype(np.int64)
+                ds_t = (np.concatenate(_d2).astype(np.int64) if len(ds_s)
+                        else np.zeros(0, np.int64))
+                _st['vouch_arcs'] = int(len(ds_s))
+                if len(ds_s):
+                    _ab = np.abs(S[:, _by, _bx])
+                    Ub = np.ascontiguousarray(
+                        np.where(_ab > 0,
+                                 S[:, _by, _bx] / np.where(_ab > 0, _ab, 1),
+                                 0).astype(np.complex64))
+                    del _ab
+                    _blab = _st['ds_label']
+                    gd, hd, vd, sd, goodd = _3d_partner_shortlist(
+                        Uv, Ub, ds_s, ds_t, _blab, len(vy), ele2phase, t,
+                        meter2rad, max_dh, max_dv, step_dh, step_dv, budget,
+                        device, iterations, _ma, threshold,
+                        stats=_st, prefix='vouch_', debug=debug)
+                    _bvel = _st['ds_velocity_rad_yr'].astype(float)
+                    _bhgt = _st['ds_height_rad'].astype(float)
+                    _bsea = _st['ds_seasonal_rad']
+                    v2first, v2votes, _okv = _3d_partner_consensus(
+                        ds_s, gd, goodd, _bvel[ds_t] + vd, len(vy),
+                        _ma, _ar, _ii,
+                        labels=(_blab[ds_t] if debug else None),
+                        stats=_st, prefix='vouch_')
+                    _st['vouch_attached'] = int(len(v2first))
+                    if len(v2first):
+                        _si, _bj = ds_s[v2first], ds_t[v2first]
+                        vy2, vx2 = vy[_si], vx[_si]
+                        lab_out[vy2, vx2] = _blab[_bj]
+                        vel_out[vy2, vx2] = (_bvel[_bj]
+                                             + vd[v2first]).astype(np.float32)
+                        hgt_out[vy2, vx2] = (_bhgt[_bj]
+                                             + hd[v2first]).astype(np.float32)
+                        coh_out[vy2, vx2] = gd[v2first].astype(np.float32)
+                        sea_out[vy2, vx2] = (
+                            (_bsea[_bj].real + sd[v2first].real)
+                            + 1j * (_bsea[_bj].imag + sd[v2first].imag)
+                            ).astype(np.complex64)
+                        _st.update(
+                            vouch_iy=vy2.copy(), vouch_ix=vx2.copy(),
+                            vouch_label=_blab[_bj],
+                            vouch_gamma=gd[v2first].copy(),
+                            vouch_votes=np.asarray(v2votes, dtype=np.int32),
+                            vouch_velocity_rad_yr=(_bvel[_bj] + vd[v2first]
+                                                   ).astype(np.float32),
+                            vouch_height_rad=(_bhgt[_bj] + hd[v2first]
+                                              ).astype(np.float32))
     if debug:
         _s = _3d_fit_ps_array.stats
         _att = int(_s.get('ds_attached', 0))
@@ -2609,6 +2601,29 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         else:
             print('DEBUG: DS       no candidates cleared the threshold',
                   flush=True)
-        print(f'DEBUG: total    {len(_s.get("iy", ())):,} PS + {_att:,} DS '
-              f'= {len(_s.get("iy", ())) + _att:,} measured pixels', flush=True)
+        _vc = int(_s.get('vouch_candidates', 0))
+        _va = int(_s.get('vouch_attached', 0))
+        if _vc:
+            _vno = int(_s.get('vouch_no_consensus', 0))
+            _vfew = int(_s.get('vouch_too_few', 0))
+            _vg = _s.get('vouch_gamma')
+            print(f'DEBUG: DS->DS   {_vc:,} still unresolved over '
+                  f'{int(_s.get("vouch_arcs", 0)):,} arcs to attached DS',
+                  flush=True)
+            print(f'DEBUG:          {int(_s.get("vouch_admissible", 0)):,} held '
+                  f'an admissible arc: {_va:,} attached, {_vno:,} did not'
+                  + (f'   gamma p50 {np.median(_vg):.3f}'
+                     if _vg is not None and len(_vg) else ''), flush=True)
+            print(f'DEBUG:          of those {_vno:,}: {_vfew:,} had too few '
+                  f'partners, {_vno - _vfew:,} had enough and disagreed',
+                  flush=True)
+            _vx2 = _s.get('vouch_cross_component_votes')
+            if _vx2 is not None:
+                print(f'DEBUG:          cross-component votes among attached: '
+                      f'{int(_vx2):,}' + ('' if _vx2 == 0 else '   <-- BUG'),
+                      flush=True)
+        print(f'DEBUG: total    {len(_s.get("iy", ())):,} PS + {_att:,} DS'
+              + (f' + {_va:,} DS->DS' if _va else '')
+              + f' = {len(_s.get("iy", ())) + _att + _va:,} measured pixels',
+              flush=True)
     return lab_out, vel_out, hgt_out, sea_out, coh_out
