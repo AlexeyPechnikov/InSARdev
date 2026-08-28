@@ -1929,7 +1929,7 @@ def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
 
 def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                        window=(32, 128), threshold=0.5, cell=(2, 8),
-                       geometry, budget=None, densify=True,
+                       geometry, budget=None, level=1,
                        max_dh=100.0, max_dv=50.0, step_dh=4.0, step_dv=2.0,
                        max_seasonal=5.0,
                        consensus, device='cpu', iterations=8, debug=False):
@@ -2393,7 +2393,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # the whole point of attaching rather than solving it alone. One that does
     # not clear it stays NaN: a DS with no coherent path to the network has no
     # datum, and a value written without one would be a different network's.
-    if densify:
+    if level >= 1:
         cand_ds = np.isfinite(q) & (q >= float(threshold))
         cand_ds[iy[sel][kk], ix[sel][kk]] = False        # nodes are not DS here
         dy_, dx_ = np.where(cand_ds)
@@ -2503,7 +2503,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         # that far. A DS carries no such certificate, so it may only vouch
         # inside the window it was itself measured in.
         _st = _3d_fit_ps_array.stats
-        if _ma is not None and int(_st.get('ds_attached', 0)):
+        if level >= 2 and _ma is not None and int(_st.get('ds_attached', 0)):
             _by, _bx = _st['ds_iy'], _st['ds_ix']
             _done = np.zeros((ny, nx), dtype=bool)
             _done[iy[sel][kk], ix[sel][kk]] = True
@@ -2540,6 +2540,16 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     _bvel = _st['ds_velocity_rad_yr'].astype(float)
                     _bhgt = _st['ds_height_rad'].astype(float)
                     _bsea = _st['ds_seasonal_rad']
+                    # THE REPRESENTATIVE IS THE HIGHEST-GAMMA SURVIVOR.
+                    # Two error terms are in play -- the new arc's, and the
+                    # base's own inherited one -- and only the first is
+                    # selectable here. Choosing instead on the base's
+                    # attachment coherence was measured and is WORSE: base
+                    # gamma says how coherently that DS attached, not how
+                    # correct its value is, so optimising for it selects
+                    # confidence rather than accuracy. The inherited error is
+                    # bounded by the gate, which has already discarded every
+                    # partner whose value disagreed.
                     v2first, v2votes, _okv = _3d_partner_consensus(
                         ds_s, gd, goodd, _bvel[ds_t] + vd, len(vy),
                         _ma, _ar, _ii,
@@ -2572,8 +2582,8 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         _s = _3d_fit_ps_array.stats
         _att = int(_s.get('ds_attached', 0))
         _cnd = int(_s.get('ds_candidates', 0))
-        if not densify:
-            print('DEBUG: DS       densify=False -- nodes only', flush=True)
+        if level < 1:
+            print('DEBUG: DS       level=0 -- the PS network only', flush=True)
         elif _cnd:
             print(f'DEBUG: DS       {_cnd:,} candidates, '
                   f'{int(_s.get("ds_reached", 0)):,} reached a node over '
