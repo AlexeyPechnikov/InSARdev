@@ -16,20 +16,6 @@ import numpy as np
 
 
 _RAYLEIGH_MEAN = np.sqrt(np.pi) / 2.0
-
-# The per-arc search is a lattice followed by a majorise-minimise refinement
-# (_3d_arc_fit). The refinement's step contracts by exactly (1 - gamma) per
-# iteration, so the count follows from the gate rather than from taste: at a
-# 0.4 gate the contraction is 0.6 and eight iterations leave 0.6^8 = 1.7% of a
-# lattice cell -- 0.07 m at step_dh = 4, 0.03 mm/yr at step_dv = 2. Refining
-# far below the step it sits inside buys nothing.
-#
-# THIS DOMINATES THE ATTACHMENT once the lattice is bounded sensibly: stage 1
-# is one GEMM over the box while stage 2 runs every arc this many times, so
-# halving it halves the larger half. It is a convergence fact, not a tuning
-# knob, which is why it is not a parameter.
-_MM_ITERS = 8
-
 # The scan runs this much wider than the caller's max_dh/max_dv so that their
 # range is entirely interior: a solution at 0.99 * max is found on its merits,
 # not pinned against a boundary. Solutions landing in the guard band are
@@ -450,7 +436,7 @@ def _3d_windows(window):
 
 
 def _3d_ps_kernel(block, window, quality, ele2phase, t, meter2rad,
-                  threshold=0.5, budget_mb=None):
+                  threshold=0.5, budget_mb=None, device='cpu', iterations=8):
     """Fitted arc coherence to ONE partner per bearing -- the PS test.
 
     A persistent scatterer carries no dominant noise, so an arc to a distant
@@ -704,7 +690,8 @@ A NINE-PATCH RING AROUND EVERY CANDIDATE. The centre patch is the pixel's
         # dropping it here would silently size the fit's largest operand by the
         # 128 MB default whatever the caller configured.
         g, _, _, _ = _3d_arc_fit(np.ascontiguousarray(arc), ele2phase, t, meter2rad,
-                              budget=budget_mb)
+                              budget=budget_mb, device=device,
+                              iterations=iterations)
         for e in (a_, b_):
             np.maximum.at(best, e, np.where(np.isfinite(g), g, -1.0))
     out[ly, lx] = np.where(best >= 0, best, np.nan)
@@ -836,7 +823,8 @@ def _3d_arcs_select(U, quality, window, threshold, cell=(2, 8)):
 
 
 def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=50.0,
-                step_dh=4.0, step_dv=2.0, budget=None, max_seasonal=5.0):
+                step_dh=4.0, step_dv=2.0, budget=None, max_seasonal=5.0,
+                device='cpu', iterations=8):
     """Joint (height, velocity) fit on many arcs at once, WITHOUT priors.
 
     arc     : (n_dates, n_arcs) COMPLEX arc, u_i * conj(u_j). Phase never
@@ -997,7 +985,8 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=50.0,
             sl = slice(s0, min(s0 + step, m))
             gs[sl], hs[sl], vs[sl], ss[sl] = _3d_arc_fit(
                 arc[:, sl], ele2phase, t, meter2rad, max_dh, max_dv,
-                step_dh, step_dv, budget, max_seasonal)
+                step_dh, step_dv, budget, max_seasonal, device,
+                iterations)
         return gs, hs, vs, ss
 
     A = np.abs(arc)
@@ -1008,13 +997,33 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=50.0,
     hh = (np.zeros_like(tt) if no_h
           else np.asarray(ele2phase, dtype=np.float64) * meter2rad)
 
+    # BOTH STAGES RUN ON THE GPU WHEN ONE IS ASKED FOR. They are large regular
+    # kernels -- one product and a fixed loop -- so they map straight across
+    # and the arithmetic is identical rather than approximated. Whether that
+    # pays at a given batch size is HARDWARE, not something to hardcode: the
+    # batch follows the dask chunk budget, and a device with cheap launches
+    # wins at sizes where one with expensive launches does not. `device` is
+    # honoured as asked; `budget` is the dial that sizes the work.
+    _dev = None
+    if device not in (None, 'cpu'):
+        from .utils_torch import get_torch_device
+        _d = str(getattr(get_torch_device(device), 'type', 'cpu'))
+        if _d != 'cpu':
+            _dev = _d
+
     # ---- stage 1: lattice, one product ---------------------------------
     P = np.stack(np.meshgrid(gh, gv, indexing='ij'), -1).reshape(-1, 2)
     C = np.exp(-1j * (np.outer(hh, P[:, 0])
                       + np.outer(tt, P[:, 1]))).astype(np.complex64)
     # no division by nv here: it is constant per arc, so it cannot move the
     # argmax, and gamma is computed once at the end from the refined model
-    k = np.argmax(np.abs(Z.T @ C), axis=1)
+    if _dev is not None:
+        import torch
+        _Zg = torch.from_numpy(Z).to(_dev)
+        k = torch.argmax(torch.abs(_Zg.T @ torch.from_numpy(C).to(_dev)),
+                         dim=1).cpu().numpy()
+    else:
+        k = np.argmax(np.abs(Z.T @ C), axis=1)
     if not (max_seasonal and max_seasonal > 0):
         del C                      # kept below: the seasonal stage re-solves on it
     TH0 = (P[k][:, 1:] if no_h else P[k]).astype(np.float64)
@@ -1036,12 +1045,38 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=50.0,
     _sc = np.linalg.norm(U, axis=0)
     _sc = np.where(_sc > 0, _sc, 1.0)
     PINV = np.linalg.pinv(U / _sc) / _sc[:, None]
-    TH = TH0.copy()
-    for _ in range(_MM_ITERS):
-        R = Z * np.exp(-1j * (U @ TH.T)).astype(np.complex64)
-        mu = R.sum(axis=0)
-        R *= np.conj(mu / np.where(np.abs(mu) > 0, np.abs(mu), 1.0))[None, :]
-        TH = TH + (PINV @ R.imag).T
+    if iterations <= 0:
+        # NO REFINEMENT: the lattice argmax IS the answer. The refinement
+        # starts at that argmax and stays
+        # inside that cell, so the lattice value already orders candidates the
+        # way the refined one does -- close enough to choose WHICH partners
+        # are worth refining. It is the same code and the same model, just
+        # stopped one step early; the chosen few are then refined normally.
+        TH = TH0
+    elif _dev is not None:
+        import torch
+        _U = torch.from_numpy(U.astype(np.float32)).to(_dev)
+        _P = torch.from_numpy(PINV.astype(np.float32)).to(_dev)
+        _TH = torch.from_numpy(TH0.astype(np.float32)).to(_dev)
+        for _ in range(iterations):
+            _ph = _U @ _TH.T
+            _R = _Zg * torch.exp(torch.complex(torch.zeros_like(_ph), -_ph))
+            _mu = _R.sum(dim=0)
+            _am = torch.abs(_mu)
+            _R = _R * torch.conj(
+                _mu / torch.where(_am > 0, _am, torch.ones_like(_am)))[None, :]
+            _TH = _TH + (_P @ _R.imag).T
+        TH = _TH.cpu().numpy().astype(np.float64)
+        del _Zg, _U, _P, _TH, _ph, _R, _mu, _am
+        if _dev == 'mps':
+            torch.mps.empty_cache()
+    else:
+        TH = TH0.copy()
+        for _ in range(iterations):
+            R = Z * np.exp(-1j * (U @ TH.T)).astype(np.complex64)
+            mu = R.sum(axis=0)
+            R *= np.conj(mu / np.where(np.abs(mu) > 0, np.abs(mu), 1.0))[None, :]
+            TH = TH + (PINV @ R.imag).T
 
     R = Z * np.exp(-1j * (U @ TH.T)).astype(np.complex64)
     gam = (np.abs(R.sum(axis=0)) / np.maximum(nv, 1)).astype(np.float32)
@@ -1212,7 +1247,7 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=50.0,
                     TH_r = (P[k2][:, 1:] if no_h else P[k2]).astype(np.float64)
                     del Cm
             THs = bth
-            for _ in range(_MM_ITERS):
+            for _ in range(iterations):
                 Rs = Z * np.exp(-1j * (Us @ THs.T)).astype(np.complex64)
                 mus = Rs.sum(axis=0)
                 Rs *= np.conj(mus / np.where(np.abs(mus) > 0,
@@ -1682,7 +1717,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                        geometry, degree=50, budget=None, densify=True,
                        max_dh=100.0, max_dv=50.0, step_dh=4.0, step_dv=2.0,
                        max_seasonal=5.0,
-                       consensus):
+                       consensus, device='cpu', iterations=8):
     """Ground phase and velocity at PERSISTENT scatterers, per connected component.
 
     The measurement is per ARC, never per pixel: a single scatterer carries an
@@ -1790,7 +1825,8 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # ---- the nodes: PS, not DS -----------------------------------------
     q = _3d_arcs_kernel(S, wy, wx, tuple(cell), budget)
     ps = _3d_ps_kernel(S, (wy, wx, pey, pex), q, ele2phase, t, meter2rad,
-                       threshold=float(threshold), budget_mb=budget)
+                       threshold=float(threshold), budget_mb=budget,
+                       device=device, iterations=iterations)
     iy, ix = np.where(np.isfinite(ps) & (ps >= float(threshold)))
     if len(iy) < 2:
         return lab_out, vel_out, hgt_out, sea_out, coh_out
@@ -1820,7 +1856,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             (Un[:, ai[s_]] * np.conj(Un[:, aj[s_]])).astype(np.complex64))
         g[s_], dh[s_], dv[s_], ds_[s_] = _3d_arc_fit(
             arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-            budget, max_seasonal)
+            budget, max_seasonal, device, iterations=iterations)
     keep = np.isfinite(g) & (g >= float(threshold))
     if keep.sum() < 3:
         return lab_out, vel_out, hgt_out, sea_out, coh_out
@@ -2131,9 +2167,52 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # long enough for a real differential to exist. That is the
                     # physically right split: the network measures the seasonal,
                     # the attachment transfers it.
+                    # RANK FIRST, REFINE THE SHORTLIST. Only `min_agreeing`
+                    # partners are used, so refining all of them spends the
+                    # larger half of the fit on candidates that are discarded a
+                    # few lines below. Ranking needs the model only well
+                    # enough to order it, and the refinement cannot leave its
+                    # own lattice cell, so it reorders neighbours at most.
+                    #
+                    # ONE PASS, NOT ZERO. The lattice alone scores every
+                    # candidate at a QUANTISED model: neighbours can land on
+                    # the same grid point and tie exactly, and even untied the
+                    # score is a grid-resolution estimate rather than the
+                    # candidate's own optimum. One pass moves each off its
+                    # shared point into its own cell, which is what separates
+                    # them; further passes converge inside a cell already
+                    # separated and reorder nothing.
                     ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
                         arc2, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-                        budget, 0.0)
+                        budget, 0.0, device, iterations=1)
+                # REFINE EXACTLY WHAT WILL BE USED. `consensus` says how many
+                # partners the answer rests on, so that is how many are worth
+                # refining -- no separate width to choose or keep in step. The
+                # lattice ranking is what picks them, and it can do that because
+                # the refinement never leaves its own lattice cell: it reorders
+                # neighbours rather than moving a candidate across the field.
+                _short = int(_ma) if _ma is not None else len(src)
+                _ord = np.lexsort((-np.where(np.isfinite(ga), ga, -np.inf), src))
+                _cnt0 = np.bincount(src[_ord], minlength=len(dy_))
+                _off0 = np.r_[0, np.cumsum(_cnt0)[:-1]]
+                _col0 = np.arange(len(_ord)) - np.repeat(_off0, _cnt0)
+                _keep = _ord[_col0 < _short]
+                if len(_keep):
+                    ad = np.abs(S[:, dy_[src[_keep]], dx_[src[_keep]]])
+                    ud = np.where(ad > 0, S[:, dy_[src[_keep]], dx_[src[_keep]]]
+                                  / np.where(ad > 0, ad, 1), 0)
+                    arc3 = np.ascontiguousarray(
+                        (ud * np.conj(Un[:, sel][:, kk][:, tgt[_keep]])
+                         ).astype(np.complex64))
+                    ga[_keep], dha[_keep], dva[_keep], dsa[_keep] = _3d_arc_fit(
+                        arc3, ele2phase, t, meter2rad, max_dh, max_dv,
+                        step_dh, step_dv, budget, 0.0, device,
+                        iterations=iterations)
+                    del arc3, ud, ad
+                # anything not refined cannot be used, whatever its lattice value
+                _unref = np.ones(len(src), dtype=bool)
+                _unref[_keep] = False
+                ga[_unref] = np.nan
                 good = np.isfinite(ga) & (ga >= float(threshold)) & np.isfinite(dha)
                 # THE PARTNERS ARE MEASUREMENTS, SO THEY ARE SOLVED THE WAY
                 # THE ARCS ARE. Each partner gives the DS a complete answer, so

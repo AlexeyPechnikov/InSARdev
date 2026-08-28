@@ -2885,6 +2885,7 @@ class BatchComplex(BatchCore):
             out[key] = pds
         return Batch(out)
 
+    @serialize_gpu
     def fit3d(self, threshold: float = 0.5, window: tuple = (32, 128),
                 cell: tuple = (2, 8), degree: int = 50,
                 baseline: str = 'BPR', budget: 'str | None' = None,
@@ -2892,7 +2893,8 @@ class BatchComplex(BatchCore):
                 max_dh: float = 100.0, max_dv: float = 50.0,
                 step_dh: float = 4.0, step_dv: float = 2.0,
                 max_seasonal: float = 5.0,
-                consensus: 'tuple | None' = (7, 5.0)) -> 'Batch':
+                consensus: 'tuple | None' = (8, 5.0),
+                device: str = 'auto', iterations: int = 8) -> 'Batch':
         """
         Fit a per-pixel (height, velocity, seasonal) model on a PS network.
 
@@ -2981,6 +2983,20 @@ class BatchComplex(BatchCore):
             and the arc fits with them.
         baseline : str
             Variable holding the perpendicular baseline per date.
+        iterations : int
+            Refinement passes per arc, for the arcs that reach the final fit. The per-arc search is a lattice followed
+            by a majorise-minimise refinement, and the refinement's step
+            contracts by exactly `(1 - gamma)` per pass -- so the useful count
+            follows from `threshold`, not from taste. At a 0.4 gate the
+            contraction is 0.6 and eight passes leave 0.6**8, under two percent
+            of a lattice cell: 0.07 m at `step_dh=4`, 0.03 mm/yr at
+            `step_dv=2`. Refining far below the step it sits inside buys
+            nothing.
+
+            It is also the larger half of the attachment's cost, since stage 1
+            is one product over the box while this runs on every arc this many
+            times. A lower `threshold` contracts more slowly and wants more
+            passes; a higher one wants fewer.
         consensus : tuple or None
             How much agreement is required before a value is reported, asked
             once for both halves of the solve: an arc must agree with the
@@ -3009,7 +3025,7 @@ class BatchComplex(BatchCore):
             many arcs a node needs to survive, so PS thin out as it rises.
 
             A bare `min_agreeing` uses the defaults for the rest;
-            `(min_agreeing, reject_sigma)` is the default (7, 5.0), and
+            `(min_agreeing, reject_sigma)` is the default (8, 5.0), and
             `(min_agreeing, reject_sigma, irls_passes)` sets the pass count too.
             Note `(3)` is just the integer 3 in Python -- the one-element tuple
             is `(3,)` -- and both are accepted.
@@ -3169,13 +3185,15 @@ class BatchComplex(BatchCore):
             threshold=threshold, window=window, cell=cell, degree=degree,
             baseline=baseline, budget=budget, densify=densify,
             max_dh=max_dh, max_dv=max_dv, step_dh=step_dh, step_dv=step_dv,
-            max_seasonal=max_seasonal, consensus=consensus)
+            max_seasonal=max_seasonal, consensus=consensus, device=device,
+            iterations=iterations)
 
 
 
     def _fit3d_ps_impl(self, threshold, window, cell, degree, baseline,
                          budget, max_dh, max_dv, step_dh, step_dv,
-                         max_seasonal, densify=True, consensus=(7, 5.0)):
+                         max_seasonal, densify=True, consensus=(8, 5.0),
+                         device='cpu', iterations=8):
         """The PS screen and its component labels, per dask block.
 
         One block at a time and no inter-block state, like arcs(): a component
@@ -3191,7 +3209,12 @@ class BatchComplex(BatchCore):
         from .Batch import Batch, Batches
         from .utils_dask import get_dask_chunk_size_mb
 
-        budget_mb = get_dask_chunk_size_mb() if budget is None else budget
+        # '4GB' -> 4096, as fit1d() does. Typed `str | None`, so a string has
+        # to be parsed rather than handed to float() further down.
+        from .BatchCore import _parse_budget
+        budget_mb = (get_dask_chunk_size_mb() if budget is None
+                     else _parse_budget(budget) if isinstance(budget, str)
+                     else float(budget))
         wy, wx, pey, pex = utils_arcs._3d_windows(window)
         # the geometry, not re-derived here
         _ep_batch = Batch._elevation_phase_approximate(self)
@@ -3245,13 +3268,14 @@ class BatchComplex(BatchCore):
                          _se=float(max_seasonal), _dn=bool(densify),
                          _cs=(consensus if consensus is None
                               or isinstance(consensus, (int, float))
-                              else tuple(consensus))):
+                              else tuple(consensus)),
+                         _dv2=str(device), _it=int(iterations)):
                     l, v, h, sa, cg = utils_arcs._3d_fit_ps_array(
                         block, _d, spacing=_sp, bperp=_bp, window=_w,
                         threshold=_t, cell=_c, geometry=_g, degree=_dg,
                         budget=_bm, densify=_dn, max_dh=_mh, max_dv=_mv,
                         step_dh=_sh, step_dv=_sv, max_seasonal=_se,
-                        consensus=_cs)
+                        consensus=_cs, device=_dv2, iterations=_it)
                     # ONE CONVENTION ACROSS EVERY FIT: displacement_los() must turn
                     # this model into a negative rate where the ground subsides,
                     # whichever fit produced it. _3d_arc_fit solves the per-DATE
