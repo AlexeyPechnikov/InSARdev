@@ -286,7 +286,13 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         fill_value=np.nan if (np.issubdtype(da_xr.dtype, np.floating) or np.issubdtype(da_xr.dtype, np.complexfloating)) else 0,
                     )
                     sources.append(da_xr.data)
-                    if da_xr.ndim >= 3 and not is_store_object:
+                    if not is_store_object:
+                        # ANY rank, not just 3D: TensorStore serialises
+                        # concurrent chunk writes itself, and that is what a
+                        # plain zarr target lacks. It needs a URI to open, so
+                        # the only case it cannot serve is a store OBJECT --
+                        # commonly a cloud-fs driver, which has no path to
+                        # hand it.
                         targets.append(_make_ts_target(z, store, var_name, group_path=grp,
                                                         storage_options=storage_options))
                     else:
@@ -323,18 +329,28 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         idx_3d = [i for i, s in enumerate(sources) if s.ndim >= 3]
         idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
 
-        # Write 2D sources directly (small, no contention)
+        # LOCK ONLY WHERE WE FELL BACK TO A PLAIN ZARR ARRAY. The array is
+        # created with a single uniform `chunksize`, while dask chunks may be
+        # IRREGULAR -- a 4088-wide axis split for a memory budget gives 66s
+        # with 65s among them. From the first odd block on, every dask block
+        # straddles two zarr chunks, so two of them read-modify-write the same
+        # chunk at once; unlocked, one loses and the region it should have
+        # written reads back as the fill value. Silent, because that fill is
+        # NaN and NaN is a legitimate value for these rasters.
+        #
+        # TensorStore handles exactly this, so with a path store nothing needs
+        # locking whatever the rank.
+        _lock = bool(is_store_object)
         if idx_2d:
             da.store([dask.optimize(sources[i])[0] for i in idx_2d],
-                     [targets[i] for i in idx_2d], lock=False)
+                     [targets[i] for i in idx_2d], lock=_lock)
 
-        # Write 3D sources via TensorStore targets (concurrent-safe, no lock needed).
         if idx_3d:
             if dim0_merged:
                 # 1D chunks: single pass, scheduler pipelines optimally
                 arrays = list(dask.optimize(*[sources[i] for i in idx_3d]))
                 store_arr = da.store(arrays, [targets[i] for i in idx_3d],
-                                    lock=False, compute=False)
+                                    lock=_lock, compute=False)
                 if _client is not None:
                     persisted = _client.persist(store_arr)
                     all_futures = futures_of(persisted)
@@ -359,7 +375,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                     k_end = min(k + batch_pairs, n_pairs)
                     arrays = list(dask.optimize(*[sources[i][k:k_end] for i in idx_3d]))
                     store_arr = da.store(arrays, [targets[i] for i in idx_3d],
-                                         lock=False, compute=False,
+                                         lock=_lock, compute=False,
                                          regions=[(slice(k, k_end),)] * len(arrays))
                     if _client is not None:
                         persisted = _client.persist(store_arr)
