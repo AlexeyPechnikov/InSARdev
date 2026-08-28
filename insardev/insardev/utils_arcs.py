@@ -399,6 +399,41 @@ def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget=None):
     return np.where(ok & seen, out, np.nan).astype(np.float32)
 
 
+def _3d_depth(chunks, window):
+    """Halo depth per axis, and the check that the given chunks can carry it.
+
+    `chunks` is (chunks_y, chunks_x) as dask reports them. Returns
+    (depth_y, depth_x).
+
+    An arc reaches at most half the PS extent from the pixel, so half is what a
+    block must see beyond its own edge. An axis held in ONE chunk already has
+    the whole raster and needs no halo -- and asking for one raises, because
+    dask refuses a depth wider than the array.
+
+    THE CHUNKING IS THE CALLER'S AND IS NEVER CHANGED HERE, only checked --
+    and checked before `da.overlap` is reached, because that calls
+    `ensure_minimum_chunksize()`, which silently re-splits any chunk shorter
+    than the depth into lengths of its own choosing. Refusing first is what
+    keeps the layout the caller asked for.
+
+    Blocks are solved independently, so a different chunking gives a different
+    set of scatterers near the seams. That is the design, not an error: a
+    pixel at a block edge sees the neighbourhood its block affords.
+    """
+    _, _, pey, pex = _3d_windows(window)
+    depth = []
+    for _cs, _w in zip((tuple(chunks[0]), tuple(chunks[1])), (pey, pex)):
+        if len(_cs) == 1:
+            depth.append(0)
+            continue
+        if min(_cs) < _w:
+            raise ValueError(f'chunk size {min(_cs)} less than processing '
+                             f'window size {_w}, enlarge chunks or decrease '
+                             f'window')
+        depth.append(_w // 2)
+    return tuple(depth)
+
+
 def _3d_windows(window):
     """(wy, wx) or (wy, wx, py, px) -> the DS box and the PS extent, validated.
 

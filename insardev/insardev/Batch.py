@@ -3329,10 +3329,28 @@ class BatchComplex(BatchCore):
                 # FIVE planes out, never n_dates+5: the kernel no longer builds a
                 # phase it would only have to throw away. predict(model)
                 # reconstructs phase when a caller actually wants it.
-                both = da.map_blocks(
-                    _blk, dsk, dtype=np.complex64,
-                    chunks=((5,),) + dsk.chunks[1:],
-                    meta=np.empty((0, 0, 0), np.complex64))
+                # THE SAME HALO arcs() USES, AND FOR THE SAME REASON. Each
+                # block is still solved on its own and nothing is merged
+                # across them -- a component is a property of the arcs inside
+                # one block -- but a node at a block edge has to be able to
+                # REACH its partners, and they lie out to the PS extent. With
+                # no halo a narrow block held no complete network and returned
+                # an empty raster, so the chunking silently decided what the
+                # answer was.
+                #
+                # The depth, and the check that the chunks can carry it,
+                # come from `_3d_depth` -- the one place that decides how far
+                # the arc search reaches, so this and arcs() cannot disagree.
+                from dask.array.overlap import overlap, trim_internal
+                dep_y, dep_x = utils_arcs._3d_depth(dsk.chunks[1:], window)
+                _dep = {0: 0, 1: int(dep_y), 2: int(dep_x)}
+                _ov = overlap(dsk, depth=_dep, boundary='none')
+                both = trim_internal(
+                    da.map_blocks(
+                        _blk, _ov, dtype=np.complex64,
+                        chunks=((5,),) + _ov.chunks[1:],
+                        meta=np.empty((0, 0, 0), np.complex64)),
+                    _dep)
                 lb = both[0].real.astype(np.int8)
                 vv = both[1].real.astype(np.float32)
                 hh_ = both[2].real.astype(np.float32)
