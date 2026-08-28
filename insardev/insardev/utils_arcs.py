@@ -39,8 +39,8 @@ _ARC_CANDIDATES = 6
 # The most components one solve may return. It is the int8 label's capacity,
 # not a preference: past 127 a label folds onto another and two unrelated
 # datums read as one. It also bounds the work -- every component costs its own
-# kriging pass, so an unbounded count is how `degree` set too low turns into
-# thousands of solves over a single raster.
+# kriging pass, so a shattered network would otherwise turn into thousands of
+# solves over a single raster.
 _MAX_COMPONENTS = 127
 
 # Reweighting passes used to find arcs the network contradicts. The weights
@@ -217,7 +217,7 @@ def _3d_arc_offsets(window_y, window_x, cell_y=2, cell_x=8):
             for dx in range(-(window_x // 2), window_x // 2 + 1)
             if (dy or dx) and not (abs(dy) < cell_y and abs(dx) < cell_x)]
 
-def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget_mb=None):
+def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget=None):
     """The BEST arc coherence each pixel reaches -- its PS quality.
 
     For every admissible separation (dy, dx) the whole raster is correlated
@@ -245,7 +245,7 @@ def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget_mb=None):
     +-window//2, so `window` is the full extent, not the reach in one
     direction.
 
-    budget_mb sizes the transient working set and MUST be resolved by the
+    budget sizes the transient working set and MUST be resolved by the
     caller, in the main process: dask workers are separate processes and do
     not inherit dask.config, so reading `array.chunk-size` in here would
     return the 128 MB default whatever the notebook set (see Stack.py:1435
@@ -345,7 +345,7 @@ def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget_mb=None):
     # One setting the caller has already tuned for its machine governs this
     # too, so a large window cannot silently allocate hundreds of MB per dask
     # thread while still honouring a raised budget when there is room.
-    tile_cap = _3d_budget_mb(budget_mb) * 1024 * 1024
+    tile_cap = _3d_budget_mb(budget) * 1024 * 1024
     Bx = max(1, hx)
     while Bx > 8:
         span_ = Bx + 2 * hx
@@ -436,7 +436,7 @@ def _3d_windows(window):
 
 
 def _3d_ps_kernel(block, window, quality, ele2phase, t, meter2rad,
-                  threshold=0.5, budget_mb=None, device='cpu', iterations=8):
+                  threshold=0.5, budget=None, device='cpu', iterations=8):
     """Fitted arc coherence to ONE partner per bearing -- the PS test.
 
     A persistent scatterer carries no dominant noise, so an arc to a distant
@@ -554,7 +554,7 @@ A NINE-PATCH RING AROUND EVERY CANDIDATE. The centre patch is the pixel's
     # a few hundred columns. Only candidates can become nodes, so only candidates are
     # tested, and the batch is sized by the dask budget like every other
     # transient here.
-    cap = max(1, int(_3d_budget_mb(budget_mb) * 1024 * 1024
+    cap = max(1, int(_3d_budget_mb(budget) * 1024 * 1024
                      // max(len(iy) * 16, 1)))
     ok = np.ones(len(iy), dtype=bool)
     for d0 in range(0, n, cap):
@@ -681,7 +681,7 @@ A NINE-PATCH RING AROUND EVERY CANDIDATE. The centre patch is the pixel's
     # seeded BELOW any coherence, not with NaN: np.maximum(nan, x) is nan, so a
     # NaN seed makes every update a no-op and nothing is ever scored
     best = np.full(len(lead), -1.0, dtype=np.float32)
-    step = max(1, int(_3d_budget_mb(budget_mb) * 1024 * 1024 // max(n * 16, 1)))
+    step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 16, 1)))
     for b0 in range(0, len(src), step):
         a_, b_ = src[b0:b0 + step], tgt[b0:b0 + step]
         arc = (Un[:, a_] * np.conj(Un[:, b_])).astype(np.complex64)
@@ -690,7 +690,7 @@ A NINE-PATCH RING AROUND EVERY CANDIDATE. The centre patch is the pixel's
         # dropping it here would silently size the fit's largest operand by the
         # 128 MB default whatever the caller configured.
         g, _, _, _ = _3d_arc_fit(np.ascontiguousarray(arc), ele2phase, t, meter2rad,
-                              budget=budget_mb, device=device,
+                              budget=budget, device=device,
                               iterations=iterations)
         for e in (a_, b_):
             np.maximum.at(best, e, np.where(np.isfinite(g), g, -1.0))
@@ -1684,7 +1684,7 @@ def _3d_krige(vals, py, px, ny, nx, spacing, window, nlags=24):
     # node contributes at all. Stricter cuts keep buying smoothness, trading
     # coverage away as they go -- but those are preferences about how much
     # ground to trade for how much
-    # quiet, and the caller controls that already through `window` and `degree`.
+    # quiet, and the caller controls that already through `window`.
     den2 = fftconvolve(mask, (K ** 2).astype(np.float32), mode='same')
     with np.errstate(invalid='ignore', divide='ignore'):
         neff = np.where(den2 > 0, den ** 2 / np.maximum(den2, 1e-30), 0.0)
@@ -1714,10 +1714,10 @@ def _3d_krige(vals, py, px, ny, nx, spacing, window, nlags=24):
 
 def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                        window=(32, 128), threshold=0.5, cell=(2, 8),
-                       geometry, degree=50, budget=None, densify=True,
+                       geometry, budget=None, densify=True,
                        max_dh=100.0, max_dv=50.0, step_dh=4.0, step_dv=2.0,
                        max_seasonal=5.0,
-                       consensus, device='cpu', iterations=8):
+                       consensus, device='cpu', iterations=8, debug=False):
     """Ground phase and velocity at PERSISTENT scatterers, per connected component.
 
     The measurement is per ARC, never per pixel: a single scatterer carries an
@@ -1806,10 +1806,6 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     sy, sx = float(spacing[0]), float(spacing[1])
     if not (sy > 0 and sx > 0):
         raise ValueError(f'spacing must be positive, got {spacing}')
-    deg_max = int(degree)
-    if deg_max < 1:
-        raise ValueError(f'degree must be at least 1, got {degree}')
-
     t = np.asarray(date_values)
     if t.dtype.kind == 'M':
         t = t.astype('datetime64[D]').astype(np.float64)
@@ -1825,10 +1821,16 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # ---- the nodes: PS, not DS -----------------------------------------
     q = _3d_arcs_kernel(S, wy, wx, tuple(cell), budget)
     ps = _3d_ps_kernel(S, (wy, wx, pey, pex), q, ele2phase, t, meter2rad,
-                       threshold=float(threshold), budget_mb=budget,
+                       threshold=float(threshold), budget=budget,
                        device=device, iterations=iterations)
     iy, ix = np.where(np.isfinite(ps) & (ps >= float(threshold)))
+    if debug:
+        _cand = int(np.count_nonzero(np.isfinite(q) & (q >= float(threshold))))
+        print(f'DEBUG: PS test  {len(iy)} nodes at >= {float(threshold)}'
+              f'  ({_cand} DS candidates in the same raster)', flush=True)
     if len(iy) < 2:
+        if debug:
+            print('DEBUG: fewer than 2 nodes -- nothing to solve', flush=True)
         return lab_out, vel_out, hgt_out, sea_out, coh_out
     a = np.abs(S[:, iy, ix])
     with np.errstate(invalid='ignore', divide='ignore'):
@@ -1858,36 +1860,43 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
             budget, max_seasonal, device, iterations=iterations)
     keep = np.isfinite(g) & (g >= float(threshold))
+    if debug:
+        _gk = g[keep]
+        print(f'DEBUG: arcs     {len(ai):,} pairs fitted, {int(keep.sum()):,} '
+              f'>= {float(threshold)}  ({100 * keep.mean():.1f}%)', flush=True)
+        if keep.any():
+            print(f'DEBUG:          arc gamma p50 {np.median(_gk):.3f}  '
+                  f'p90 {np.percentile(_gk, 90):.3f}  max {_gk.max():.3f}',
+                  flush=True)
     if keep.sum() < 3:
+        if debug:
+            print('DEBUG: fewer than 3 arcs cleared the threshold', flush=True)
         return lab_out, vel_out, hgt_out, sea_out, coh_out
     ai, aj, dh, dv, ds_ = ai[keep], aj[keep], dh[keep], dv[keep], ds_[keep]
     gk = g[keep]
 
-    # ---- AT MOST `degree` ARCS PER NODE, BEST FIRST ---------------------
-    # `degree` caps how many arcs a node carries; it does not decide which
-    # nodes survive. Every node the PS test found stays a node -- dropping one
-    # would throw away a scatterer the data certified -- and what the cap
-    # controls is how much redundancy the network is built with.
+    # ---- EVERY ARC THE FIT CERTIFIED ENTERS THE NETWORK -----------------
+    # No cap. An arc that cleared `threshold` is a measurement, and the only
+    # reason to refuse one would be cost -- which there is none of: the pairs
+    # are ALREADY FITTED above, before anything could select among them, so
+    # discarding some afterwards saves no fitting at all. It only shrinks the
+    # least-squares system, and that system is thousands of rows against the
+    # millions of arcs the attachment fits.
     #
-    # That redundancy is what the screen is made of. Split the arcs into two
-    # disjoint halves and compare the screens they produce independently: the
-    # disagreement falls as degree rises, and too few arcs per node leave the
-    # network in disconnected pieces. Arcs are taken best-first by fitted
-    # coherence, so a cap spends its budget on the arcs most likely to be real.
+    # What a cap did cost was connectivity. Taking a fixed number of arcs per
+    # node best-first spends a node's budget on its closest, most coherent
+    # neighbours -- which are the arcs most likely to be redundant with each
+    # other -- and the long arcs that tie distant groups together are exactly
+    # the ones it drops. The network then falls into pieces, each piece gets
+    # its own free datum, and pixels near the seam are lost twice over: their
+    # velocities are no longer comparable, and a DS drawing partners from both
+    # sides sees them disagree by the datum offset and is rejected.
+    #
+    # Redundancy is still what the screen is made of; it is simply taken
+    # rather than rationed, and the robust pass below decides which arcs the
+    # network believes.
     N = len(iy)
-    order = np.argsort(-gk)
-    dcount = np.zeros(N, dtype=np.int64)
-    take = np.zeros(len(ai), dtype=bool)
-    for e in order:
-        a_, b_ = ai[e], aj[e]
-        if dcount[a_] < deg_max or dcount[b_] < deg_max:
-            take[e] = True
-            dcount[a_] += 1
-            dcount[b_] += 1
-    if take.sum() < 3:
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
-    ai, aj, dh, dv, ds_ = ai[take], aj[take], dh[take], dv[take], ds_[take]
-    gtake = gk[take]
+    gtake = gk
 
     def _incidence(a_, b_, m):
         return coo_matrix((np.tile([1.0, -1.0], m),
@@ -1965,6 +1974,10 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     if keep_arc.sum() < 3:
         return lab_out, vel_out, hgt_out, sea_out, coh_out
     rejected = int((~keep_arc).sum())
+    if debug:
+        print(f'DEBUG: IRLS     {rejected:,} of {len(ai):,} arcs rejected '
+              f'beyond {_ar} sigma  ({100 * rejected / max(len(ai), 1):.1f}%)',
+              flush=True)
     # how much of each node's own support the rejection took away
     drej = np.bincount(np.r_[ai[~keep_arc], aj[~keep_arc]], minlength=N)
     ai, aj, dh, dv, ds_, gtake = (ai[keep_arc], aj[keep_arc], dh[keep_arc],
@@ -1976,14 +1989,25 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     gnode = np.where(dcount > 0, _gsum / np.maximum(dcount, 1), np.nan)
     ncomp, lab = connected_components(
         coo_matrix((np.ones(len(ai)), (ai, aj)), shape=(N, N)), directed=False)
-    # A NODE THE REJECTION LEFT UNSUPPORTED IS NOT A NODE. Rejecting an arc
-    # takes that arc's evidence away from both of its ends, so a node can come
-    # out of the robust pass holding fewer arcs than make it testable -- with
-    # one arc an error is invisible, with two it cannot be localised. Such a
-    # node is attached, not measured, and it leaves the rasters, the stats and
-    # the DS attachment together: a DS hung on it would inherit a datum that
-    # nothing in the network can check.
-    live = dcount >= (_ma if _ma is not None else 1)
+    # CONNECTED IS THE ONLY REQUIREMENT. A node with no surviving arc has no
+    # datum -- nothing places it against anything else -- so it cannot be
+    # reported. One surviving arc is enough, because of WHAT survival means
+    # here: the robust pass has already rejected every arc the network
+    # contradicts, so a node holding one arc holds one the network AGREES
+    # with. Counting arcs a second time would re-ask a question the rejection
+    # already answered.
+    #
+    # Whether a pixel IS a PS is settled by the PS test; how many network arcs
+    # it happens to receive depends only on how well connected its neighbours
+    # are. Requiring more than one here let that decide how many PS exist.
+    live = dcount >= 1
+    if debug:
+        # NODES LOST BEFORE ANY COMPONENT EXISTS. A node whose every arc was
+        # rejected holds no datum and cannot be reported. Counted separately
+        # from the component floor below: the two are different losses at
+        # different stages, and a single "kept" total hides which is which.
+        print(f'DEBUG: solve     {int((~live).sum())} of {len(live)} nodes '
+              f'left with no surviving arc', flush=True)
     if not live.any():
         return lab_out, vel_out, hgt_out, sea_out, coh_out
 
@@ -2028,15 +2052,19 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
 
     sy_, sx_ = iy[sel], ix[sel]
     comps = []
-    # A COMPONENT MUST BE ABLE TO CARRY THE REQUESTED REDUNDANCY. Degree
-    # cannot exceed n-1 inside an n-node component, so one with `degree`
-    # nodes or fewer can never be built to the density the caller asked for
-    # -- it is not a sparser answer, it is a weaker and differently-datumed
-    # one. This is the caller's own parameter deciding it, not a second
-    # threshold: ask for less redundancy and smaller components qualify.
+    # A COMPONENT MUST BE ABLE TO MEET THE CONSENSUS IT IS JUDGED BY. Each
+    # component carries its own free datum, so a small one is not a sparser
+    # answer -- it is a separately-datumed one, resting on however few arcs
+    # its handful of nodes could form. `consensus` already states how many
+    # agreeing measurements a value must rest on before it is reported; a
+    # component with fewer nodes than that cannot supply them even in
+    # principle. It is the caller's own requirement applied to the network
+    # itself, not a second threshold: ask for less and smaller ones qualify,
+    # and with `consensus=None` the check is off along with all the others.
+    _cmin = int(_ma) if _ma is not None else 1
     for c in np.unique(lab[sel]):
         k = np.where(lab[sel] == c)[0]
-        if len(k) <= deg_max:
+        if len(k) < _cmin:
             continue
         comps.append((len(k), float(np.median(dcount[sel][k])), k))
     if not comps:
@@ -2045,6 +2073,23 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # fold component 128 onto -128 and two unrelated datums would read as one.
     # What is dropped is the smallest, which is also the least trustworthy.
     comps.sort(key=lambda c: -c[0])
+    if debug:
+        _seen = sorted((int((lab[sel] == c).sum())
+                        for c in np.unique(lab[sel])), reverse=True)
+        _drop = [z for z in _seen if z < _cmin]
+        print(f'DEBUG: network  {len(_seen)} connected component(s); '
+              f'{len(_drop)} below the {_cmin}-node consensus floor',
+              flush=True)
+        for _n_, _d_, _k_ in comps:
+            print(f'DEBUG:          size {_n_:>6,}   arcs/node {_d_:5.1f}',
+                  flush=True)
+        if _drop:
+            # SIZES, not just a count. "3 dropped" hides whether that is six
+            # nodes or twenty; the floor is per COMPONENT, so a total far
+            # above it can still be made of pieces every one of which is
+            # below it.
+            print(f'DEBUG:          dropped sizes {_drop}  '
+                  f'= {sum(_drop)} nodes, each below {_cmin}', flush=True)
     dropped = max(0, len(comps) - _MAX_COMPONENTS)
     comps = comps[:_MAX_COMPONENTS]
     order_size = sorted(range(len(comps)), key=lambda z: -comps[z][0])
@@ -2091,6 +2136,19 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         height_rad=hgt[sel][kk].astype(np.float32),
         velocity_rad_yr=vel[sel][kk].astype(np.float32),
         seasonal_rad=(anr[sel][kk] + 1j * ani[sel][kk]).astype(np.complex64))
+
+    if debug:
+        _dn = dcount[sel][kk]
+        _gn = gnode[sel][kk]
+        _gn = _gn[np.isfinite(_gn)]
+        print(f'DEBUG: solved   {len(kk)} of {len(live)} nodes kept, '
+              f'{int(dropped)} component(s) dropped past the int8 label limit',
+              flush=True)
+        print(f'DEBUG:          arcs/node p50 {np.median(_dn):.0f}  '
+              f'min {_dn.min()}  max {_dn.max()}', flush=True)
+        if len(_gn):
+            print(f'DEBUG:          node gamma p50 {np.median(_gn):.3f}  '
+                  f'p10 {np.percentile(_gn, 10):.3f}', flush=True)
 
     # ---- attach the DS to the network ----------------------------------
     # THE PS EXTENT IS THE REACH, NOT THE DS WINDOW. A PS is defined by holding
@@ -2188,6 +2246,83 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
                         arc2, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
                         budget, 0.0, device, iterations=1)
+                # ONE COMPONENT PER DS. Every component carries its own
+                # free datum, so partners drawn from two of them disagree by
+                # that offset however good each arc is. A DS at a seam would
+                # then see its best partners contradict one another and be
+                # rejected for a disagreement that is bookkeeping rather than
+                # measurement -- and a seam is precisely where the network is
+                # thinnest and the extra reach matters most. So the candidates
+                # are cut to a single component first and the consensus is
+                # sought inside it, which is what makes the surviving votes
+                # comparable at all.
+                #
+                # WHICH component is decided by the quantity the answer will
+                # rest on: the coherence of its `min_agreeing`-th best arc,
+                # the weakest partner the consensus would be built from. One
+                # that cannot field that many cannot answer, and is not asked.
+                # With a single component -- what an uncapped network gives on
+                # connected ground -- none of this runs.
+                if _ma is not None and len(comps) > 1:
+                    # THE BEST PARTNER NAMES THE COMPONENT, AND THEN ONLY ITS
+                    # NODES ARE USED. A DS reaches every node inside its
+                    # extent regardless of which component that node belongs
+                    # to; the single most coherent arc says which network this
+                    # pixel belongs to, and the consensus is then sought among
+                    # that component's nodes alone.
+                    #
+                    # It is the ONE criterion available before any value is
+                    # read. Scoring a component by whether it can field
+                    # `min_agreeing` good partners -- what this did first --
+                    # picks the component most likely to PASS, which is
+                    # choosing to suit the answer: a DS whose best arc by far
+                    # sits in a small component would be handed to a larger
+                    # one it agrees with less, purely because the larger one
+                    # could fill the shortlist. Arc coherence is settled
+                    # before any velocity is looked at, so the best arc cannot
+                    # be picked to produce a result.
+                    #
+                    # If the named component then cannot field `min_agreeing`
+                    # partners, or they disagree, the DS is unmeasured. That
+                    # is the honest outcome -- not a reason to go back and
+                    # choose a different network.
+                    #
+                    # Spatial position plays no part. Components are not
+                    # regions; an island and a far river bank interleave with
+                    # the main network across the raster.
+                    _lab = lab_all[tgt].astype(np.int64)
+                    _gf = np.where(np.isfinite(ga), ga, -np.inf)
+                    _top1 = np.full(len(dy_), -np.inf)
+                    np.maximum.at(_top1, src, _gf)
+                    _is1 = (_gf >= _top1[src]) & (_gf > -np.inf)
+                    _win = np.full(len(dy_), -1, dtype=np.int64)
+                    _win[src[_is1]] = _lab[_is1]
+                    if debug:
+                        # WHAT THE RESTRICTION FORBIDS, counted before it
+                        # acts: shortlists that would have spanned two
+                        # components. Not "saw more than one component" --
+                        # nearly every DS does once a second one exists in
+                        # reach. Only a straddling SHORTLIST would have
+                        # differenced partners against unrelated datums.
+                        _so = np.lexsort((-_gf, src))
+                        _sn = np.bincount(src[_so], minlength=len(dy_))
+                        _sf = np.r_[0, np.cumsum(_sn)[:-1]]
+                        _tp = _so[(np.arange(len(_so))
+                                   - np.repeat(_sf, _sn)) < _ma]
+                        _lo = np.full(len(dy_), np.iinfo(np.int64).max, np.int64)
+                        _hi = np.full(len(dy_), -1, dtype=np.int64)
+                        np.minimum.at(_lo, src[_tp], _lab[_tp])
+                        np.maximum.at(_hi, src[_tp], _lab[_tp])
+                        _3d_fit_ps_array.stats['ds_shortlist_straddled'] = int(
+                            np.count_nonzero((_hi >= 0) & (_hi != _lo)))
+                        del _so, _sn, _sf, _tp, _lo, _hi
+                    _3d_fit_ps_array.stats['ds_multi_component'] = int(
+                        np.count_nonzero(
+                            np.bincount(src[_lab != _win[src]],
+                                        minlength=len(dy_)) > 0))
+                    ga[_lab != _win[src]] = np.nan
+                    del _lab, _gf, _top1, _is1, _win
+
                 # REFINE EXACTLY WHAT WILL BE USED. `consensus` says how many
                 # partners the answer rests on, so that is how many are worth
                 # refining -- no separate width to choose or keep in step. The
@@ -2199,7 +2334,16 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                 _cnt0 = np.bincount(src[_ord], minlength=len(dy_))
                 _off0 = np.r_[0, np.cumsum(_cnt0)[:-1]]
                 _col0 = np.arange(len(_ord)) - np.repeat(_off0, _cnt0)
-                _keep = _ord[_col0 < _short]
+                # ADMISSIBLE ONLY. Ranking puts NaN last, but taking the
+                # first `_short` POSITIONS still reaches them when a DS has
+                # fewer admissible candidates than that -- and refitting one
+                # hands it a fresh finite coherence, so an arc ruled out
+                # before the ranking would come back holding a vote. That is
+                # how a DS assigned to one component could still be scored
+                # against another's nodes, which is the whole thing the
+                # restriction above is for. A DS left with too few is left
+                # with too few; the consensus rejects it for that.
+                _keep = _ord[(_col0 < _short) & np.isfinite(ga[_ord])]
                 if len(_keep):
                     ad = np.abs(S[:, dy_[src[_keep]], dx_[src[_keep]]])
                     ud = np.where(ad > 0, S[:, dy_[src[_keep]], dx_[src[_keep]]]
@@ -2329,15 +2473,70 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # quality: a strong arc and a barely-admitted one carried
                     # equal standing in a count, and the count was what decided.
                     if _ma is not None:
-                        okds = keep[:, :_ma].sum(axis=1) >= _ma
+                        # ALL `min_agreeing` OF THEM, UNANIMOUSLY. The
+                        # selection names WHICH partners are asked -- that is
+                        # what stops the test being "some few of many" and
+                        # therefore vacuous -- and every one of them has to
+                        # agree.
+                        #
+                        # Allowing a single dissenter is not the mild
+                        # relaxation it reads as. There are only `_ma` columns,
+                        # so a DS holding `_ma - 1` admissible partners fills
+                        # every column it has and passes: the tolerance meant
+                        # for one partner DISAGREEING is spent instead on one
+                        # partner being ABSENT, and a pixel that never had the
+                        # asked-for redundancy is reported as though it did.
+                        # Those two failures are not interchangeable -- one is
+                        # a measurement that was contradicted, the other is a
+                        # measurement that was never made.
+                        #
+                        # Requiring the full count keeps them apart. A row with
+                        # too few partners cannot reach `_ma` and is rejected
+                        # for being too few, which is what it is.
+                        okds = keep[:, :_ma].sum(axis=1) == _ma
                     else:
                         okds = nkeep >= 1
                     # rows are gamma-descending, so the first survivor is the
                     # best arc of the consistent set
                     sel_col = np.argmax(keep, axis=1)
                     first = IDX[np.flatnonzero(okds), sel_col[okds]]
+                    if debug:
+                        # THE INVARIANT, CHECKED RATHER THAN ARGUED. The
+                        # SHORTLIST behind an attached DS -- the partners
+                        # whose agreement was tested -- must lie in ONE
+                        # component. Components carry unrelated datums, so a
+                        # decision taken across two is a numerical error, not
+                        # a noisier answer. Must read 0 on any scene with any
+                        # parameters; it is an assertion, not a quality
+                        # measure. It exists because the restriction HAS been
+                        # reversed downstream once already, silently, by a
+                        # shortlist that selected by position and let nulled
+                        # arcs be refitted back into votes.
+                        #
+                        # On `fin`, NOT on `keep`. A cross-component partner
+                        # differs by the datum offset, which is precisely what
+                        # makes it an outlier, so the sigma rejection discards
+                        # it before `keep` exists -- a check there asks a
+                        # question the preceding code already answered, and
+                        # reads 0 even with the restriction switched off.
+                        _rw = np.flatnonzero(okds)
+                        _ix2 = IDX[_rw]
+                        _lb2 = np.where(fin[_rw] & (_ix2 >= 0),
+                                        lab_all[tgt[np.clip(_ix2, 0, None)]
+                                                ].astype(np.int64), -1)
+                        _hi2 = _lb2.max(axis=1)
+                        _lo2 = np.where(_lb2 >= 0, _lb2,
+                                        np.iinfo(np.int64).max).min(axis=1)
+                        _3d_fit_ps_array.stats['ds_cross_component_votes'] = int(
+                            np.count_nonzero((_hi2 >= 0) & (_hi2 != _lo2)))
+                        del _rw, _ix2, _lb2, _hi2, _lo2
                     votes = nkeep[okds].astype(np.int32)
                     reach = int(np.count_nonzero(cnt))
+                    # DS holding at least one admissible arc -- the population
+                    # the consensus is actually asked about. `ds_no_consensus`
+                    # is the whole shortfall from it and CONTAINS
+                    # `ds_too_few`; the two are nested, not side by side.
+                    _3d_fit_ps_array.stats['ds_admissible'] = reach
                     _3d_fit_ps_array.stats['ds_no_consensus'] = reach - len(first)
                     _3d_fit_ps_array.stats['ds_too_few'] = int(
                         reach - np.count_nonzero(
@@ -2377,4 +2576,39 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                                          + 1j * (ani[sel][kk][ps_i]
                                                  + dsa[first].imag)
                                          ).astype(np.complex64))
+    if debug:
+        _s = _3d_fit_ps_array.stats
+        _att = int(_s.get('ds_attached', 0))
+        _cnd = int(_s.get('ds_candidates', 0))
+        if not densify:
+            print('DEBUG: DS       densify=False -- nodes only', flush=True)
+        elif _cnd:
+            print(f'DEBUG: DS       {_cnd:,} candidates, '
+                  f'{int(_s.get("ds_reached", 0)):,} reached a node over '
+                  f'{int(_s.get("ds_arcs", 0)):,} arcs', flush=True)
+            _adm = int(_s.get('ds_admissible', 0))
+            _no = int(_s.get('ds_no_consensus', 0))
+            _few = int(_s.get('ds_too_few', 0))
+            _g = _s.get('ds_gamma')
+            print(f'DEBUG:          {_adm:,} held an admissible arc: '
+                  f'{_att:,} attached, {_no:,} did not'
+                  + (f'   gamma p50 {np.median(_g):.3f}'
+                     if _g is not None and len(_g) else ''), flush=True)
+            print(f'DEBUG:          of those {_no:,}: {_few:,} had too few '
+                  f'partners, {_no - _few:,} had enough and disagreed',
+                  flush=True)
+            print(f'DEBUG:          {int(_s.get("ds_multi_component", 0)):,} '
+                  f'candidates saw more than one component; '
+                  f'{int(_s.get("ds_shortlist_straddled", 0)):,} would have '
+                  f'drawn a shortlist spanning two', flush=True)
+            _xv = _s.get('ds_cross_component_votes')
+            if _xv is not None:
+                print(f'DEBUG:          cross-component votes among attached '
+                      f'DS: {int(_xv):,}' + ('' if _xv == 0 else '   <-- BUG'),
+                      flush=True)
+        else:
+            print('DEBUG: DS       no candidates cleared the threshold',
+                  flush=True)
+        print(f'DEBUG: total    {len(_s.get("iy", ())):,} PS + {_att:,} DS '
+              f'= {len(_s.get("iy", ())) + _att:,} measured pixels', flush=True)
     return lab_out, vel_out, hgt_out, sea_out, coh_out

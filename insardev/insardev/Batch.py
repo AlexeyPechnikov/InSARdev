@@ -2887,14 +2887,15 @@ class BatchComplex(BatchCore):
 
     @serialize_gpu
     def fit3d(self, threshold: float = 0.5, window: tuple = (32, 128),
-                cell: tuple = (2, 8), degree: int = 50,
+                cell: tuple = (2, 8),
                 baseline: str = 'BPR', budget: 'str | None' = None,
                 densify: bool = True,
                 max_dh: float = 100.0, max_dv: float = 50.0,
                 step_dh: float = 4.0, step_dv: float = 2.0,
                 max_seasonal: float = 5.0,
                 consensus: 'tuple | None' = (8, 5.0),
-                device: str = 'auto', iterations: int = 8) -> 'Batch':
+                device: str = 'auto', iterations: int = 8,
+                debug: bool = False) -> 'Batch':
         """
         Fit a per-pixel (height, velocity, seasonal) model on a PS network.
 
@@ -3039,6 +3040,19 @@ class BatchComplex(BatchCore):
             rule moving the answer underneath them -- the checks exist to make a
             LOW threshold usable, by removing what a low gate lets in.
 
+        debug : bool
+            Print a stage-by-stage account of the solve: how many nodes the PS
+            test found, how many pairs were fitted and how many cleared
+            `threshold`, what the robust pass rejected, the connected
+            components and their sizes, and where the DS candidates went --
+            too few partners, no consensus, or attached. Off by default.
+
+            The counts are the ones that explain a disappointing result. A
+            thin answer is either few nodes, few arcs, a network in pieces, or
+            DS that reached a node and failed consensus, and those call for
+            different changes -- the returned rasters alone cannot tell them
+            apart.
+
         budget : str or None
             Memory budget for the arc-counting slabs, e.g. '512MB'.
         max_dh, max_dv : float
@@ -3120,26 +3134,6 @@ class BatchComplex(BatchCore):
         unwrapping reports its own components, and a caller who ignores it will
         compare values that share no reference.
 
-        Parameters
-        ----------
-        degree : int
-            Most arcs any ONE NODE may carry -- a cap on how much redundancy the
-            network is built with, not a filter on which nodes survive. Every
-            pixel the PS test certified stays a node whatever this is set to;
-            arcs are taken best-first by fitted coherence, so the budget is
-            spent on the arcs most likely to be real.
-
-            Redundancy buys two separate things. Noise: split the arcs into
-            two disjoint halves and compare the screens they independently
-            produce -- the disagreement falls as degree rises. Connectivity:
-            too few arcs per node leave the network in pieces, each carrying
-            its own free datum, and a fragmented network is not a worse answer,
-            it is several unrelated ones.
-
-            The default is high because raising it costs arcs to fit, which is
-            linear, while setting it too low costs a screen made of noise, and
-            that is invisible in every summary a user is likely to read.
-
         Returns
         -------
         Batches of two Batch
@@ -3153,7 +3147,7 @@ class BatchComplex(BatchCore):
                     shattered rather than resolved, and says so rather than
                     folding one component's label onto another's. Where two
                     components reach one pixel the screen is taken from the one
-                    with the higher degree, never averaged between them --
+                    with the more arcs per node, never averaged between --
                     their datums are unrelated, and mixing them is worse than
                     either alone.
 
@@ -3182,18 +3176,19 @@ class BatchComplex(BatchCore):
         from . import utils_arcs as _ua
         _ua._3d_consensus(consensus)
         return self._fit3d_ps_impl(
-            threshold=threshold, window=window, cell=cell, degree=degree,
+            threshold=threshold, window=window, cell=cell,
             baseline=baseline, budget=budget, densify=densify,
             max_dh=max_dh, max_dv=max_dv, step_dh=step_dh, step_dv=step_dv,
             max_seasonal=max_seasonal, consensus=consensus, device=device,
+            debug=debug,
             iterations=iterations)
 
 
 
-    def _fit3d_ps_impl(self, threshold, window, cell, degree, baseline,
+    def _fit3d_ps_impl(self, threshold, window, cell, baseline,
                          budget, max_dh, max_dv, step_dh, step_dv,
                          max_seasonal, densify=True, consensus=(8, 5.0),
-                         device='cpu', iterations=8):
+                         device='cpu', iterations=8, debug=False):
         """The PS screen and its component labels, per dask block.
 
         One block at a time and no inter-block state, like arcs(): a component
@@ -3262,20 +3257,22 @@ class BatchComplex(BatchCore):
 
                 def _blk(block, _d=date_values, _bp=bp, _w=(wy, wx, pey, pex),
                          _t=float(threshold), _c=tuple(cell), _g=geom,
-                         _sp=spacing, _dg=int(degree), _bm=budget_mb,
+                         _sp=spacing, _bm=budget_mb,
                          _mh=float(max_dh), _mv=float(max_dv),
                          _sh=float(step_dh), _sv=float(step_dv),
                          _se=float(max_seasonal), _dn=bool(densify),
                          _cs=(consensus if consensus is None
                               or isinstance(consensus, (int, float))
                               else tuple(consensus)),
-                         _dv2=str(device), _it=int(iterations)):
+                         _dv2=str(device), _it=int(iterations),
+                         _db=bool(debug)):
                     l, v, h, sa, cg = utils_arcs._3d_fit_ps_array(
                         block, _d, spacing=_sp, bperp=_bp, window=_w,
-                        threshold=_t, cell=_c, geometry=_g, degree=_dg,
+                        threshold=_t, cell=_c, geometry=_g,
                         budget=_bm, densify=_dn, max_dh=_mh, max_dv=_mv,
                         step_dh=_sh, step_dv=_sv, max_seasonal=_se,
-                        consensus=_cs, device=_dv2, iterations=_it)
+                        consensus=_cs, device=_dv2, iterations=_it,
+                        debug=_db)
                     # ONE CONVENTION ACROSS EVERY FIT: displacement_los() must turn
                     # this model into a negative rate where the ground subsides,
                     # whichever fit produced it. _3d_arc_fit solves the per-DATE
