@@ -757,7 +757,7 @@ class Batch(BatchCore):
         return out
 
     def fit1d(self, weight=None, baseline: str = 'BPR', transform=None,
-              max_dh: float = 30.0, max_dv: float = 100.0,
+              max_dh: float = 30.0, max_dv: float = 25.0,
               min_dv: 'float | None' = None,
               max_seasonal: float = 0.0, device: str = 'auto',
               debug: bool = False) -> 'Batch':
@@ -2362,7 +2362,7 @@ class BatchUnit(BatchCore):
 
 class BatchComplex(BatchCore):
     def fit1d(self, weight=None, baseline: str = 'BPR',
-              max_dh: float = 200.0, max_dv: float = 100.0,
+              max_dh: float = 200.0, max_dv: float = 25.0,
               step_dh: float = 4.0, step_dv: float = 2.0,
               max_seasonal: 'float | None' = None,
               budget: 'str | None' = None) -> 'Batch':
@@ -2890,10 +2890,10 @@ class BatchComplex(BatchCore):
                 cell: tuple = (2, 8),
                 baseline: str = 'BPR', budget: 'str | None' = None,
                 level: int = 1,
-                max_dh: float = 100.0, max_dv: float = 50.0,
+                max_dh: float = 100.0, max_dv: float = 25.0,
                 step_dh: float = 4.0, step_dv: float = 2.0,
                 max_seasonal: float = 5.0,
-                consensus: 'tuple | None' = (8, 5.0),
+                consensus: 'tuple | None' = (5, 3.0),
                 device: str = 'auto', iterations: int = 8,
                 debug: bool = False) -> 'Batch':
         """
@@ -3086,6 +3086,24 @@ class BatchComplex(BatchCore):
             Memory budget for the arc-counting slabs, e.g. '512MB'.
         max_dh, max_dv : float
             Largest DIFFERENTIAL height (m) and rate (mm/yr) an arc may carry:
+
+            `max_dv` DEFAULTS BELOW ONE FRINGE PER YEAR. A rate of lambda/2 per
+            year -- 27.7 mm/yr at Sentinel-1's 55.5 mm -- advances the phase by
+            a whole cycle over a year, and the search finds a second maximum
+            close to it. That maximum is not a true alias: with these dates the
+            two are separable in principle. But it is high enough to win on a
+            marginal arc, and ONE arc that takes it is then integrated by the
+            network across everything behind it -- with closure staying clean,
+            since every arc agrees with the shifted solution. Measured on a
+            real stack, 55 nodes sat a full cycle above their neighbours 1 km
+            away while the solve reported no node closing worse than 0.6 mm/yr.
+            Keeping the bound under that rate denies the search the second
+            maximum. It does NOT bound the velocity a pixel may be reported at:
+            the bound is per ARC, and faster ground is reached by integrating a
+            chain of arcs that each stay inside it. Raising it past lambda/2 per
+            year re-admits the failure; the value is wavelength-specific and
+            would need revisiting for another mission.
+
             the difference between two neighbours a few tens of metres apart,
             not an absolute elevation or velocity. Anything solving beyond
             them returns NaN rather than a plausible wrong number, so these
@@ -3204,8 +3222,8 @@ class BatchComplex(BatchCore):
         # it was written
         from . import utils_arcs as _ua
         _ua._3d_consensus(consensus)
-        if int(level) not in (0, 1, 2):
-            raise ValueError(f'level must be 0, 1 or 2; got {level!r}')
+        if int(level) < 0:
+            raise ValueError(f'level must be >= 0; got {level!r}')
         return self._fit3d_ps_impl(
             threshold=threshold, window=window, cell=cell,
             baseline=baseline, budget=budget, level=level,
@@ -3218,7 +3236,7 @@ class BatchComplex(BatchCore):
 
     def _fit3d_ps_impl(self, threshold, window, cell, baseline,
                          budget, max_dh, max_dv, step_dh, step_dv,
-                         max_seasonal, level=1, consensus=(8, 5.0),
+                         max_seasonal, level=1, consensus=(5, 3.0),
                          device='cpu', iterations=8, debug=False):
         """The PS screen and its component labels, per dask block.
 
