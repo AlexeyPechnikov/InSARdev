@@ -342,7 +342,16 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         # locking whatever the rank.
         _lock = bool(is_store_object)
         if idx_2d:
-            da.store([dask.optimize(sources[i])[0] for i in idx_2d],
+            # HANDED OVER AS BUILT. `dask.optimize` rewrites each
+            # collection into a self-contained graph, and a layer feeding
+            # SEVERAL outputs is fused into every one of them -- so a
+            # computation whose results are split into more than one variable
+            # is executed once per variable. `da.store` computes the arrays
+            # together and the scheduler optimises the merged graph, which is
+            # where the optimisation belongs. dask says as much of calling it
+            # by hand: "in most cases you shouldn't need to call this function
+            # directly".
+            da.store([sources[i] for i in idx_2d],
                      [targets[i] for i in idx_2d], lock=_lock)
 
         if idx_3d:
