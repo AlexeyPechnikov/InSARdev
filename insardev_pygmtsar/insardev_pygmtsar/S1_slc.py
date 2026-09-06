@@ -109,7 +109,7 @@ class S1_slc(Satellite):
         
         df = pd.DataFrame(records)
         assert len(df), f'Bursts not found'
-        df = gpd.GeoDataFrame(df, geometry='geometry')\
+        df = gpd.GeoDataFrame(df, geometry='geometry', crs=4326)\
             .sort_values(by=['fullBurstID','polarization','burst'])\
             .set_index(['fullBurstID','polarization','burst'])
 
@@ -118,8 +118,47 @@ class S1_slc(Satellite):
         if len(path_numbers) > 1:
             print (f'NOTE: Multiple path numbers found in the dataset: {", ".join(map(str, path_numbers))}.')
             print (f'NOTE: The following reference dates are available: {", ".join(min_dates)}.')
+        df = self._drop_duplicates(df)
         print (f'NOTE: Loaded {len(df)} bursts.')
         self.df = df
+        # a record attribute, placed before the geometry, which is kept last as the long field
+        self.df.insert(self.df.columns.get_loc('geometry'), 'BPR', self.baselines())
+
+    def _drop_duplicates(self, df):
+        """Ignore bursts that repeat an acquisition, keeping the first of them.
+
+        An acquisition is one burst, one polarization and one time. The Sentinel-1 archive can
+        distribute a single acquisition more than once, as separate products of the same
+        datatake, holding the same image. Keeping them all puts one date twice in the stack,
+        which is rejected only much later when the stack is loaded, so the repeats are dropped
+        here and reported.
+
+        Parameters
+        ----------
+        df : geopandas.GeoDataFrame
+            The scanned bursts.
+
+        Returns
+        -------
+        geopandas.GeoDataFrame
+            The bursts without the repeated acquisitions.
+        """
+        # the stack compares the dates by the second, so an acquisition is keyed the same way
+        key = df.reset_index()[['fullBurstID', 'polarization']].assign(
+            time=df.startTime.dt.floor('s').values)
+        duplicated = key.duplicated(keep='first').values
+        if not duplicated.any():
+            return df
+
+        bursts = df.index.get_level_values('burst')
+        for idx in duplicated.nonzero()[0]:
+            same = ((key.fullBurstID == key.fullBurstID.iloc[idx])
+                    & (key.polarization == key.polarization.iloc[idx])
+                    & (key.time == key.time.iloc[idx])).values.nonzero()[0][0]
+            print(f'NOTE: {bursts[idx]} repeats the acquisition of {bursts[same]}, ignored.')
+        print(f'NOTE: {int(duplicated.sum())} of {len(df)} bursts repeat an acquisition, '
+              f'{len(df) - int(duplicated.sum())} left.')
+        return df[~duplicated]
 
     def parse_annotation(self, filename: str) -> dict:
         """

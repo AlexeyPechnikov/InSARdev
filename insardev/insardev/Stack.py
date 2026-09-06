@@ -91,15 +91,7 @@ def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
     # Add pair dim back: (y, x) -> (1, y, x)
     return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
 
-def _irls_process_no_weight(phase_chunk, params_tuple):
-    """Process phase chunk without weight. Returns only unwrapped phase."""
-    unwrapped, _ = _irls_process_chunk_with_tuple(phase_chunk, None, params_tuple)
-    return unwrapped
 
-def _irls_process_with_weight(phase_chunk, weight_chunk, params_tuple):
-    """Process phase chunk with weight. Returns only unwrapped phase."""
-    unwrapped, _ = _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple)
-    return unwrapped
 
 def _irls_process_no_weight_conncomp(phase_chunk, params_tuple):
     """Process phase chunk without weight. Returns stacked (1, 2, y, x)."""
@@ -538,7 +530,8 @@ class Stack(BatchComplex):
 
     def unwrap2d(self, phase, weight=None, conncomp=False,
                 conncomp_size=1_000, conncomp_gap=None,
-                conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
+                conncomp_linksize=5, conncomp_linkcount=30, union=False,
+                device='auto', debug=False, **kwargs):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
@@ -585,6 +578,12 @@ class Stack(BatchComplex):
             connections from each component. Higher values find more potential
             connections but increase computation. Default is 30.
             Only used when conncomp=False.
+        union : bool, optional
+            False (default) solves each burst separately -- the form that
+            scales, at the cost of each carrying its own integer solution, so
+            bursts need not agree across a shared edge. True merges and solves
+            once, consistent across them, while the merged scene fits. A Batch
+            either way, each burst back with only its own pixels.
         device : str, optional
             PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
             'auto' uses GPU if Dask client has resources={'gpu': 1}.
@@ -637,6 +636,13 @@ class Stack(BatchComplex):
                 f'Components must have at least conncomp_linksize pixels for reliable offset estimation.'
             )
 
+        if union:
+            return self._unwrap2d_union(
+                phase, weight, conncomp=conncomp, conncomp_size=conncomp_size,
+                conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
+                conncomp_linkcount=conncomp_linkcount, device=device,
+                debug=debug, **kwargs)
+
         # Use IRLS unwrapping - always returns (unwrapped, conncomp)
         # Pass conncomp_size to filter small components during IRLS
         unwrapped, conncomp_labels = self.unwrap2d_irls(
@@ -656,109 +662,54 @@ class Stack(BatchComplex):
             )
             return unwrapped
 
-    def unwrap2d_dataset(self, phase, weight=None, conncomp=False,
-                         conncomp_size=1000, conncomp_gap=None,
-                         conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
+    def _unwrap2d_union(self, phase, weight=None, conncomp=False,
+                        conncomp_size=1000, conncomp_gap=None,
+                        conncomp_linksize=5, conncomp_linkcount=30,
+                        device='auto', debug=False, **kwargs):
+        """One solve over the union of the bursts, returned on the burst grid.
+
+        Unwrapping needs one raster, so the bursts are merged internally; the
+        caller passes a Batch and gets a Batch back.
         """
-        Unwrap a single phase Dataset using GPU-accelerated IRLS algorithm.
-
-        Convenience wrapper around unwrap2d() for working with merged datasets
-        instead of per-burst batches. Useful when you have already dissolved
-        and merged your data.
-
-        Parameters
-        ----------
-        phase : xr.Dataset
-            Wrapped phase dataset (from intf.align().dissolve().to_dataset()).
-        weight : xr.Dataset, optional
-            Correlation values for weighting (from corr.dissolve().to_dataset()).
-        conncomp : bool, optional
-            If False (default), link disconnected components.
-            If True, keep components separate and return conncomp labels.
-        conncomp_size : int, optional
-            Minimum pixels for a connected component. Default is 1000.
-        conncomp_gap : int or None, optional
-            Maximum pixel distance between components. Default is None.
-        conncomp_linksize : int, optional
-            Pixels for offset estimation. Default is 5.
-        conncomp_linkcount : int, optional
-            Maximum neighbor components to consider. Default is 30.
-        device : str, optional
-            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
-        debug : bool, optional
-            Print diagnostic information. Default is False.
-        **kwargs
-            Additional arguments passed to unwrap2d_irls.
-
-        Returns
-        -------
-        xr.Dataset or tuple
-            If conncomp is False: Unwrapped phase Dataset.
-            If conncomp is True: tuple of (unwrapped Dataset, conncomp Dataset).
-
-        Examples
-        --------
-        Basic usage with merged datasets:
-        >>> intf_ds = intf.align().dissolve().compute().to_dataset()
-        >>> corr_ds = corr.dissolve().compute().to_dataset()
-        >>> unwrapped = stack.unwrap2d_dataset(intf_ds, corr_ds)
-
-        Get connected components:
-        >>> unwrapped, conncomp = stack.unwrap2d_dataset(intf_ds, corr_ds, conncomp=True)
-
-        Convert back to per-burst Batch:
-        >>> phase_batch = intf.from_dataset(unwrapped)
-        """
+        import numpy as np
         import xarray as xr
         from .Batch import BatchWrap, BatchUnit
+        from .BatchCore import BatchCore
 
-        # Validate input types
-        if not isinstance(phase, xr.Dataset):
-            raise TypeError(f"phase must be xr.Dataset, got {type(phase).__name__}")
-        if weight is not None and not isinstance(weight, xr.Dataset):
-            raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
+        _batch_in = isinstance(phase, BatchCore)
+        phase_ds = phase.to_dataset() if _batch_in else phase
+        weight_ds = (weight.to_dataset()
+                     if isinstance(weight, BatchCore) else weight)
+        if not isinstance(phase_ds, xr.Dataset):
+            raise TypeError(f"phase must be a Batch or xr.Dataset, got "
+                            f"{type(phase).__name__}")
+        if weight_ds is not None and not isinstance(weight_ds, xr.Dataset):
+            raise TypeError(f"weight must be a Batch or xr.Dataset, got "
+                            f"{type(weight).__name__}")
 
-        # Check for spatial chunking and rechunk if needed
-        # Phase unwrapping is a global operation that needs single spatial chunk
-        needs_rechunk = False
-        for var_name in phase.data_vars:
-            var_data = phase[var_name]
-            if hasattr(var_data.data, 'chunks'):
-                chunks = var_data.data.chunks
-                # For 2D or 3D data, check spatial dimensions (last two)
-                y_chunks = chunks[-2] if len(chunks) >= 2 else chunks[0]
-                x_chunks = chunks[-1]
-                if len(y_chunks) > 1 or len(x_chunks) > 1:
-                    print(f"NOTE: unwrap2d_dataset() rechunking to single spatial chunk "
-                          f"(from y: {len(y_chunks)} chunks, x: {len(x_chunks)} chunks)")
-                    needs_rechunk = True
-                break  # Only check first variable
+        # the solve is one raster; this bends the merged view, not the caller's
+        _spatial = {d: -1 for d in ('y', 'x') if d in phase_ds.dims}
+        phase_ds = phase_ds.chunk(_spatial)
+        if weight_ds is not None:
+            weight_ds = weight_ds.chunk(_spatial)
 
-        if needs_rechunk:
-            # Rechunk to single spatial chunk (keep first dim if present)
-            phase = phase.chunk({'y': -1, 'x': -1})
-            if weight is not None:
-                weight = weight.chunk({'y': -1, 'x': -1})
-
-        # Wrap datasets in temporary batches with empty key
-        intf_batch = BatchWrap({'': phase})
-        corr_batch = BatchUnit({'': weight}) if weight is not None else None
-
-        # Call unwrap2d
+        # the merged raster IS the single burst of this solve
         result = self.unwrap2d(
-            intf_batch, corr_batch, conncomp=conncomp,
-            conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
-            conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
-            device=device, debug=debug, **kwargs
-        )
+            BatchWrap({'': phase_ds}),
+            BatchUnit({'': weight_ds}) if weight_ds is not None else None,
+            conncomp=conncomp, conncomp_size=conncomp_size,
+            conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
+            conncomp_linkcount=conncomp_linkcount, union=False,
+            device=device, debug=debug, **kwargs)
+        merged = ([r[''] for r in result] if conncomp else [result['']])
 
-        # Extract and return the dataset(s)
-        if conncomp:
-            unwrapped, conncomp_labels = result
-            return unwrapped[''], conncomp_labels['']
-        else:
-            return result['']
+        if not _batch_in:
+            return tuple(merged) if conncomp else merged[0]
+
+        # keep only each burst's own pixels; overlaps were filled from neighbours
+        valid = phase.map_da(lambda da: da.notnull())
+        out = [phase.from_dataset(m).where(valid) for m in merged]
+        return tuple(out) if conncomp else out[0]
 
     def unwrap2d_irls(self, phase, weight=None, device='auto',
                       max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2,
@@ -1331,7 +1282,7 @@ class Stack(BatchComplex):
         >>> corr_masked = corr_ds.where(~mask)
         >>>
         >>> # Unwrap
-        >>> unwrapped = stack.unwrap2d_dataset(intf_masked, corr_masked)
+        >>> unwrapped = intf_masked.unwrap2d(corr_masked, union=True)
 
         Notes
         -----
@@ -2294,8 +2245,29 @@ DEFOMAX_CYCLE  {defomax}
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def transform(self) -> Batch:
-        """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
-        return Batch(self)
+        """Return a Batch view of this Stack (including 1D/2D non-complex vars).
+
+        Also `northing` and `easting`, each burst's own y/x as a vector.
+
+        `azi` and `rng` are the BURST'S grid and restart in each one, so a
+        plane across bursts written in them is a sawtooth; the map coordinates
+        share a lattice.
+        """
+        import numpy as np
+        out = {}
+        for key, ds in self.items():
+            if 'y' not in ds.dims or 'x' not in ds.dims:
+                out[key] = ds
+                continue
+            # ONE AXIS EACH, not a raster: a map coordinate is constant along
+            # the other axis, so it is the coordinate vector and nothing is
+            # broadcast, stored or shipped per block that a 1-D read gives.
+            out[key] = ds.assign(
+                northing=(('y',), np.asarray(ds.y.values, np.float32),
+                          dict(ds.y.attrs)),
+                easting=(('x',), np.asarray(ds.x.values, np.float32),
+                         dict(ds.x.attrs)))
+        return Batch(out)
 
     def incidence(self) -> Batch:
         """Compute incidence angle for each burst via linear polynomial fit."""
@@ -3726,6 +3698,9 @@ DEFOMAX_CYCLE  {defomax}
 
             # Coords eagerly (small 1D arrays)
             ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
+            # the coordinates keep their attributes, actual_range among them
+            ds.x.attrs.update(transform.x.attrs)
+            ds.y.attrs.update(transform.y.attrs)
 
             # 2D vars as lazy dask arrays via custom reader (no persistent file descriptors)
             # One reader call per chunk for memory efficiency
@@ -3763,7 +3738,10 @@ DEFOMAX_CYCLE  {defomax}
                         chunk_rows.append(chunk_cols)
                     arr = da.block(chunk_rows)
 
-                ds[var] = xr.DataArray(arr, dims=['y', 'x'])
+                # the variable's attributes travel with it: actual_range is
+                # how far it reaches, and reading it beats scanning the raster
+                ds[var] = xr.DataArray(arr, dims=['y', 'x'],
+                                       attrs=dict(transform[var].attrs))
 
             # Set spatial_ref
             if spatial_ref is None:
@@ -3954,6 +3932,8 @@ DEFOMAX_CYCLE  {defomax}
                 transform = xr.open_zarr(transform_url, consolidated=True, zarr_format=3,
                                          storage_options=storage_options)
                 ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
+                ds.x.attrs.update(transform.x.attrs)
+                ds.y.attrs.update(transform.y.attrs)
                 for var in transform.data_vars:
                     shape = transform[var].shape
                     delayed_load = dask.delayed(Stack._load_zarr_array)(
@@ -3961,7 +3941,7 @@ DEFOMAX_CYCLE  {defomax}
                     )
                     ds[var] = xr.DataArray(
                         da.from_delayed(delayed_load, shape=shape, dtype=np.float32),
-                        dims=['y', 'x']
+                        dims=['y', 'x'], attrs=dict(transform[var].attrs)
                     )
 
                 if spatial_ref is None:

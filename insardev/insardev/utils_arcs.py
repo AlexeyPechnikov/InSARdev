@@ -12,7 +12,11 @@ here clears the cell.
                   model is fitted on the arcs, integrated over the network, and
                   the temporally-rough remainder is the atmospheric phase.
 """
+import numba as _numba
 import numpy as np
+import threading as _threading
+import collections.abc as _abc
+import time
 import warnings
 
 
@@ -54,7 +58,72 @@ _MAX_COMPONENTS = 127
 # residuals are defined differently, because an arc is one equation in a joint
 # system while a partner is a direct estimate, but nothing justifies judging
 # them at different resolutions.
-_SIGMA_FLOOR = 0.05
+# THE FLOOR IS HUBER'S TUNING ON A CALIBRATED SCALE. A robust scale needs a
+# lower bound only so a degenerate set cannot drive it to zero, and the MAD is
+# already that scale: sigma = 1.4826 * MAD. Huber's constant is 1.345 sigma,
+# which is 2 MAD, so the bound is stated in MADs and the constant is the one
+# the estimator was designed around rather than a number chosen here.
+#
+# Set as a small FRACTION of the MAD it did real damage: the IRLS weight is
+# `gamma / max(|r|, floor)`, so at a twentieth of a MAD a measurement sitting
+# on the running centre outweighed one a MAD away by twenty to one and the
+# estimate collapsed onto whichever happened to be nearest. On arcs it rejected
+# twice as many as it should, and what it rejected was not outliers.
+class _ThreadStats(_abc.MutableMapping):
+    """`.stats` as PER-THREAD state, so any dask shape is a valid one.
+
+    A worker with more than one thread runs several blocks in one PROCESS, and
+    a module-level dict is then shared by all of them: whatever the last block
+    wrote is what the next one reads. That is a wrong answer whenever the two
+    happen to be the same length and a crash when they are not, and neither is
+    something a caller can be asked to avoid by choosing a different cluster --
+    `threads_per_worker=2` exists so a worker can read while it computes.
+
+    Every mapping operation resolves against the CALLING thread's dict, so the
+    existing `_3d_fit_ps_array.stats[...]` call sites need no change; only the
+    whole-dict assignments become `reset()`, since rebinding the attribute
+    would swap the proxy out from under the other threads.
+    """
+
+    __slots__ = ('_tl',)
+
+    def __init__(self):
+        self._tl = _threading.local()
+
+    @property
+    def _d(self):
+        d = getattr(self._tl, 'd', None)
+        if d is None:
+            d = {}
+            self._tl.d = d
+        return d
+
+    def reset(self, mapping=None, **kw):
+        d = dict(mapping) if mapping else {}
+        d.update(kw)
+        self._tl.d = d
+        return self
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __setitem__(self, k, v):
+        self._d[k] = v
+
+    def __delitem__(self, k):
+        del self._d[k]
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self):
+        return len(self._d)
+
+    def __repr__(self):
+        return f'_ThreadStats({self._d!r})'
+
+
+_SIGMA_FLOOR = 2.0
 
 # Arcs each node should end up with. One (a bare spanning forest) connects the
 # network but leaves every node on a single measurement, which shows in the
@@ -118,73 +187,44 @@ _CORE_STAGES = (1.0,)
 
 
 def _3d_consensus(consensus):
-    """How much agreement is required, as (min_agreeing, reject_sigma, passes).
+    """How many agreeing measurements a value must rest on. An int.
 
     One argument for both halves of the solve, because it is one question asked
     twice: an arc must agree with the network, a partner must agree with the
     other partners.
 
-        None        ask for none of it -- plain least squares on the network and
-                    the best arc for a DS. That is what a caller wants when THEY
-                    are choosing `threshold` and do not want a second rule
-                    moving the answer underneath them.
-        n           n survivors required, the rest left at their defaults
-        (n, k)      and outliers rejected beyond k robust sigma
-        (n, k, i)   and i reweighting passes
+    IT USED TO CARRY THE OUTLIER BOUND AND THE PASS COUNT AS WELL, as
+    `(n, k, i)`. Neither belonged with it. The bound is now stated in physical
+    units by `err_dh`/`err_dv`, where a caller can reason about it -- a robust
+    sigma is a property of whatever scatter happens to be present, so a pixel
+    whose partners were uniformly wrong widened the bar that judged them and
+    passed. The pass count is `iterations`, which already governs the other
+    iterative refinement in the same solve.
 
-    `min_agreeing` and `reject_sigma` come back None when the checks are off.
+    A COUNT IS REQUIRED. `None` used to mean "ask for none of it", but the
+    network stage has no path without something to judge against: it leaves its
+    residuals unset and fails hundreds of lines later, inside a dask block.
     Parsed in ONE place and called from the public method as well, so a bad
     value raises where it was written rather than inside a dask block minutes
     later.
     """
-    # THE DEFAULTS LIVE HERE AND ONLY HERE. `consensus` exists so these are
-    # the caller's to set, so keeping module constants for them would put the
-    # real values somewhere the caller cannot see or reach.
-    #
-    # reject_sigma: an outlier bound in the usual statistical sense, not a
-    # quality level -- arc coherence already decides what is admitted at all.
-    # The sigma comes from the robust solution, so an outlier cannot widen the
-    # bar that judges it.
-    REJECT_SIGMA, IRLS_PASSES = 3.0, 8
-    # The binding constraint is ESTIMATING the scale, not redundancy. With one
-    # measurement an error is invisible and with two it cannot be localised, but
-    # three does not fix it: the robust scale of three residuals is the smaller
-    # of the two gaps, and of four it is the mean of the middle two, so in both
-    # cases whichever pair happens to land closest sets the bar. Two partners
-    # close together collapse the scale and the rest are rejected on the
-    # accident of spacing rather than on the pixel.
-    #
-    # Below the floor the gate rejects on that accident rather than on quality,
-    # so it costs coverage without testing anything. Asking for less is asking
-    # the library to report points it cannot defend.
-    # `consensus=None` is the honest way to say the caller is tuning `threshold`
-    # instead, and it stays available -- so this refuses an undefendable middle
-    # ground, not a capability.
-    FLOOR = 5
-    if consensus is None:
-        return None, None, IRLS_PASSES
-    c = ((consensus,) if isinstance(consensus, (int, float, np.integer,
-                                                np.floating))
-         else tuple(consensus))
-    if len(c) == 1:
-        ma, ar, ii = int(c[0]), REJECT_SIGMA, IRLS_PASSES
-    elif len(c) == 2:
-        ma, ar, ii = int(c[0]), float(c[1]), IRLS_PASSES
-    elif len(c) == 3:
-        ma, ar, ii = int(c[0]), float(c[1]), int(c[2])
-    else:
+    if consensus is None or isinstance(consensus, bool):
         raise ValueError(
-            'consensus takes None, min_agreeing, (min_agreeing, reject_sigma) '
-            f'or (min_agreeing, reject_sigma, irls_passes); got {consensus!r}')
-    if ar <= 0 or ii < 1:
-        raise ValueError(f'consensus values must be positive; got {consensus!r}')
-    if ma < FLOOR:
+            'consensus must be an integer count of agreeing measurements; '
+            f'got {consensus!r}')
+    if isinstance(consensus, (tuple, list)):
         raise ValueError(
-            f'consensus needs at least {FLOOR} agreeing; got {consensus!r}. '
-            'Use consensus=None to switch the checks off entirely.')
-    return ma, ar, ii
-
-
+            'consensus is now a plain count; the outlier bound moved to '
+            f'err_dh/err_dv and the pass count to iterations. Got {consensus!r}')
+    try:
+        ma = int(consensus)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'consensus must be an integer count; got {consensus!r}') from None
+    if ma != consensus or ma < 1:
+        raise ValueError(
+            f'consensus must be a whole number >= 1; got {consensus!r}')
+    return ma
 def _3d_arc_offsets(window_y, window_x, cell_y=2, cell_x=8):
     """Neighbour offsets inside the window that are not the same sample.
 
@@ -218,8 +258,271 @@ def _3d_arc_offsets(window_y, window_x, cell_y=2, cell_x=8):
             for dx in range(-(window_x // 2), window_x // 2 + 1)
             if (dy or dx) and not (abs(dy) < cell_y and abs(dx) < cell_x)]
 
+@_numba.njit(nogil=True, cache=True)
+def _3d_ds_partners(Uv, Ub, cy, cx, fg, hy, hx, hy2, hx2,
+                    cell_y, cell_x, kk, thr, out_v, out_j, early, lo, hi):
+    """Each candidate's best `kk` FIXED partners, searched OUTWARD.
+
+    The DS window is the scale over which the atmosphere is taken to be
+    common, so it is where a partner is worth having; the doubled window is
+    a fallback for candidates the window itself could not serve, and it is
+    entered ONLY by those. Widening for everyone costs 16x the box for
+    partners that are worse by construction.
+
+    Nothing is materialised per pair: a candidate holds `kk` slots and a
+    partner either displaces the weakest or is forgotten, so the working set
+    is `kk` per candidate rather than one entry per pair in reach.
+
+    `fg` carries the fixed node's index at its pixel and -1 elsewhere, which
+    is what makes the search bipartite -- a candidate never partners another
+    candidate, whose value does not exist yet.
+    """
+    n = Uv.shape[0]
+    ny, nx = fg.shape
+    # SERIAL ON PURPOSE, threaded by the caller in candidate bands. A
+    # parallel=True kernel called from a multi-threaded dask worker trips
+    # numba's workqueue layer -- "not threadsafe ... concurrent access has
+    # been detected" -- and takes the whole worker down, surfacing only as a
+    # crash. Every other kernel here is serial for the same reason, and a
+    # candidate writes only its own row, so bands need no coordination.
+    for c in range(lo, hi):
+        for s in range(kk):
+            out_v[c, s] = -1.0
+            out_j[c, s] = -1
+        yc = cy[c]
+        xc = cx[c]
+        for _pass in range(2):
+            ry = hy if _pass == 0 else hy2
+            rx = hx if _pass == 0 else hx2
+            ya = yc - ry
+            if ya < 0:
+                ya = 0
+            yb = yc + ry + 1
+            if yb > ny:
+                yb = ny
+            xa = xc - rx
+            if xa < 0:
+                xa = 0
+            xb = xc + rx + 1
+            if xb > nx:
+                xb = nx
+            for py in range(ya, yb):
+                dy = py - yc
+                ady = dy if dy >= 0 else -dy
+                for px in range(xa, xb):
+                    j = fg[py, px]
+                    if j < 0:
+                        continue
+                    dx = px - xc
+                    adx = dx if dx >= 0 else -dx
+                    # ONE SAMPLE OF THE GROUND is not an arc: inside the
+                    # independence cell the two pixels share an impulse
+                    # response and their coherence reports it, not the terrain.
+                    if ady < cell_y and adx < cell_x:
+                        continue
+                    # the second pass re-walks the first pass's box; skip what
+                    # it already weighed rather than paying for it twice
+                    if _pass == 1 and ady <= hy and adx <= hx:
+                        continue
+                    sr = 0.0
+                    si = 0.0
+                    for d in range(n):
+                        ar = Uv[d, c].real
+                        ai = Uv[d, c].imag
+                        br = Ub[d, j].real
+                        bi = Ub[d, j].imag
+                        sr += ar * br + ai * bi
+                        si += ai * br - ar * bi
+                    v = np.sqrt(sr * sr + si * si) / n
+                    mi = 0
+                    mv = out_v[c, 0]
+                    for s in range(1, kk):
+                        if out_v[c, s] < mv:
+                            mv = out_v[c, s]
+                            mi = s
+                    if v > mv:
+                        out_v[c, mi] = v
+                        out_j[c, mi] = j
+            got = 0
+            for s in range(kk):
+                if out_v[c, s] >= thr:
+                    got += 1
+            if got >= kk:
+                # WHETHER THE WIDER PASS IS EVER SKIPPED. With a shortlist
+                # near the node count of the inner box this can never fire,
+                # and the two passes are one search written twice; the
+                # counter is what says which regime a run is in.
+                early[c] = 1
+                break
+
+
+@_numba.njit(nogil=True, cache=True)
+def _3d_topk_tile(tv, mask, want_own, want_par, tk_v, tk_y, tk_x,
+                  y, x0, hx, gx0, xa, xb):
+    """One tile's top-k bookkeeping, GIL-free (numba nogil).
+
+    The numpy twin held the GIL in tens of thousands of small partial sorts
+    and scatters, which is what stopped the banded threads from scaling; a
+    replace-the-minimum insertion per wanted pixel does the same selection in
+    one compiled pass.
+    """
+    w, ndy, span = tv.shape
+    kk = tk_v.shape[2]
+    for i in range(w):                       # own pixels of the tile row
+        if not want_own[i]:
+            continue
+        xi = x0 + i
+        for dy in range(ndy):
+            base = dy * span
+            for c in range(span):
+                if mask[i, base + c] == 0.0:
+                    continue
+                v = tv[i, dy, c]
+                mi = 0
+                mv = tk_v[y, xi, 0]
+                for s in range(1, kk):
+                    if tk_v[y, xi, s] < mv:
+                        mv = tk_v[y, xi, s]; mi = s
+                if v > mv:
+                    tk_v[y, xi, mi] = v
+                    tk_y[y, xi, mi] = dy
+                    tk_x[y, xi, mi] = c - hx - i
+    for dy in range(ndy):                    # the partner ends, offsets reversed
+        for col in range(xa, xb):
+            if not want_par[dy, col - xa]:
+                continue
+            yy = y + dy
+            for i in range(w):
+                if mask[i, dy * span + (col - gx0)] == 0.0:
+                    continue
+                v = tv[i, dy, col - gx0]
+                mi = 0
+                mv = tk_v[yy, col, 0]
+                for s in range(1, kk):
+                    if tk_v[yy, col, s] < mv:
+                        mv = tk_v[yy, col, s]; mi = s
+                if v > mv:
+                    tk_v[yy, col, mi] = v
+                    tk_y[yy, col, mi] = -dy
+                    tk_x[yy, col, mi] = x0 + i - col
+
+
+def _3d_topk_kernel(block, window_y, window_x, cell, budget, kk, want,
+                    threads=1):
+    """Best `kk` partners of the WANTED pixels only -- the topk twin of
+    `_3d_arcs_kernel`, named apart because it answers a narrower question.
+
+    The selection is the raster: unchosen pixels neither collect a partner
+    nor are one, exactly as the masked path of the full kernel enforces by
+    zeroing their phasors. What the full kernel spends besides -- the best-arc
+    raster nobody reads at these call sites, and GIL-holding numpy
+    bookkeeping -- is dropped, so row bands scale across threads.
+
+    Returns (coherence, dy, dx) shaped (ny, nx, kk); unwanted pixels hold
+    coherence -1.
+    """
+    S = np.asarray(block)
+    n, ny, nx = S.shape
+    cy, cx = (int(cell[0]), int(cell[1])) if cell is not None else (2, 8)
+    wy, wx = int(window_y), int(window_x)
+    hy, hx = wy // 2, wx // 2
+    kk = int(kk)
+    _th = max(1, int(threads))
+    if _th > 1 and ny >= 2 * (hy + 1):
+        from concurrent.futures import ThreadPoolExecutor
+        _mb = _3d_budget_mb(budget) / _th
+        H = max(hy + 1, -(-ny // _th))
+        bands = [(a, min(a + H, ny)) for a in range(0, ny, H)]
+        tv_o = np.empty((ny, nx, kk), np.float32)
+        ty_o = np.empty((ny, nx, kk), np.int16)
+        tx_o = np.empty((ny, nx, kk), np.int16)
+
+        def _band(band):
+            ya, yb = band
+            a0 = max(0, ya - hy); b0 = min(ny, yb + hy)
+            v, yy, xx = _3d_topk_kernel(S[:, a0:b0], wy, wx, (cy, cx), _mb,
+                                        kk, np.asarray(want)[a0:b0])
+            sl = slice(ya - a0, yb - a0)
+            tv_o[ya:yb] = v[sl]; ty_o[ya:yb] = yy[sl]; tx_o[ya:yb] = xx[sl]
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_band, bands))
+        return tv_o, ty_o, tx_o
+
+    want = np.asarray(want, bool)
+    K = 2 * n
+    Xp = np.zeros((ny, nx + 2 * hx, K), dtype=np.float32)
+    ok = np.zeros((ny, nx), bool)
+    slab = max(1, min(ny, int(64 * 1024 * 1024 // max(n * nx * 8, 1))))
+    for y0 in range(0, ny, slab):
+        y1 = min(y0 + slab, ny)
+        blk = S[:, y0:y1, :]
+        a = np.abs(blk)
+        f = np.isfinite(a) & (a > 0)
+        o = f.all(axis=0) & want[y0:y1]
+        ok[y0:y1] = o
+        with np.errstate(invalid='ignore', divide='ignore'):
+            u = np.where(f, blk / np.where(f, a, 1), 0)
+        u *= o[None, :, :]
+        Xp[y0:y1, hx:hx + nx, :n] = np.moveaxis(u.real, 0, -1)
+        Xp[y0:y1, hx:hx + nx, n:] = np.moveaxis(u.imag, 0, -1)
+        del blk, a, f, o, u
+    tile_cap = _3d_budget_mb(budget) * 1024 * 1024
+    Bx = max(1, hx)
+    while Bx > 8:
+        span_ = Bx + 2 * hx
+        if (hy + 1) * span_ * 4 * (K + 2 * Bx) <= tile_cap:
+            break
+        Bx //= 2
+    tk_v = np.full((ny, nx, kk), -1.0, np.float32)
+    tk_y = np.zeros((ny, nx, kk), np.int16)
+    tk_x = np.zeros((ny, nx, kk), np.int16)
+    masks = {}
+    for y in range(ny):
+        ndy = min(hy + 1, ny - y)
+        for x0 in range(0, nx, Bx):
+            w = min(Bx, nx - x0)
+            span = w + 2 * hx
+            gx0 = x0 - hx
+            xa, xb = max(0, gx0), min(nx, gx0 + span)
+            own = want[y, x0:x0 + w]
+            par = want[y:y + ndy, xa:xb]
+            if not (own.any() or par.any()):
+                continue
+            A1 = Xp[y, hx + x0:hx + x0 + w, :]
+            A2 = np.empty((w, K), np.float32)
+            A2[:, :n] = A1[:, n:]; A2[:, n:] = -A1[:, :n]
+            Bk = np.ascontiguousarray(
+                Xp[y:y + ndy, x0:x0 + span, :].transpose(2, 0, 1)
+            ).reshape(K, ndy * span)
+            t = A1 @ Bk
+            Ci = A2 @ Bk
+            np.multiply(t, t, out=t); np.multiply(Ci, Ci, out=Ci)
+            t += Ci
+            del Ci, Bk, A2
+            key = (w, ndy)
+            if key not in masks:
+                dxm = (np.arange(span)[None, None, :] - hx
+                       - np.arange(w)[:, None, None])
+                dyv = np.arange(ndy)[None, :, None]
+                mm = ((np.abs(dxm) <= hx)
+                      & ~((dyv < cy) & (np.abs(dxm) < cx))
+                      & ~((dyv == 0) & (dxm <= 0)))
+                masks[key] = mm.reshape(w, ndy * span).astype(np.float32)
+            m = masks[key]
+            t *= m
+            _3d_topk_tile(t.reshape(w, ndy, span), m,
+                          np.ascontiguousarray(own), np.ascontiguousarray(par),
+                          tk_v, tk_y, tk_x, y, x0, hx, gx0, xa, xb)
+    good = tk_v > 0
+    _sq = np.full(tk_v.shape, -1.0, np.float32)
+    np.sqrt(tk_v, out=_sq, where=good)
+    tk_v = np.where(good, _sq / n, -1.0).astype(np.float32)
+    tk_v[~ok] = -1.0
+    return tk_v, tk_y, tk_x
+
+
 def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget=None,
-                    topk=None, topk_mask=None):
+                    topk=None, topk_mask=None, threads=1):
     """The BEST arc coherence each pixel reaches -- its PS quality.
 
     For every admissible separation (dy, dx) the whole raster is correlated
@@ -296,6 +599,41 @@ def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget=None,
     hy, hx = wy // 2, wx // 2
     if n < 2 or ny == 0 or nx == 0:
         return np.full((ny, nx), np.nan, dtype=np.float32)
+
+    # ROW BANDS WITH AN hy HALO. A pixel's partners live within +-hy rows, so
+    # a band's own rows carry the full-raster answer; the halo pairs are
+    # recomputed, which is the whole price. Only a caller that OWNS the host
+    # may raise `threads` -- the fit3d gate does, a per-chunk task must not.
+    _th = max(1, int(threads))
+    if _th > 1 and ny >= 2 * (hy + 1):
+        from concurrent.futures import ThreadPoolExecutor
+        _mb = _3d_budget_mb(budget) / _th
+        H = max(hy + 1, -(-ny // _th))
+        bands = [(a, min(a + H, ny)) for a in range(0, ny, H)]
+        kk0 = int(topk) if topk else 0
+        best_o = np.empty((ny, nx), np.float32)
+        if kk0:
+            tv_o = np.empty((ny, nx, kk0), np.float32)
+            ty_o = np.empty((ny, nx, kk0), np.int16)
+            tx_o = np.empty((ny, nx, kk0), np.int16)
+
+        def _band(band):
+            ya, yb = band
+            a0 = max(0, ya - hy); b0 = min(ny, yb + hy)
+            m = None if topk_mask is None else np.asarray(topk_mask)[a0:b0]
+            r = _3d_arcs_kernel(S[:, a0:b0], wy, wx, (cy, cx), _mb,
+                                topk=topk, topk_mask=m)
+            sl = slice(ya - a0, yb - a0)
+            if kk0:
+                best_o[ya:yb] = r[0][sl]
+                tv_o[ya:yb] = r[1][sl]
+                ty_o[ya:yb] = r[2][sl]
+                tx_o[ya:yb] = r[3][sl]
+            else:
+                best_o[ya:yb] = r[sl]
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_band, bands))
+        return (best_o, tv_o, ty_o, tx_o) if kk0 else best_o
 
     # ---- BUILD THE OPERAND IN SLABS -------------------------------------
     # The whole-pixel rule first: a pixel is inside the radar extent or it is
@@ -511,9 +849,12 @@ def _3d_depth(chunks, window):
     set of scatterers near the seams. That is the design, not an error: a
     pixel at a block edge sees the neighbourhood its block affords.
     """
-    _, _, pey, pex = _3d_windows(window)
+    # THE DS BOX IS THE REACH. What a block computes beyond its own edge is
+    # the neighbourhood the DS window looks over; the PS extent bounds nothing
+    # a halo can carry, since a node reaches every other node of its block.
+    wy, wx, _, _ = _3d_windows(window)
     depth = []
-    for _cs, _w in zip((tuple(chunks[0]), tuple(chunks[1])), (pey, pex)):
+    for _cs, _w in zip((tuple(chunks[0]), tuple(chunks[1])), (wy, wx)):
         if len(_cs) == 1:
             depth.append(0)
             continue
@@ -562,7 +903,7 @@ def _3d_windows(window):
 
 
 def _3d_ps_kernel(block, window, quality, ele2phase, t, meter2rad,
-                  threshold=0.5, budget=None, device='cpu', iterations=8):
+                  threshold=0.5, budget=None, iterations=8):
     """Fitted arc coherence to ONE partner per bearing -- the PS test.
 
     A persistent scatterer carries no dominant noise, so an arc to a distant
@@ -816,7 +1157,7 @@ A NINE-PATCH RING AROUND EVERY CANDIDATE. The centre patch is the pixel's
         # dropping it here would silently size the fit's largest operand by the
         # 128 MB default whatever the caller configured.
         g, _, _, _ = _3d_arc_fit(np.ascontiguousarray(arc), ele2phase, t, meter2rad,
-                              budget=budget, device=device,
+                              budget=budget,
                               iterations=iterations)
         for e in (a_, b_):
             np.maximum.at(best, e, np.where(np.isfinite(g), g, -1.0))
@@ -950,7 +1291,7 @@ def _3d_arcs_select(U, quality, window, threshold, cell=(2, 8)):
 
 def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
                 step_dh=4.0, step_dv=2.0, budget=None, max_seasonal=5.0,
-                device='cpu', iterations=8, seed_th=None):
+                iterations=8, seed_th=None):
     """Joint (height, velocity) fit on many arcs at once, WITHOUT priors.
 
     arc     : (n_dates, n_arcs) COMPLEX arc, u_i * conj(u_j). Phase never
@@ -1127,7 +1468,7 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
             sl = slice(s0, min(s0 + step, m))
             gs[sl], hs[sl], vs[sl], ss[sl] = _3d_arc_fit(
                 arc[:, sl], ele2phase, t, meter2rad, max_dh, max_dv,
-                step_dh, step_dv, budget, max_seasonal, device,
+                step_dh, step_dv, budget, max_seasonal,
                 iterations,
                 seed_th=None if seed_th is None else seed_th[sl])
         return gs, hs, vs, ss
@@ -1142,20 +1483,6 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
     hh = (np.zeros_like(tt) if no_h
           else np.asarray(ele2phase, dtype=np.float64))
 
-    # BOTH STAGES RUN ON THE GPU WHEN ONE IS ASKED FOR. They are large regular
-    # kernels -- one product and a fixed loop -- so they map straight across
-    # and the arithmetic is identical rather than approximated. Whether that
-    # pays at a given batch size is HARDWARE, not something to hardcode: the
-    # batch follows the dask chunk budget, and a device with cheap launches
-    # wins at sizes where one with expensive launches does not. `device` is
-    # honoured as asked; `budget` is the dial that sizes the work.
-    _dev = None
-    if device not in (None, 'cpu'):
-        from .utils_torch import get_torch_device
-        _d = str(getattr(get_torch_device(device), 'type', 'cpu'))
-        if _d != 'cpu':
-            _dev = _d
-
     # ---- stage 1: lattice, one product ---------------------------------
     P = np.stack(np.meshgrid(gh, gv, indexing='ij'), -1).reshape(-1, 2)
     C = np.exp(-1j * (np.outer(hh, P[:, 0])
@@ -1165,9 +1492,8 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
     # THE PRODUCT IS BATCHED BY ITS OWN OUTPUT, not by the arcs going in. The
     # callers size their batches so the ARC array fits `budget`, but this
     # allocates (arcs x lattice), which is thousands of times larger -- so the
-    # peak here is nothing like what `budget` accounted for. CPU absorbs the
-    # oversized temporary; MPS does not raise on an allocation past its limit,
-    # it SEGFAULTS, and only on rasters large enough to reach it.
+    # peak here is nothing like what `budget` accounted for, and it is batched
+    # down to what `budget` allows.
     # A SEED SKIPS THE LATTICE ENTIRELY. The caller already knows where this
     # arc's optimum is -- from the network, which has solved both ends onto one
     # datum -- so the search that finds the basin has nothing left to find. The
@@ -1192,19 +1518,9 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
         _mb = _3d_budget_mb(budget)
         _blk = max(1, int(_mb * 1024 * 1024 // max(_L * 8, 1)))
         k = np.empty(Z.shape[1], dtype=np.int64)
-        if _dev is not None:
-            import torch
-            _Cg = torch.from_numpy(C).to(_dev)
-            for _b0 in range(0, Z.shape[1], _blk):
-                _sl = slice(_b0, min(_b0 + _blk, Z.shape[1]))
-                _Zg = torch.from_numpy(np.ascontiguousarray(Z[:, _sl])).to(_dev)
-                k[_sl] = torch.argmax(torch.abs(_Zg.T @ _Cg), dim=1).cpu().numpy()
-                del _Zg
-            del _Cg
-        else:
-            for _b0 in range(0, Z.shape[1], _blk):
-                _sl = slice(_b0, min(_b0 + _blk, Z.shape[1]))
-                k[_sl] = np.argmax(np.abs(Z[:, _sl].T @ C), axis=1)
+        for _b0 in range(0, Z.shape[1], _blk):
+            _sl = slice(_b0, min(_b0 + _blk, Z.shape[1]))
+            k[_sl] = np.argmax(np.abs(Z[:, _sl].T @ C), axis=1)
         if not (max_seasonal and max_seasonal > 0):
             del C                  # kept below: the seasonal stage re-solves on it
         TH0 = (P[k][:, 1:] if no_h else P[k]).astype(np.float64)
@@ -1234,38 +1550,15 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
         # are worth refining. It is the same code and the same model, just
         # stopped one step early; the chosen few are then refined normally.
         TH = TH0
-    elif _dev is not None:
-        import torch
-        # THE REFINEMENT STAGES Z ITSELF, ALWAYS. The lattice loop above moves
-        # Z across in slices and frees each one as it goes -- it is sized for
-        # the (arcs x candidates) product, not for this -- so nothing it left
-        # behind can be reused here. Referencing it was an UnboundLocalError on
-        # every GPU call, seeded or not, which is why this path went unused.
-        _Zg = torch.from_numpy(np.ascontiguousarray(Z)).to(_dev)
-        _U = torch.from_numpy(U.astype(np.float32)).to(_dev)
-        _P = torch.from_numpy(PINV.astype(np.float32)).to(_dev)
-        _TH = torch.from_numpy(TH0.astype(np.float32)).to(_dev)
-        for _ in range(iterations):
-            _ph = _U @ _TH.T
-            _R = _Zg * torch.exp(torch.complex(torch.zeros_like(_ph), -_ph))
-            _mu = _R.sum(dim=0)
-            _am = torch.abs(_mu)
-            _R = _R * torch.conj(
-                _mu / torch.where(_am > 0, _am, torch.ones_like(_am)))[None, :]
-            _TH = _TH + (_P @ _R.imag).T
-        TH = _TH.cpu().numpy().astype(np.float64)
-        del _Zg, _U, _P, _TH, _ph, _R, _mu, _am
-        if _dev == 'mps':
-            torch.mps.empty_cache()
     else:
         TH = TH0.copy()
         for _ in range(iterations):
-            R = Z * np.exp(-1j * (U @ TH.T)).astype(np.complex64)
+            R = _3d_rotate(Z, U @ TH.T)
             mu = R.sum(axis=0)
             R *= np.conj(mu / np.where(np.abs(mu) > 0, np.abs(mu), 1.0))[None, :]
             TH = TH + (PINV @ R.imag).T
 
-    R = Z * np.exp(-1j * (U @ TH.T)).astype(np.complex64)
+    R = _3d_rotate(Z, U @ TH.T)
     gam = (np.abs(R.sum(axis=0)) / np.maximum(nv, 1)).astype(np.float32)
 
     if max_seasonal and max_seasonal > 0:
@@ -1420,7 +1713,7 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
                 for kt in range(-nt, nt + 1):
                     TH_k = TH_r.copy()
                     TH_k[:, rate_col] = TH_k[:, rate_col] + kt * comb
-                    Rk = (Z * np.exp(-1j * (U @ TH_k.T))).astype(np.complex64)
+                    Rk = _3d_rotate(Z, U @ TH_k.T)
                     G = np.abs(Rk.T @ Cbank)              # (m, nC)
                     kc = np.argmax(G, axis=1)
                     g_ = G[np.arange(m), kc] / np.maximum(nv, 1)
@@ -1439,12 +1732,12 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
                     del Cm
             THs = bth
             for _ in range(iterations):
-                Rs = Z * np.exp(-1j * (Us @ THs.T)).astype(np.complex64)
+                Rs = _3d_rotate(Z, Us @ THs.T)
                 mus = Rs.sum(axis=0)
                 Rs *= np.conj(mus / np.where(np.abs(mus) > 0,
                                              np.abs(mus), 1.0))[None, :]
                 THs = THs + (PINVs @ Rs.imag).T
-            Rs = Z * np.exp(-1j * (Us @ THs.T)).astype(np.complex64)
+            Rs = _3d_rotate(Z, Us @ THs.T)
             g_a = np.abs(Rs.sum(axis=0)) / np.maximum(nv, 1)
             up = g_a > gbest
             gbest = np.where(up, g_a, gbest)
@@ -1544,7 +1837,7 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=100.0, max_dv=25.0,
 
 
 def _3d_arc_fit_brute(arc, ele2phase, t, meter2rad, h_range=150.0, v_range=60.0,
-                      h_step=0.5, v_step=0.25, device=None, budget=None):
+                      h_step=0.5, v_step=0.25, budget=None):
     """Exhaustive (height, rate) scan -- the REFERENCE the ladder is checked against.
 
     _3d_arc_fit walks a coarse-to-fine ladder and can land in the wrong basin;
@@ -1557,16 +1850,14 @@ def _3d_arc_fit_brute(arc, ele2phase, t, meter2rad, h_range=150.0, v_range=60.0,
 
         gamma(a, c) = |sum_d Z[d, a] conj(E[d, c])| / n_valid
 
-    with E the (dates x candidates) model bank, so it is a GEMM and batches on
-    a GPU exactly like the arc kernel. On this machine a 101 x 81 grid over
-    10000 arcs is seconds.
+    with E the (dates x candidates) model bank, so it is a GEMM like the arc
+    kernel's, and a full grid over thousands of arcs stays cheap.
 
     UNLIKE the ladder this takes a RANGE, which is a prior. That is why it is a
     reference and not the estimator: the ladder's search window is set by the
     baselines alone. Use it to verify, to debug a suspect pixel, or in a test
     that asserts the ladder finds what is there.
 
-    device: 'cuda' / 'mps' / 'cpu' / None to pick the best available.
     Returns (gamma, height_rad, velocity_rad_yr), each (n_arcs,).
     Height is radians per unit ele2phase and rate is radians per year: the
     library works in phase throughout and only displacement_los()
@@ -1620,105 +1911,6 @@ def _3d_arc_fit_brute(arc, ele2phase, t, meter2rad, h_range=150.0, v_range=60.0,
     return best_g.astype(np.float32), best_h, best_v
 
 
-def _3d_deterministic_detrend(X, t, bperp=None, iters=60):
-    """Remove the DETERMINISTIC part of each series, keep atmosphere and noise.
-
-    The screen handed to the interpolation must keep atmosphere AND noise --
-    they are both white in time and cannot be separated per pixel, only in
-    space -- and must lose whatever is deterministic, because anything smooth
-    left in the residual is deformation that a caller would subtract from the
-    data.
-
-    A smoothness prior cannot decide this here. Gaussian-process regression
-    with a fitted noise ratio fails in exactly the regime this data occupies:
-    on a noise-dominated series its own marginal likelihood concludes there is
-    no smooth part, keeps only the constant, and passes the WHOLE deterministic
-    signal into the screen. Node residuals ARE noise-dominated, so the screen
-    it produces is the whole residual, deformation included.
-
-    A fixed basis cannot be fooled that way: it removes its own degrees of
-    freedom and no more, whatever the noise level or the cadence. Against
-    planted signals what survives is the estimator's own coefficient noise
-    rather than the signal, and nearly all of the white part is left intact.
-
-    The basis is {1, t}: offset and rate, matching the (dv, dh) model the arcs
-    are fitted with. The annual term is deliberately NOT here. Tropospheric
-    delay was once assumed to be seasonal itself, which would have made a
-    cos/sin term strip real atmosphere. Whether it actually is seasonal has to
-    be tested on the stack in hand -- against a permuted-date null, and by
-    looking for a spectral peak at one cycle per year -- not assumed. This
-    function assumes the screen is white in time, and the cos/sin term is not
-    removed here, so a seasonal component would survive to be seen.
-
-    Including cos/sin costs held-out coherence: with only a small differential
-    seasonal in the arcs, two extra free parameters are fitting noise, and a
-    held-out test punishes exactly that. So the term stays out of THIS function
-    -- but see max_seasonal on the arc fit, where a small allowance helps.
-
-    What this does not remove is a quadratic or a transient: those are
-    genuinely non-parametric, and catching them was the GP's justification,
-    which it does not deliver.
-
-    Fitted on the PHASORS by Gauss-Newton on Im(Z conj(model)), the component
-    of the unit radius vector perpendicular to the model. It equals the phase
-    error to first order and saturates instead of jumping a turn at +-pi, so
-    nothing is ever wrapped or unwrapped. Because it saturates, it also
-    converges SLOWLY when the series carries a lot of phase, and these do, so
-    the step is scaled to a Newton one (see below). A screen with a residual
-    rate biases every velocity it is ever removed from.
-
-    THE BASELINE IS DETERMINISTIC TOO. Atmospheric delay is not correlated
-    with the perpendicular baseline -- that is what distinguishes it from
-    topography -- so any part of a residual proportional to ele2phase(d) is by
-    definition NOT atmosphere and must not be carried into the screen. The
-    per-node height came out with the network model, but a network solved on
-    few arcs leaves a common height error behind, and a sparse stage's screen
-    then spreads it over everything the interpolation reaches. Removing the
-    baseline direction here costs nothing when there is none to remove.
-
-    X     : (n_dates, n_series) complex residual phasors.
-    bperp : (n_dates,) height-to-phase factor, or None to leave the baseline
-            direction in (it is then only removed if it happens to be
-            collinear with time).
-    Returns the remainder, also as unit phasors.
-    """
-    X = np.asarray(X)
-    if not np.iscomplexobj(X):
-        raise TypeError(f'X must be complex phasors, got {X.dtype}')
-    n = X.shape[0]
-    if n < 6 or X.shape[1] == 0:
-        return (X / np.maximum(np.abs(X), 1e-30)).astype(np.complex64)
-    ts = np.asarray(t, dtype=np.float64)
-    cols = [np.ones(n), ts - ts.mean()]
-    if bperp is not None:
-        bb = np.asarray(bperp, dtype=np.float64)
-        bb = bb - bb.mean()
-        if np.any(np.abs(bb) > 0):
-            cols.append(bb / np.max(np.abs(bb)))
-    B = np.stack(cols, axis=1)
-    pinv = np.linalg.pinv(B)
-    A = np.abs(X)
-    Z = np.where(A > 0, X / np.where(A > 0, A, 1.0), 0).astype(np.complex128)
-    ok = A > 0
-    c = np.zeros((B.shape[1], Z.shape[1]))
-    for _ in range(int(iters)):
-        r = Z * np.exp(-1j * (B @ c))
-        # A PLAIN step, deliberately. The update rides on sin(error), whose
-        # slope is <cos(error)> ~ exp(-sigma^2/2), so it travels only part of
-        # the way and needs many iterations -- and scaling by that slope to
-        # make it a Newton step, which converges in a tenth of them on planted
-        # series, is UNSTABLE here: the factor is 1/coherence, and a weak node
-        # gets its step amplified enormously and overshoots. Iterating plainly
-        # costs a negligible fraction of the solve.
-        c = c + pinv @ np.where(ok, r.imag, 0.0)
-    # The rate and the baseline term come out; the CONSTANT stays. The constant
-    # is the node's base, and the network has already set it relative to every
-    # other node -- removing it here would give each node an independent base
-    # again and the screens would no longer average to a field.
-    c[0] = 0.0
-    out = Z * np.exp(-1j * (B @ c))
-    out = np.where(ok, out, 0.0)
-    return (out / np.maximum(np.abs(out), 1e-30)).astype(np.complex64)
 
 
 
@@ -1737,199 +1929,12 @@ def _3d_budget_mb(budget):
     return float(get_dask_chunk_size_mb())
 
 
-def _3d_krige(vals, py, px, ny, nx, spacing, window, nlags=24):
-    """The screen at every pixel: all nodes in the WINDOW, covariance-weighted.
-
-    `vals` is (n_dates, n_nodes) COMPLEX unit phasors. Kriging the wrapped
-    ANGLE instead is wrong and measurably so: two nodes whose phases differ by
-    more than pi average to a value near neither, so the interpolant is worse
-    than copying the nearest node. Phase is circular, so the components are
-    interpolated and recombined; the variogram is built on the phase DIFFERENCE
-    between nodes, which is well defined however the two are wrapped.
-
-    THE NEIGHBOURHOOD IS THE WINDOW, not a fixed number of nodes. A count is a
-    hidden distance: a fixed count of nearest nodes reaches only a few metres
-    where nodes are dense, averaging many samples of ONE resolution element and
-    cancelling no noise at all. `window` is already the spatial scale the caller
-    asked for, and the atmosphere is correlated across that range: a single
-    node's screen transfers very little on its own, flat with separation, so the
-    screen exists but is buried in per-node noise and only appears once many
-    nodes are averaged.
-
-    That average is the whole point of the interpolation, so it must be over
-    every node in the window rather than a truncated list. Taking all of them
-    turns the estimator into a convolution, which is also what makes it
-    affordable: an FFT per date instead of a linear solve per pixel.
-    """
-    from scipy.signal import fftconvolve
-    n = vals.shape[0]
-    sy, sx = float(spacing[0]), float(spacing[1])
-    wy, wx = int(window[0]), int(window[1])
-    py = np.asarray(py, dtype=np.int64)
-    px = np.asarray(px, dtype=np.int64)
-    P = np.c_[py.astype(float) * sy, px.astype(float) * sx]
-
-    rng = np.random.default_rng(0)
-    npair = int(min(200000, max(1000, len(P) * 40)))
-    i = rng.integers(0, len(P), npair)
-    j = rng.integers(0, len(P), npair)
-    ok = i != j
-    i, j = i[ok], j[ok]
-    d = np.hypot(P[i, 0] - P[j, 0], P[i, 1] - P[j, 1])
-    # THE VARIOGRAM WITHOUT TAKING AN ANGLE. For unit phasors the coherence of
-    # a pair over the dates, R = |mean_d z_i conj(z_j)|, is exp(-sigma^2/2) for
-    # the variance of their phase difference, so gamma = -ln R exactly. Only
-    # the MAGNITUDE of a complex mean is used and nothing is ever wrapped.
-    #
-    # The squared-angle form this replaces was the last wrapping operation in
-    # the whole path, and it saturates: an angle cannot exceed pi, so once the
-    # screen varies by more than that the estimate stops growing and reports
-    # structure that is not there: it inflates the nugget towards the sill,
-    # and the fitted range then swings wildly on a modest change in the node
-    # set -- which sets the kernel size, and so the coverage.
-    R_ = np.abs(np.mean(vals[:, i] * np.conj(vals[:, j]), axis=0))
-    semi = -np.log(np.clip(R_, 1e-6, 1.0))
-    hi = np.percentile(d, 95)
-    edges = np.linspace(0.0, max(hi, 1.0), nlags + 1)
-    which = np.clip(np.digitize(d, edges) - 1, 0, nlags - 1)
-    lagd = np.full(nlags, np.nan)
-    lagg = np.full(nlags, np.nan)
-    for k in range(nlags):
-        m = which == k
-        if m.any():
-            lagd[k] = d[m].mean()
-            lagg[k] = semi[m].mean()
-    m = np.isfinite(lagd) & np.isfinite(lagg)
-    if m.sum() < 3:
-        sill = float(max(np.nanmean(semi), 1e-6))
-        nug = 0.1 * sill
-        rng_ = float(max(np.median(d), 1.0))
-    else:
-        sill = float(np.nanmax(lagg[m]))
-        nug = float(np.clip(lagg[m][0], 0.0, 0.9 * sill))
-        half = np.where(lagg[m] >= 0.5 * (sill + nug))[0]
-        rng_ = float(lagd[m][half[0]]) if len(half) else float(np.median(d))
-        rng_ = max(rng_, 1.0)
-
-    # the kernel is the covariance over the window extent; the nugget stays out
-    # of it, since it is the part of a node's value that does NOT transfer
-    # THE WINDOW IS THE BOX, so the reach is HALF of it either way -- (32, 128)
-    # px on an 8 x 2 m grid is 256 x 256 m of ground and the kernel runs to
-    # +-128 m, the same convention _3d_arc_offsets uses. Spanning a full window
-    # each way doubles the reach and pulls in nodes the variogram says carry
-    # nothing: with a nugget-dominated variogram the far half of that kernel
-    # adds weight without adding information.
-    # THE REACH STOPS WHERE THE COVARIANCE DOES, not where the window does.
-    # The kernel is exp(-3h/range), so at one range it is exp(-3) = 0.05 and
-    # past that there is nothing left to weight with: several ranges out the
-    # weight is many orders of magnitude below that. Interpolating from that is
-    # not interpolation, it is round-off with a direction, and it shows: pixels
-    # held by only a few nodes carry large steps between NEIGHBOURING pixels --
-    # near reversals -- where densely held ones are smooth. The window stays
-    # the outer bound, because it is what the
-    # caller set; the range is what the data can support inside it.
-    ry = min(wy // 2, max(1, int(np.ceil(rng_ / sy))))
-    rx = min(wx // 2, max(1, int(np.ceil(rng_ / sx))))
-    ky = np.arange(-ry, ry + 1)
-    kx = np.arange(-rx, rx + 1)
-    hh = np.hypot(np.outer(ky * sy, np.ones_like(kx)),
-                  np.outer(np.ones_like(ky), kx * sx))
-    # TAPERED TO ZERO AT ITS OWN EDGE. A kernel that stops abruptly makes the
-    # screen jump: crossing the boundary adds or drops a node whose weight was
-    # still a noticeable fraction of the peak, and where few nodes carry the
-    # estimate that one is most of it. Without the taper, pixels with only a
-    # few nodes in reach show large steps between NEIGHBOURING pixels.
-    #
-    # Subtracting the edge value makes the weight reach zero continuously, so a
-    # node entering the neighbourhood arrives with no weight at all and nothing
-    # can step. The support is unchanged in the interior, where the estimate was
-    # never in doubt.
-    R = min(rng_, float(np.hypot(ry * sy, rx * sx)))
-    K = ((sill - nug) * np.maximum(np.exp(-3.0 * hh / rng_)
-                                   - np.exp(-3.0 * R / rng_), 0.0)
-         ).astype(np.float32)
-
-    field = np.zeros((ny, nx), dtype=np.complex64)
-    mask = np.zeros((ny, nx), dtype=np.float32)
-    mask[py, px] = 1.0
-    # COVERAGE IS A BOX TEST, NOT A THRESHOLD ON THE TRANSFORM. A pixel is
-    # reached exactly when a node lies inside the window centred on it, and
-    # maximum_filter answers that with no arithmetic to go wrong.
-    #
-    # It used to ask `fftconvolve(mask, K) > 1e-12`, which is a test orders of
-    # magnitude below the noise of the thing being tested: the convolution
-    # carries float32 round-off far outside the kernel's support, including
-    # NEGATIVE values, which a sum of positive weights cannot produce. Every
-    # one of them passed. The screen was therefore extrapolated across the entire block
-    # however small the window: from a cluster spanning 8 rows it covered all
-    # 400, a reach of 198 rows where 128 was the most the window allows.
-    from scipy.ndimage import maximum_filter
-    good = maximum_filter(mask, size=K.shape, mode='constant', cval=0.0) > 0
-    den = fftconvolve(mask, K, mode='same')
-    # the taper zeroes the kernel outside its disc, so the box above is now
-    # generous: a pixel in the corner of the box but beyond the disc collects no
-    # weight at all. Its den is pure transform round-off, so anything a
-    # millionth of ONE node's peak weight is real support and anything below it
-    # is noise wearing a direction.
-    good &= den > 1e-6 * float(K.max())
-    # ACCURACY IS A PROPERTY OF EACH PIXEL, NOT OF A CROP. A convex hull was
-    # tried and is wrong: it is a polygon, so it discards a pixel lying metres
-    # from a node merely because that node happens to sit on the boundary,
-    # while admitting anything inside however thin the support there is.
-    #
-    # The estimate's own variance says it per pixel and costs one convolution.
-    # With weights w = K/den, simple kriging leaves
-    #     sigma^2(x) = C(0) - sum_i w_i C(x - x_i) = K(0) - den2/den
-    # which falls to zero where the pixel sits on a node and rises to K(0)
-    # where the weights are spread over nodes too far to say anything. It is
-    # geometry alone -- no value enters it -- so it is the same number whatever
-    # the atmosphere did that day.
-    den2 = fftconvolve(mask, (K ** 2).astype(np.float32), mode='same')
-    with np.errstate(invalid='ignore', divide='ignore'):
-        var = float(K.max()) - den2 / np.maximum(den, 1e-30)
-    _3d_krige.var = np.where(good, var / max(float(K.max()), 1e-30), np.nan)
-    # AND IT MUST BE AN INTERPOLATION. Kish's effective sample size,
-    # (sum K)^2 / sum K^2, is 1 when one node carries the estimate however many
-    # are nominally in reach, and rises only as the weight genuinely spreads.
-    # Below 2 the screen is one node copied outward, which is a nearest-node
-    # assignment wearing the name of an interpolation -- and it is where the
-    # field tears: even with the taper in place, pixels at low n_eff carry
-    # large steps between neighbours where high-n_eff ones are smooth.
-    #
-    # 2 is structural rather than chosen: it is the point at which a second
-    # node contributes at all. Stricter cuts keep buying smoothness, trading
-    # coverage away as they go -- but those are preferences about how much
-    # ground to trade for how much
-    # quiet, and the caller controls that already through `window`.
-    den2 = fftconvolve(mask, (K ** 2).astype(np.float32), mode='same')
-    with np.errstate(invalid='ignore', divide='ignore'):
-        neff = np.where(den2 > 0, den ** 2 / np.maximum(den2, 1e-30), 0.0)
-    good &= neff >= 2.0
-    out = np.empty((n, ny, nx), dtype=np.complex64)
-    for d_ in range(n):
-        field[:] = 0
-        field[py, px] = vals[d_]
-        num = (fftconvolve(field.real, K, mode='same')
-               + 1j * fftconvolve(field.imag, K, mode='same'))
-        with np.errstate(invalid='ignore', divide='ignore'):
-            z = np.where(good, num, np.nan + 1j * np.nan)
-            # A ZERO NUMERATOR IS NOT A SCREEN. den > 0 only says some node lies
-            # under the kernel; the numerator is a signed sum and can cancel, or
-            # underflow in float32, at the fringe where the weights are tiny.
-            # Dividing it by its own magnitude then yields 0 + 0j, which is not
-            # a unit phasor and would ZERO the data it multiplies rather than
-            # rotate it. Before the guard this hit a scattering of samples,
-            # always a few dates at a pixel and never all of them, so nothing
-            # downstream would have flagged it.
-            mag = np.abs(z)
-            out[d_] = np.where(mag > 0, z / np.maximum(mag, 1e-30),
-                               np.nan + 1j * np.nan).astype(np.complex64)
-    return out
 
 
 
 def _3d_arc_batch(Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
-                  step_dh, step_dv, budget, device, iterations, seed_th=None):
+                  step_dh, step_dv, budget, iterations, seed_th=None,
+                  threads=1):
     """Fit every (src, tgt) arc between two phasor sets, in budgeted batches.
 
     NO DIFFERENTIAL ANNUAL. Both callers attach a pixel to a neighbour tens of
@@ -1937,11 +1942,30 @@ def _3d_arc_batch(Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
     and thermal delay vary with elevation and over kilometres, not across a
     courtyard. Fitting one is fitting noise, and two free parameters on a
     marginal arc buy enough coherence to carry the rate a whole sideband away.
+
+    threads : arcs are independent, so slices of them fit concurrently; the
+    GEMMs and ufuncs release the GIL. Only a caller that OWNS the host may
+    raise it -- the fit3d gate does, a per-chunk dask task must not.
     """
     n = Us.shape[0]
     ga = np.empty(len(src), np.float32)
     dha = np.empty(len(src)); dva = np.empty(len(src))
     dsa = np.empty(len(src), np.complex128)
+    _th = max(1, int(threads))
+    if _th > 1 and len(src) > _th:
+        from concurrent.futures import ThreadPoolExecutor
+        _mb = _3d_budget_mb(budget) / _th
+        bnd = np.linspace(0, len(src), _th * 4 + 1).astype(np.int64)
+
+        def _slice(i):
+            sl = slice(bnd[i], bnd[i + 1])
+            ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_batch(
+                Us, Ut, src[sl], tgt[sl], ele2phase, t, meter2rad, max_dh,
+                max_dv, step_dh, step_dv, _mb, iterations,
+                seed_th=None if seed_th is None else seed_th[sl])
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_slice, range(_th * 4)))
+        return ga, dha, dva, dsa
     step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 16, 1)))
     for b0 in range(0, len(src), step):
         sl = slice(b0, min(b0 + step, len(src)))
@@ -1949,20 +1973,21 @@ def _3d_arc_batch(Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
             (Us[:, src[sl]] * np.conj(Ut[:, tgt[sl]])).astype(np.complex64))
         ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
             arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-            budget, 0.0, device, iterations=iterations,
+            budget, 0.0, iterations=iterations,
             seed_th=None if seed_th is None else seed_th[sl])
     return ga, dha, dva, dsa
 
 
 def _3d_ds_solve(n_ds, ei, ep, e_dv, e_dh, e_g, ni, nj, p_dv, p_dh, p_g,
-                 ps_vel, ps_hgt, reject_sigma, passes):
+                 ps_vel, ps_hgt, err_v, err_h, passes):
     """Rate and height for every DS at once, from all of its equations.
 
         DS_i - PS_p = dv_ip     PS FIXED, so this pins the DS to the datum
         DS_i - DS_j = dv_ij     what relates one DS to the next
 
-    Returns (vel, hgt, n_surviving) -- the values and, per DS, how many of its
-    own equations came through the gate.
+    Returns (vel, hgt, n_surviving, n_anchor) -- the values and, per DS, how
+    many of its own equations came through the gate, and how many of THOSE
+    tie it to the fixed layer rather than to a peer at its own level.
 
     The PS are held rather than solved with the DS. They are the certified
     layer and they carry the datum; a hundred thousand weak DS solved jointly
@@ -1975,7 +2000,21 @@ def _3d_ds_solve(n_ds, ei, ep, e_dv, e_dh, e_g, ni, nj, p_dv, p_dh, p_g,
     over the neighbours it contradicts; only removal stops that, and the scale
     must not be re-estimated from the survivors or the gate feeds on itself
     and erodes the network instead of settling.
+
+    RATE AND HEIGHT ARE JUDGED TOGETHER, also as the node network does. Both
+    are solved every pass and an arc answers for the worse of its two
+    residuals, each against its own scale. Judged on the rate alone, an arc
+    that is metres out in height -- a facade, a roof edge, two scatterers at
+    different elevations inside one window -- passes the gate and its height
+    enters the answer unchallenged, so the heights could not be trusted even
+    where the rates were sound.
     """
+    # a list per CALL, published per THREAD: the two lsqr threads inside
+    # _both append through the closure, while concurrent attach blocks in
+    # other worker threads each publish their own list -- a bare function
+    # attribute was one shared list, and one block's reset wiped another's
+    conv = []
+    _3d_ds_solve._tl.conv = conv
     from scipy.sparse import coo_matrix, diags
     from scipy.sparse.linalg import lsqr
     m1, m2 = len(ei), len(ni)
@@ -1991,26 +2030,77 @@ def _3d_ds_solve(n_ds, ei, ep, e_dv, e_dh, e_g, ni, nj, p_dv, p_dh, p_g,
     rhs_h = np.r_[ps_hgt[ep] + e_dh, p_dh]
 
     def _solve(Gm, r, w):
+        # LSQR STARTS AT ZERO, so stopping early is shrinkage toward zero --
+        # a Landweber-type regularisation nobody asked for. `istop` and `itn`
+        # say whether that happened; discarding them hides it.
         sw = np.sqrt(np.maximum(w, 0.0))
-        return lsqr(diags(sw) @ Gm, sw * r, atol=1e-10, btol=1e-10,
-                    iter_lim=500)[0]
+        _o = lsqr(diags(sw) @ Gm, sw * r, atol=1e-10, btol=1e-10,
+                  iter_lim=500)
+        conv.append((int(_o[1]), int(_o[2]), int(Gm.shape[1])))
+        return _o[0]
+
+    def _both(Gm, w_, rv, rh):
+        """Rate and height together: two solves, one matrix, two threads.
+
+        The two right-hand sides share the matrix and depend on nothing of
+        each other's, and `lsqr` spends its time in kernels that release the
+        GIL, so the pair costs little more than one of them. That matters
+        because the gate now judges both residuals, so BOTH are solved on
+        every pass rather than height once at the end.
+        """
+        import threading
+        out = [None, None]
+
+        def _run(i, r):
+            out[i] = _solve(Gm, r, w_)
+
+        th = (threading.Thread(target=_run, args=(0, rv)),
+              threading.Thread(target=_run, args=(1, rh)))
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        return out[0], out[1]
+
+    def _mad(r):
+        return max(1.4826 * float(np.median(np.abs(r - np.median(r)))), 1e-12)
+
+    # BOTH RESIDUALS DECIDE, as the node network's gate does. An arc carries a
+    # differential rate AND a differential height, and the two fail
+    # independently: a facade or a roof edge can be metres out in height while
+    # its rate looks ordinary, and judged on the rate alone that arc is kept
+    # and its height goes into the answer unchallenged. Each residual is
+    # scored against its own scale, since a metre and a millimetre per year
+    # are not comparable numbers, and the worse of the two is what the arc is
+    # judged by.
+    def _z(Gm, xv, xh, rv, rh, s_v=None, s_h=None):
+        r_v = Gm @ xv - rv
+        r_h = Gm @ xh - rh
+        # THE SCALE IS THE BOUND THE CALLER STATED, not one read off the
+        # residuals: a set that is uniformly wrong produces a wide robust
+        # sigma and passes itself. Same rule as the network and the vote.
+        s_v = err_v if s_v is None else s_v
+        s_h = err_h if s_h is None else s_h
+        return np.maximum(np.abs(r_v) / s_v, np.abs(r_h) / s_h), s_v, s_h
 
     w = w0.copy()
-    x = _solve(G, rhs_v, w)
+    xv, xh = _both(G, w, rhs_v, rhs_h)
     for _ in range(max(1, int(passes))):
-        r = G @ x - rhs_v
-        sc = max(1.4826 * np.median(np.abs(r - np.median(r))), 1e-12)
-        w = w0 / np.maximum(np.abs(r) / sc, 1.0)
-        x = _solve(G, rhs_v, w)
+        z, _, _ = _z(G, xv, xh, rhs_v, rhs_h)
+        w = w0 / np.maximum(z, 1.0)
+        xv, xh = _both(G, w, rhs_v, rhs_h)
     live = np.ones(m1 + m2, dtype=bool)
-    if reject_sigma is not None:
-        r = G @ x - rhs_v
-        scale = max(1.4826 * np.median(np.abs(r - np.median(r))), 1e-12)
+    if err_v is not None:
+        # the scales are taken once and HELD, so the gate cannot feed on its
+        # own survivors -- the same rule the reweighting above answers to
+        _, s_v, s_h = _z(G, xv, xh, rhs_v, rhs_h)
         for _ in range(max(1, int(passes))):
             idx = np.flatnonzero(live)
-            xs = _solve(G[idx], rhs_v[idx], w[idx])
-            keep = np.abs(G[idx] @ xs - rhs_v[idx]) / scale <= reject_sigma
-            x = xs
+            xs_v, xs_h = _both(G[idx], w[idx], rhs_v[idx], rhs_h[idx])
+            zz, _, _ = _z(G[idx], xs_v, xs_h, rhs_v[idx], rhs_h[idx],
+                          s_v, s_h)
+            keep = zz <= 1.0
+            xv, xh = xs_v, xs_h
             if keep.all():
                 break
             nl = np.zeros(m1 + m2, dtype=bool)
@@ -2019,19 +2109,30 @@ def _3d_ds_solve(n_ds, ei, ep, e_dv, e_dh, e_g, ni, nj, p_dv, p_dh, p_g,
                 break
             live = nl
     idx = np.flatnonzero(live)
-    vel = _solve(G[idx], rhs_v[idx], w[idx])
-    hgt = _solve(G[idx], rhs_h[idx], w[idx])
+    vel, hgt = _both(G[idx], w[idx], rhs_v[idx], rhs_h[idx])
+    # TWO KINDS OF EQUATION, COUNTED APART. `DS - PS` ties a pixel to the
+    # FIXED layer and so to the datum; `DS - DS` is purely relative and ties
+    # it only to its neighbours. Summed together a cluster can clear any
+    # threshold on its own internal edges alone -- and with no surviving
+    # anchor its block of the system is rank-deficient in the datum
+    # direction, so lsqr returns the minimum-norm answer and the whole
+    # cluster is pulled toward zero.
     nsurv = np.zeros(n_ds, dtype=np.int64)
-    np.add.at(nsurv, ei[live[:m1]], 1)
+    nanch = np.zeros(n_ds, dtype=np.int64)
+    np.add.at(nanch, ei[live[:m1]], 1)
+    nsurv += nanch
     if m2:
         l2 = live[m1:]
         np.add.at(nsurv, ni[l2], 1)
         np.add.at(nsurv, nj[l2], 1)
-    return vel, hgt, nsurv
+    return vel, hgt, nsurv, nanch
 
 
-def _3d_pair_fit(Us, Ut, src, tgt, ele2phase, t, reject_sigma, passes,
-                 budget):
+_3d_ds_solve._tl = _threading.local()
+
+
+def _3d_pair_fit(Us, Ut, src, tgt, ele2phase, t, err_v, err_h, passes,
+                 budget, threads=1):
     """Differential height and rate for SHORT arcs, without a lattice.
 
     Both ends are already aligned by their own attachment, so there is nothing
@@ -2060,6 +2161,21 @@ def _3d_pair_fit(Us, Ut, src, tgt, ele2phase, t, reject_sigma, passes,
     m = len(src)
     g = np.empty(m, np.float32)
     dh = np.empty(m); dv = np.empty(m)
+    _th = max(1, int(threads))
+    if _th > 1 and m > _th:
+        # arcs are independent; slices of them fit concurrently
+        from concurrent.futures import ThreadPoolExecutor
+        _mb = _3d_budget_mb(budget) / _th
+        bnd = np.linspace(0, m, _th * 4 + 1).astype(np.int64)
+
+        def _slice(i):
+            sl = slice(bnd[i], bnd[i + 1])
+            g[sl], dh[sl], dv[sl] = _3d_pair_fit(
+                Us, Ut, src[sl], tgt[sl], ele2phase, t, err_v, err_h,
+                passes, _mb)
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_slice, range(_th * 4)))
+        return g, dh, dv
     step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024
                       // max(len(a1) * 64, 1)))
     for b0 in range(0, m, step):
@@ -2081,14 +2197,26 @@ def _3d_pair_fit(Us, Ut, src, tgt, ele2phase, t, reject_sigma, passes,
             sc = np.maximum(1.4826 * np.median(
                 np.abs(res - np.median(res, 0)), 0), 1e-9)
             z = np.abs(res) / sc
-            w = (np.where(z <= reject_sigma, 1.0 / np.maximum(z, 1.0), 0.0)
-                 if reject_sigma is not None else 1.0 / np.maximum(z, 1.0))
+            w = (np.where(z <= 1.0, 1.0 / np.maximum(z, 1.0), 0.0)
+                 if err_v is not None else 1.0 / np.maximum(z, 1.0))
         g[sl] = np.abs(np.exp(1j * res).mean(axis=0))
         dh[sl] = th_h
         dv[sl] = th_v
         del ph, w, res
     return g, dh, dv
 
+
+
+def _3d_lap(t0):
+    """Seconds since `t0`, and the mark for the next stage.
+
+    Stage timings ride the debug stream because the work runs inside dask
+    tasks on other processes, where a profiler attached to the caller sees
+    nothing. Returned as a pair so a caller can print one stage and start the
+    next from the same instant, leaving no gap between them.
+    """
+    _t = time.monotonic()
+    return _t - t0, _t
 
 def _3d_model_removed(U, ele2phase, t, h, v):
     """Divide each column's OWN fitted model out of its phasors.
@@ -2110,45 +2238,26 @@ def _3d_model_removed(U, ele2phase, t, h, v):
                                           + np.outer(t, v)))).astype(np.complex64)
 
 
-def _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, device='cpu'):
+def _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, threads=1):
     """Arc coherence at the PREDICTED model, for corrected phasors.
 
     Batched, because the gather is what costs memory here: the product itself
     is one column per arc, but `Us_c[:, src]` materialises (dates x arcs).
-
-    ON THE GPU THE PHASORS GO ACROSS ONCE. Both operands are (dates x pixels)
-    and small -- it is the ARC gather that is large -- so moving the two sets
-    over and indexing device-side keeps every batch on the device. Sending
-    gathered arcs instead would spend the transfer the kernel is meant to
-    save.
     """
     n = Us_c.shape[0]
     out = np.empty(len(src), dtype=np.float32)
-    _dev = None
-    if device not in (None, 'cpu'):
-        from .utils_torch import get_torch_device
-        _d = str(getattr(get_torch_device(device), 'type', 'cpu'))
-        if _d != 'cpu':
-            _dev = _d
-    if _dev is not None:
-        import torch
-        _A = torch.from_numpy(np.ascontiguousarray(Us_c)).to(_dev)
-        _B = torch.from_numpy(np.ascontiguousarray(Ut_c)).to(_dev)
-        # the batch bounds the (dates x arcs) gather, which is the only large
-        # allocation here -- and on MPS an oversized one segfaults rather than
-        # raising, so it is sized from `budget` like every other operand
-        step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 32, 1)))
-        for b0 in range(0, len(src), step):
-            sl = slice(b0, min(b0 + step, len(src)))
-            _i = torch.from_numpy(np.ascontiguousarray(src[sl])).to(_dev)
-            _j = torch.from_numpy(np.ascontiguousarray(tgt[sl])).to(_dev)
-            _p = (_A.index_select(1, _i) * torch.conj(_B.index_select(1, _j))
-                  ).sum(dim=0)
-            out[sl] = (torch.abs(_p) / n).cpu().numpy()
-            del _i, _j, _p
-        del _A, _B
-        if _dev == 'mps':
-            torch.mps.empty_cache()
+    _th = max(1, int(threads))
+    if _th > 1 and len(src) > _th:
+        # batches are independent; einsum releases the GIL
+        from concurrent.futures import ThreadPoolExecutor
+        bnd = np.linspace(0, len(src), _th * 4 + 1).astype(np.int64)
+
+        def _slice(i):
+            sl = slice(bnd[i], bnd[i + 1])
+            out[sl] = _3d_predict_gamma(Us_c, Ut_c, src[sl], tgt[sl],
+                                        _3d_budget_mb(budget) / _th)
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_slice, range(_th * 4)))
         return out
     step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 32, 1)))
     for b0 in range(0, len(src), step):
@@ -2158,21 +2267,221 @@ def _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, device='cpu'):
     return out
 
 
+def _3d_rotate(Z, X):
+    """`Z * exp(-i X)` in complex64, without the complex128 detour.
+
+    `np.exp(-1j * X)` evaluates the transcendental in float64 and builds a
+    complex128 array at sixteen bytes an element, which is then copied down.
+    cos and sin written straight into the halves of a complex64 result skip
+    both, and the reduction below is what makes the narrower evaluation safe.
+    """
+    # REDUCED BEFORE IT IS NARROWED. cos and sin are accurate in float32 only
+    # for a small argument, and these phases run to hundreds of radians, where
+    # a float32 argument costs three decimal digits. Folding into [-pi, pi] in
+    # float64 first keeps the error at the float32 floor whatever the phase.
+    x = np.asarray(X, np.float64)
+    x = (x - (2 * np.pi) * np.round(x / (2 * np.pi))).astype(np.float32)
+    e = np.empty(x.shape, np.complex64)
+    np.cos(x, out=e.real)
+    np.sin(x, out=e.imag)
+    np.negative(e.imag, out=e.imag)
+    e *= Z
+    return e
+
+
+@_numba.njit(nogil=True, cache=True)
+def _3d_topk_stream(score, src, nsrc, k):
+    """One pass of replace-the-minimum per source -- the lexsort's answer
+    at O(arcs x k) instead of a sort of the whole graph. Strict `>` keeps
+    the EARLIEST arc on ties, exactly as the stable sort did."""
+    vals = np.full((nsrc, k), -np.inf, np.float64)
+    idxs = np.full((nsrc, k), -1, np.int64)
+    for a in range(len(score)):
+        v = score[a]
+        if not np.isfinite(v):
+            continue
+        s = src[a]
+        mi = 0
+        mv = vals[s, 0]
+        for j in range(1, k):
+            if vals[s, j] < mv or (vals[s, j] == mv
+                                   and idxs[s, j] > idxs[s, mi]):
+                mv = vals[s, j]; mi = j
+        if v > mv:
+            # evict the LATEST arc among the minimum slots, so ties keep
+            # the earliest -- the stable sort's choice
+            vals[s, mi] = v
+            idxs[s, mi] = a
+    return idxs
+
+
 def _3d_topk_per_src(score, src, nsrc, k):
     """Indices of the best `k` arcs of each source, NaN ranked last."""
-    sc = np.where(np.isfinite(score), score, -np.inf)
-    o = np.lexsort((-sc, src))
-    cnt = np.bincount(src[o], minlength=nsrc)
-    off = np.r_[0, np.cumsum(cnt)[:-1]]
-    col = np.arange(len(o)) - np.repeat(off, cnt)
-    return o[(col < k) & np.isfinite(score[o])]
+    idxs = _3d_topk_stream(np.asarray(score, np.float64),
+                           np.asarray(src, np.int64), int(nsrc), int(k))
+    out = idxs.ravel()
+    return out[out >= 0]
+
+
+def _3d_reach_tiles(pos):
+    """DS candidates by tile, with the nodes that tile can reach.
+
+    `pos` is `(src_y, src_x, tgt_y, tgt_x, ry, rx, hy, hx)` in pixels: the
+    candidate and node positions, the HALF PS extent -- the same radius the
+    node-to-node arcs get from their Chebyshev query, so a DS reaches exactly
+    as far as a PS does -- and the DS window, which is the tile.
+
+    A TILE OF CANDIDATES IS ANSWERED BY ONE DENSE PRODUCT. The operand is the
+    nodes within the PS extent of the tile's own bounds, and since every pixel
+    in the tile lies inside those bounds, its whole window is inside the
+    operand: no pair in the product needs testing, and none that belongs is
+    missing. The reach the tile adds is its own half-size, and a tile is
+    counted in DS windows -- the scale the DS window is DEFINED by, the area
+    over which the atmospheric phase does not change -- so the extent and the
+    extent grown by a tile stand in the same atmosphere and the arcs mean the
+    same thing.
+
+    THE TILE IS THE DS WINDOW, and nothing else has to be decided. Larger
+    tiles reach further and so rank each candidate against more nodes, which
+    costs more than the products it saves; smaller ones cut the product into
+    pieces too thin to be worth a call. Neither margin is close, so there is
+    no size to tune and no memory to budget: a window's worth of candidates
+    against the nodes it reaches is a few megabytes whatever the block is,
+    and it falls out of the two windows the caller already declared.
+    """
+    sy, sx, ty, tx, ry, rx, wy, wx = pos
+    wy, wx = max(int(wy), 1), max(int(wx), 1)
+    kx = (sx // wx).astype(np.int64)
+    key = (sy // wy).astype(np.int64) * (int(kx.max()) + 1) + kx
+    order = np.argsort(key, kind='stable')
+    ks = key[order]
+    cut = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1], True])
+    for a, b in zip(cut[:-1], cut[1:]):
+        idx = order[a:b]
+        _y, _x = sy[idx], sx[idx]
+        tsel = np.nonzero((ty >= _y.min() - ry) & (ty <= _y.max() + ry)
+                          & (tx >= _x.min() - rx) & (tx <= _x.max() + rx))[0]
+        yield idx, tsel
+
+
+def _3d_shortlist_ds_ps(Us, Ut, base_lab, nsrc, ele2phase, t, meter2rad,
+                        max_dh, max_dv, step_dh, step_dv, budget,
+                        iterations, min_agreeing, threshold,
+                        stats=None, prefix='ds_', debug=False,
+                        fix_h=None, fix_v=None, threads=1, pos=None):
+    """DS to PS over the 3x3 DS-WINDOW neighbourhood, every candidate fitted.
+
+    THE WINDOW LATTICE IS THE NEIGHBOURHOOD. A candidate takes the nodes whose
+    DS window is its own or one of the eight around it. That is an integer
+    index test, not a distance, so there is no reach to tune and no geometry to
+    compute; and since the winner grid holds one node per half-window cell, a
+    window offers at most four and the candidate set is bounded at thirty-six
+    by construction.
+
+    THE BOUND IS WHY NOTHING IS RANKED. A ranking exists to avoid fitting, and
+    with a bounded set the fit costs less than the machinery that would choose
+    within it -- so there is no raw score, no seed, and no provisional model.
+    Removing them also removes an error. A raw score is a coherence, so it
+    decays with the arc's own height at `ele2phase * meter2rad` radians per
+    metre: a tall scatterer's true partner scores like noise and ranks last,
+    which is exactly where the height is the thing being measured. A ranking
+    built on it must also estimate the candidate's model before it can rank,
+    and estimating that model from whatever the reach admits makes the ruler
+    move when the reach does. Fitting every candidate cannot make either
+    mistake.
+
+    Returns (ksrc, ktgt, ga, dha, dva, dsa, good), aligned.
+    """
+    if pos is None:
+        raise ValueError('_3d_shortlist_ds_ps needs `pos` to name the windows')
+    dy_, dx_, ny_, nx_, _ry, _rx, wy, wx = pos
+    dy_, dx_ = np.asarray(dy_), np.asarray(dx_)
+    ny_, nx_ = np.asarray(ny_), np.asarray(nx_)
+    wy, wx = max(int(wy), 1), max(int(wx), 1)
+    # THE NODES ARE BUCKETED BY WINDOW ONCE, then each of the nine offsets is a
+    # pair of `searchsorted` bounds into that order -- the candidates never
+    # meet the nodes as a product, so nothing of graph length is materialised.
+    kdy, kdx = dy_ // wy, dx_ // wx
+    kpy, kpx = ny_ // wy, nx_ // wx
+    _stride = int(max(int(kdx.max(initial=0)), int(kpx.max(initial=0)))) + 3
+    _order = np.argsort((kpy + 1) * _stride + (kpx + 1), kind='stable')
+    _sorted = ((kpy + 1) * _stride + (kpx + 1))[_order]
+    _ks, _kt = [], []
+    for _oy in (-1, 0, 1):
+        for _ox in (-1, 0, 1):
+            _k = (kdy + 1 + _oy) * _stride + (kdx + 1 + _ox)
+            _lo = np.searchsorted(_sorted, _k, 'left')
+            _hi = np.searchsorted(_sorted, _k, 'right')
+            _cnt = _hi - _lo
+            _has = np.flatnonzero(_cnt > 0)
+            if not len(_has):
+                continue
+            _c = _cnt[_has]
+            _within = (np.arange(int(_c.sum()))
+                       - np.repeat(np.r_[0, np.cumsum(_c)[:-1]], _c))
+            _ks.append(np.repeat(_has.astype(np.int64), _c))
+            _kt.append(_order[np.repeat(_lo[_has], _c) + _within]
+                       .astype(np.int64))
+    ksrc = np.concatenate(_ks) if _ks else np.empty(0, np.int64)
+    ktgt = np.concatenate(_kt) if _kt else np.empty(0, np.int64)
+    if len(ksrc):
+        # the offsets arrive one ring at a time; the caller indexes by
+        # candidate, so restore that order
+        _o = np.lexsort((ktgt, ksrc))
+        ksrc, ktgt = ksrc[_o], ktgt[_o]
+
+    ga = np.full(len(ksrc), np.nan, np.float32)
+    dha = np.full(len(ksrc), np.nan)
+    dva = np.full(len(ksrc), np.nan)
+    dsa = np.zeros(len(ksrc), dtype=np.complex128)
+    if len(ksrc):
+        ga, dha, dva, dsa = _3d_arc_batch(
+            Us, Ut, ksrc, ktgt, ele2phase, t, meter2rad, max_dh, max_dv,
+            step_dh, step_dv, budget, iterations, threads=threads)
+        ga = np.asarray(ga, np.float32)
+    good = np.isfinite(ga) & (ga >= float(threshold)) & np.isfinite(dha)
+
+    # ONE COMPONENT PER CANDIDATE. Components carry their own free datum, so a
+    # candidate holding partners from two of them measures the offset between
+    # the datums rather than its own value. The component is named by the
+    # candidate's best partner, as it was when a score chose it -- but the
+    # score is now the fitted coherence, which is what the choice meant.
+    _lb = np.asarray(base_lab, np.int64)
+    if len(ksrc) and len(np.unique(_lb)) > 1:
+        _rank = np.where(good, ga, -np.inf)
+        _o = np.lexsort((-_rank, ksrc))
+        _first = _o[np.r_[True, np.diff(ksrc[_o]) > 0]]
+        _first = _first[good[_first]]
+        _own = np.full(int(nsrc), -1, np.int64)
+        _own[ksrc[_first]] = _lb[ktgt[_first]]
+        good &= (_own[ksrc] >= 0) & (_lb[ktgt] == _own[ksrc])
+
+    if stats is not None:
+        stats[prefix + 'ranked_arcs'] = 0
+        stats[prefix + 'searched_arcs'] = int(len(ksrc))
+        stats[prefix + 'provisional'] = int(len(np.unique(ksrc))) if len(ksrc) else 0
+    return ksrc, ktgt, ga, dha, dva, dsa, good
+
+
+def _3d_seed_ds_ds(Us, Ut, src, tgt, nsrc, k, budget, threads=1):
+    """DS to DS: the best `k` partners of every candidate, over the LISTED arcs.
+
+    The vouching window is a small box on purpose -- a candidate is attached by
+    neighbours it can be compared against, and short arcs are the better ones.
+    The graph is therefore sparse, and a dense product would score pairs the
+    window deliberately excluded.
+    """
+    g0 = _3d_predict_gamma(np.asarray(Us, np.complex64), Ut, src, tgt,
+                           budget, threads=threads)
+    sd = _3d_topk_per_src(g0, src, nsrc, k)
+    return src[sd], tgt[sd]
 
 
 def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
                           meter2rad, max_dh, max_dv, step_dh, step_dv, budget,
-                          device, iterations, min_agreeing, threshold,
+                          iterations, min_agreeing, threshold,
                           stats=None, prefix='ds_', debug=False,
-                          fix_h=None, fix_v=None):
+                          fix_h=None, fix_v=None, seed=None, threads=1):
     """Rank every arc, name ONE component, refine the best `min_agreeing`.
 
     RANK FIRST, REFINE THE SHORTLIST. Only `min_agreeing` partners are used, so
@@ -2201,10 +2510,9 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
         # corrected partner while assuming the pixel carries no offset is
         # already far better than raw coherence, and it only has to be good
         # enough to put `consensus` usable arcs in front.
-        g0 = _3d_predict_gamma(np.asarray(Us, np.complex64), Ut_c,
-                               src, tgt, budget, device)
         _nk = int(min_agreeing) if min_agreeing is not None else 1
-        _sd = _3d_topk_per_src(g0, src, nsrc, _nk)
+        _ssel, _tsel = seed(Us, Ut_c, src, tgt, nsrc, _nk,
+                            budget, threads=threads)
 
         # (b) the seeds get the FULL search, and ALL of them are used. Each
         # returns a complete answer for the pixel -- h_p + dh -- so they are
@@ -2212,15 +2520,15 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
         # is their robust centre. Taking the best single one would rest the
         # pixel on one arc, which is the star attachment this replaces.
         gs_, hs_, vs_, _ = _3d_arc_batch(
-            Us, Ut, src[_sd], tgt[_sd], ele2phase, t, meter2rad, max_dh,
-            max_dv, step_dh, step_dv, budget, device, iterations)
+            Us, Ut, _ssel, _tsel, ele2phase, t, meter2rad, max_dh,
+            max_dv, step_dh, step_dv, budget, iterations, threads=threads)
         _ph = np.full((nsrc, _nk), np.nan)
         _pv = np.full((nsrc, _nk), np.nan)
-        _o = np.lexsort((-np.where(np.isfinite(gs_), gs_, -np.inf), src[_sd]))
-        _cn = np.bincount(src[_sd][_o], minlength=nsrc)
+        _o = np.lexsort((-np.where(np.isfinite(gs_), gs_, -np.inf), _ssel))
+        _cn = np.bincount(_ssel[_o], minlength=nsrc)
         _cl = np.arange(len(_o)) - np.repeat(np.r_[0, np.cumsum(_cn)[:-1]], _cn)
-        _ph[src[_sd][_o], _cl] = (fix_h[tgt[_sd]] + hs_)[_o]
-        _pv[src[_sd][_o], _cl] = (fix_v[tgt[_sd]] + vs_)[_o]
+        _ph[_ssel[_o], _cl] = (fix_h[_tsel] + hs_)[_o]
+        _pv[_ssel[_o], _cl] = (fix_v[_tsel] + vs_)[_o]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN rows
             prov_h = np.nanmedian(_ph, axis=1)
@@ -2235,7 +2543,7 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
         Us_c[:, _ok] = _3d_model_removed(
             np.asarray(Us, np.complex64)[:, _ok], ele2phase, t,
             prov_h[_ok], prov_v[_ok])
-        ga = _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, device)
+        ga = _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, threads=threads)
         ga = np.where(_ok[src], ga, np.nan).astype(np.float32)
         del Us_c
         if min_agreeing is not None and len(np.unique(base_lab)) > 1:
@@ -2261,22 +2569,22 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
                               prov_v[src[_keep]] - fix_v[tgt[_keep]]], axis=1)
             g2, h2, v2, s2 = _3d_arc_batch(
                 Us, Ut, src[_keep], tgt[_keep], ele2phase, t, meter2rad,
-                max_dh, max_dv, step_dh, step_dv, budget, device, iterations,
-                seed_th=_seed)
+                max_dh, max_dv, step_dh, step_dv, budget, iterations,
+                seed_th=_seed, threads=threads)
             ga[_keep], dha[_keep], dva[_keep], dsa[_keep] = g2, h2, v2, s2
         _unref = np.ones(len(src), dtype=bool)
         _unref[_keep] = False
         ga[_unref] = np.nan
         if stats is not None:
             stats[prefix + 'ranked_arcs'] = int(len(src))
-            stats[prefix + 'searched_arcs'] = int(len(_sd))
+            stats[prefix + 'searched_arcs'] = int(len(_ssel))
             stats[prefix + 'provisional'] = int(_ok.sum())
         good = np.isfinite(ga) & (ga >= float(threshold)) & np.isfinite(dha)
         return ga, dha, dva, dsa, good
 
     ga, dha, dva, dsa = _3d_arc_batch(
         Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
-        step_dh, step_dv, budget, device, 1)
+        step_dh, step_dv, budget, 1, threads=threads)
     _lab = base_lab[tgt].astype(np.int64)
     if min_agreeing is not None and len(np.unique(base_lab)) > 1:
         # THE BEST PARTNER NAMES THE COMPONENT, AND THEN ONLY ITS NODES ARE
@@ -2323,7 +2631,8 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
     if len(_keep):
         g2, h2, v2, s2 = _3d_arc_batch(
             Us, Ut, src[_keep], tgt[_keep], ele2phase, t, meter2rad,
-            max_dh, max_dv, step_dh, step_dv, budget, device, iterations)
+            max_dh, max_dv, step_dh, step_dv, budget, iterations,
+            threads=threads)
         ga[_keep], dha[_keep], dva[_keep], dsa[_keep] = g2, h2, v2, s2
     # anything not refined cannot be used, whatever its lattice value
     _unref = np.ones(len(src), dtype=bool)
@@ -2334,8 +2643,8 @@ def _3d_partner_shortlist(Us, Ut, src, tgt, base_lab, nsrc, ele2phase, t,
 
 
 def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
-                          reject_sigma, passes, labels=None, stats=None,
-                          prefix='ds_'):
+                          err_v, passes, labels=None, stats=None,
+                          prefix='ds_', h_abs=None, err_h=None):
     """Do a pixel's best `min_agreeing` partners agree? Returns (first, votes, ok).
 
     ONLY THE BEST `min_agreeing` PARTNERS ENTER, AND NOTHING ELSE DOES. A pixel
@@ -2350,7 +2659,7 @@ def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
     homogeneous set of comparable measurements, which is the only situation
     where a robust scale means anything.
     """
-    _ma, _ar, _ii = min_agreeing, reject_sigma, passes
+    _ma, _ii = min_agreeing, passes
     o2 = np.lexsort((-np.where(good, ga, -np.inf), src))
     o2 = o2[good[o2]]
     cnt = np.bincount(src[o2], minlength=nsrc)
@@ -2397,11 +2706,27 @@ def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
     sig = np.full(nsrc, floor)
     if fin.any():
         rr = np.where(fin, r, np.nan)
-        enough = fin.sum(axis=1) >= (_ma if _ma is not None else 1)
+        enough = fin.sum(axis=1) >= _ma
         if enough.any():
             sig[enough] = np.maximum(
                 1.4826 * np.nanmedian(rr[enough], axis=1), floor)
-    keep = fin & (r <= _ar * sig[:, None]) if _ar is not None else fin
+    # THE BOUND IS ABSOLUTE, AND IT TESTS BOTH QUANTITIES. A robust sigma is a
+    # property of whatever scatter is present, so a pixel whose partners were
+    # uniformly wrong grew a scale to match and certified itself unanimously.
+    # A stated bound cannot be widened by what it is judging. Height is tested
+    # too: the vote used to read velocity alone, and a partner could agree on
+    # the rate while placing the pixel metres away.
+    _HVg = None
+    if h_abs is not None:
+        _HVg = np.full((nsrc, kmax), np.nan)
+        _HVg[row, col] = np.asarray(h_abs)[o2]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            _eh = np.nanmedian(np.where(fin, _HVg, np.nan), axis=1)
+        _eh = np.where(np.isfinite(_eh), _eh, 0.0)
+    keep = fin & (r <= float(err_v))
+    if _HVg is not None and err_h is not None:
+        keep = keep & (np.abs(_HVg - _eh[:, None]) <= float(err_h))
     nkeep = keep.sum(axis=1)
     if _ma is not None:
         # ALL `min_agreeing` OF THEM, UNANIMOUSLY. Naming WHICH partners have
@@ -2419,7 +2744,39 @@ def _3d_partner_consensus(src, ga, good, v_abs, nsrc, min_agreeing,
     sel_col = np.argmax(keep, axis=1)
     first = IDX[np.flatnonzero(ok), sel_col[ok]]
     votes = nkeep[ok].astype(np.int32)
+    # THE CENTRE IS THE ANSWER, NOT ONLY THE TEST. Every partner is a complete
+    # measurement of this pixel, so a pixel holding `nkeep` of them holds that
+    # many measurements of one quantity. Naming the best and discarding the
+    # rest throws away the averaging they were gathered for; the robust centre
+    # of the voting set is what they collectively say.
+    def _centre(X):
+        _xk = np.where(keep, X, np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            c = np.nanmedian(_xk, axis=1)
+            _fl = max(_SIGMA_FLOOR * float(np.nanmedian(
+                np.abs(_xk - c[:, None]))), 1e-9)
+        c = np.where(np.isfinite(c), c, 0.0)
+        for _ in range(max(int(passes) if passes else 1, 1)):
+            w = np.where(keep, G / np.maximum(np.abs(X - c[:, None]), _fl), 0.0)
+            sw = w.sum(axis=1)
+            c = np.where(sw > 0,
+                         (w * np.where(keep, X, 0.0)).sum(axis=1)
+                         / np.maximum(sw, 1e-30), c)
+        return np.where(nkeep > 0, c, np.nan)
+    _cen_v = _centre(V)
+    _cen_h = None if _HVg is None else _centre(_HVg)
     if stats is not None:
+        stats[prefix + 'centre_v'] = _cen_v
+        stats[prefix + 'centre_h'] = _cen_h
+        # THE ARCS THAT VOTED. A pixel's consistency has to be read over the
+        # partners its consensus actually rested on, the way the network's
+        # closure is read over the arcs its solve rested on. Every admissible
+        # partner includes the ones this test threw out, which is a different
+        # question and a harsher one.
+        _vm = keep & ok[:, None]
+        _vi = IDX[_vm]
+        stats[prefix + 'vote_arcs'] = _vi[_vi >= 0]
         reach = int(np.count_nonzero(cnt))
         stats[prefix + 'admissible'] = reach
         stats[prefix + 'no_consensus'] = reach - len(first)
@@ -2450,7 +2807,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                        geometry, budget=None, level=1,
                        max_dh=100.0, max_dv=25.0, step_dh=4.0, step_dv=2.0,
                        max_seasonal=5.0,
-                       consensus, device='cpu', iterations=8, debug=False):
+                       consensus, iterations=8, threads=None, debug=False):
     """Ground phase and velocity at PERSISTENT scatterers, per connected component.
 
     The measurement is per ARC, never per pixel: a single scatterer carries an
@@ -2500,45 +2857,32 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     from scipy.sparse.linalg import lsqr
     from scipy.spatial import cKDTree
 
-    # HOW MUCH AGREEMENT IS REQUIRED, in one argument for both halves of the
-    # solve, because it is one question asked twice: an arc must agree with the
-    # network and a partner must agree with the other partners.
-    #
-    _ma, _ar, _ii = _3d_consensus(consensus)
+    # ONE FIT AT A TIME, cluster-wide. The solve saturates the host by itself,
+    # so a second concurrent block buys contention rather than throughput; a
+    # cluster semaphore serialises the blocks while the graph stays lazy and
+    # any single block stays independently computable.
+    from distributed import Semaphore
+    _gate = Semaphore(max_leases=1, name='insardev-fit3d')
+    _gate.acquire()
+    try:
+        return __3d_fit_ps_array_gated(
+            scenes, date_values, spacing=spacing, bperp=bperp, window=window,
+            threshold=threshold, cell=cell, geometry=geometry, budget=budget,
+            level=level, max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
+            step_dv=step_dv, max_seasonal=max_seasonal, consensus=consensus,
+            iterations=iterations, threads=threads, debug=debug)
+    finally:
+        _gate.release()
 
-    S = np.ascontiguousarray(scenes, dtype=np.complex64)
-    n, ny, nx = S.shape
-    wy, wx, pey, pex = _3d_windows(window)
-    # int8 states the intent: a scene has a handful of components, not
-    # thousands, and a label that needs more than a byte means the network has
-    # shattered rather than resolved. -1 is nodata, so 0..127 are available.
-    lab_out = np.full((ny, nx), -1, dtype=np.int8)
-    # VELOCITY AND HEIGHT AS RASTERS, not only in `.stats`. The stats dict is a
-    # function attribute set by whichever block ran last in the worker, so under
-    # dask it describes one chunk and silently misdescribes the rest -- it can
-    # report 200 nodes for a raster carrying 29118. A caller cannot reproduce
-    # the product from it, which means the product is not really returned.
-    vel_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    hgt_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    # COHERENCE of the arc that ties the pixel to the network: for a node the
-    # mean over its own kept arcs, for an attached DS the arc it came in on.
-    # rmse = sqrt(-2 ln gamma) is derived from it upstairs rather than carried
-    # as a second plane, since the two are exact inverses.
-    coh_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    # the fitted annual, complex, in RADIANS -- part of the model and otherwise
-    # unreachable from the public API
-    sea_out = np.full((ny, nx), np.nan + 1j * np.nan, dtype=np.complex64)
-    # Cleared FIRST, because several guards below return early and a stats dict
-    # left over from the previous call describes a different solve: without
-    # this, a run that produced nothing still reported components from the
-    # previous one, which is worse than reporting none.
-    _3d_fit_ps_array.stats = dict(nodes=0, arcs=0, dropped=0, components=[],
-                                    fill_order=[])
-    if n < 2 or ny == 0 or nx == 0:
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
-    sy, sx = float(spacing[0]), float(spacing[1])
-    if not (sy > 0 and sx > 0):
-        raise ValueError(f'spacing must be positive, got {spacing}')
+
+
+def _3d_fit_frame(date_values, bperp, geometry, n):
+    """The time base and the height-to-phase factors the three stages share.
+
+    Pulled out because the stages run in separate tasks under `union=True` and
+    each has to rebuild the same frame; deriving it twice from the same inputs
+    is exact, while passing it between tasks would let the two drift.
+    """
     t = np.asarray(date_values)
     if t.dtype.kind == 'M':
         t = t.astype('datetime64[D]').astype(np.float64)
@@ -2550,12 +2894,39 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     meter2rad = 4.0 * np.pi / wavelength
     ele2phase = B / r_sin
     car = np.exp(2j * np.pi * t)
+    return t, ele2phase, meter2rad, car
 
+
+def _3d_ps_nodes(scenes, date_values, *, spacing, bperp=None,
+                 window=(32, 128), threshold=0.5, cell=(2, 8), geometry,
+                 budget=None, iterations=8, threads=None, debug=False):
+    """PASS 1, per block: the rank raster and this block's PS nodes.
+
+    The block is read once, scanned, and left behind: what leaves is the rank
+    raster and a table of nodes -- their positions and their unit phasors --
+    which is sparse where the block is dense. That is what lets one network be
+    solved over bursts that were never merged into a single raster.
+    """
+    import os as _os
+    _nth = max(1, int(threads) if threads else (_os.process_cpu_count() or 1))
+    S = np.ascontiguousarray(scenes, dtype=np.complex64)
+    n, ny, nx = S.shape
+    wy, wx, pey, pex = _3d_windows(window)
+    if n < 2 or ny == 0 or nx == 0:
+        return None
+    sy, sx = float(spacing[0]), float(spacing[1])
+    if not (sy > 0 and sx > 0):
+        raise ValueError(f'spacing must be positive, got {spacing}')
+    t, ele2phase, meter2rad, car = _3d_fit_frame(date_values, bperp,
+                                                 geometry, n)
+    # THE BOUNDS ARE STATED IN METRES AND MM/YR AND USED IN RADIANS. A metre of
+    # height and a mm/yr of rate carry different amounts of phase, so the two
+    # bounds are not interchangeable numbers -- they are the same statement
     # ---- the nodes: PS, not DS -----------------------------------------
-    q = _3d_arcs_kernel(S, wy, wx, tuple(cell), budget)
+    q = _3d_arcs_kernel(S, wy, wx, tuple(cell), budget, threads=_nth)
     ps = _3d_ps_kernel(S, (wy, wx, pey, pex), q, ele2phase, t, meter2rad,
                        threshold=float(threshold), budget=budget,
-                       device=device, iterations=iterations)
+                       iterations=iterations)
     iy, ix = np.where(np.isfinite(ps) & (ps >= float(threshold)))
     if debug:
         _cand = int(np.count_nonzero(np.isfinite(q) & (q >= float(threshold))))
@@ -2564,7 +2935,12 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     if len(iy) < 2:
         if debug:
             print('DEBUG: fewer than 2 nodes -- nothing to solve', flush=True)
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        # EMPTY, not "one node": the positions and the phasor columns are
+        # one table and must stay the same length. A lone position with no
+        # column silently misaligns every node concatenated after it when the
+        # union stage gathers the blocks.
+        return dict(q=q, iy=iy[:0], ix=ix[:0],
+                    U=np.zeros((n, 0), np.complex64))
     a = np.abs(S[:, iy, ix])
     with np.errstate(invalid='ignore', divide='ignore'):
         Un = np.ascontiguousarray(
@@ -2572,6 +2948,57 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                      ).astype(np.complex64))
     del a
 
+    return dict(q=q, iy=iy, ix=ix, U=Un)
+
+
+# HOW MANY ARCS A NODE MAY BRING TO THE NETWORK. Not a quality threshold --
+# `threshold` is that -- but a bound on redundancy: beyond this many arcs a
+# node is drawing repeatedly from the same neighbourhood, so the rows stop
+# carrying independent information while the solve keeps paying for them.
+_ARC_CAP = 100
+
+
+def _3d_ps_network(U, iy, ix, date_values, *, bperp=None, window=(32, 128),
+                   threshold=0.5, geometry, budget=None, consensus,
+                   iterations=8, max_dh=100.0, max_dv=25.0, step_dh=4.0,
+                   step_dv=2.0, max_seasonal=5.0, err_dh=5.0, err_dv=1.0,
+                   threads=None, debug=False):
+    """The network over the nodes ALONE -- no raster, so no scene in memory.
+
+    Every argument is a node quantity, which is why this stage can be run once
+    over nodes gathered from several blocks or several bursts: the arcs are
+    fitted between phasor columns and the datum is per component, neither of
+    which asks where the pixels were stored.
+
+    Returns the solved node table, or None when no network could be formed.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from scipy.sparse import coo_matrix, diags
+    from scipy.sparse.csgraph import connected_components
+    from scipy.sparse.linalg import lsqr
+    from scipy.spatial import cKDTree
+    import os as _os
+    _nth = max(1, int(threads) if threads else (_os.process_cpu_count() or 1))
+    _ma = _3d_consensus(consensus)
+    _ii = max(1, int(iterations))
+    Un = np.ascontiguousarray(U, dtype=np.complex64)
+    iy = np.asarray(iy)
+    ix = np.asarray(ix)
+    n = Un.shape[0]
+    wy, wx, pey, pex = _3d_windows(window)
+    _3d_fit_ps_array.stats.reset(nodes=0, arcs=0, dropped=0, components=[],
+                                 fill_order=[])
+    _mark = time.monotonic()
+    if n < 2 or len(iy) < 2:
+        return None
+    t, ele2phase, meter2rad, car = _3d_fit_frame(date_values, bperp,
+                                                 geometry, n)
+    # THE BOUNDS ARE STATED IN METRES AND MM/YR AND USED IN RADIANS. A metre of
+    # height and a mm/yr of rate carry different amounts of phase, so the two
+    # are not interchangeable numbers -- they are one statement about how far a
+    # measurement may sit from the solve, each in its own unit.
+    _err_h = float(err_dh) * meter2rad
+    _err_v = float(err_dv) * meter2rad / 1e3
     # ---- the arcs: every pair inside the PS window ----------------------
     # scaled so the window becomes the unit box, then a Chebyshev query is
     # exactly "inside the window" and costs O(N k) rather than O(N^2)
@@ -2579,24 +3006,41 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     tree = cKDTree(np.c_[iy / hy, ix / hx])
     pairs = tree.query_pairs(1.0, p=np.inf, output_type='ndarray')
     if len(pairs) < 3:
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
     ai, aj = pairs[:, 0], pairs[:, 1]
-    step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 16, 1)))
     g = np.empty(len(ai), np.float32)
     dh = np.empty(len(ai)); dv = np.empty(len(ai))
     ds_ = np.empty(len(ai), np.complex128)
-    for b0 in range(0, len(ai), step):
-        s_ = slice(b0, min(b0 + step, len(ai)))
-        arc = np.ascontiguousarray(
-            (Un[:, ai[s_]] * np.conj(Un[:, aj[s_]])).astype(np.complex64))
-        g[s_], dh[s_], dv[s_], ds_[s_] = _3d_arc_fit(
-            arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-            budget, max_seasonal, device, iterations=iterations)
+
+    def _fit_pairs(sel, budget_):
+        step = max(1, int(_3d_budget_mb(budget_) * 1024 * 1024
+                          // max(n * 16, 1)))
+        for b0 in range(0, len(sel), step):
+            s_ = sel[b0:min(b0 + step, len(sel))]
+            arc = np.ascontiguousarray(
+                (Un[:, ai[s_]] * np.conj(Un[:, aj[s_]])).astype(np.complex64))
+            g[s_], dh[s_], dv[s_], ds_[s_] = _3d_arc_fit(
+                arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh,
+                step_dv, budget_, max_seasonal,
+                iterations=iterations)
+    if _nth > 1 and len(ai) > _nth:
+        # arcs are independent; slices of them fit concurrently
+        from concurrent.futures import ThreadPoolExecutor
+        _bnd = np.linspace(0, len(ai), _nth * 4 + 1).astype(np.int64)
+        _idx = np.arange(len(ai))
+        with ThreadPoolExecutor(_nth) as _ex:
+            list(_ex.map(lambda i: _fit_pairs(
+                _idx[_bnd[i]:_bnd[i + 1]],
+                _3d_budget_mb(budget) / _nth), range(_nth * 4)))
+    else:
+        _fit_pairs(np.arange(len(ai)), budget)
     keep = np.isfinite(g) & (g >= float(threshold))
+    _lap, _mark = _3d_lap(_mark)
     if debug:
         _gk = g[keep]
         print(f'DEBUG: arcs     {len(ai):,} pairs fitted, {int(keep.sum()):,} '
-              f'>= {float(threshold)}  ({100 * keep.mean():.1f}%)', flush=True)
+              f'>= {float(threshold)}  ({100 * keep.mean():.1f}%)'
+              f'   {_lap:.1f}s', flush=True)
         if keep.any():
             print(f'DEBUG:          arc gamma p50 {np.median(_gk):.3f}  '
                   f'p90 {np.percentile(_gk, 90):.3f}  max {_gk.max():.3f}',
@@ -2604,30 +3048,49 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     if keep.sum() < 3:
         if debug:
             print('DEBUG: fewer than 3 arcs cleared the threshold', flush=True)
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
     ai, aj, dh, dv, ds_ = ai[keep], aj[keep], dh[keep], dv[keep], ds_[keep]
     gk = g[keep]
 
-    # ---- EVERY ARC THE FIT CERTIFIED ENTERS THE NETWORK -----------------
-    # No cap. An arc that cleared `threshold` is a measurement, and the only
-    # reason to refuse one would be cost -- which there is none of: the pairs
-    # are ALREADY FITTED above, before anything could select among them, so
-    # discarding some afterwards saves no fitting at all. It only shrinks the
-    # least-squares system, and that system is thousands of rows against the
-    # millions of arcs the attachment fits.
+    # ---- A NODE'S BEST `_ARC_CAP` ARCS, AND NO MORE ---------------------
+    # A node's degree is its PS density times the window's area, so it grows
+    # without bound as a scene gets denser while the window stays fixed -- and
+    # the least-squares system grows with it. Past some number of arcs a node
+    # is not being measured any better: the extra ones are drawn from the same
+    # neighbourhood as the ones already kept, so they add rows without adding
+    # independent constraint, and the robust pass has to judge every one of
+    # them. On a sparse scene the cap is inert; on a dense one it is what keeps
+    # the solve proportional to the ground rather than to the density.
     #
-    # What a cap did cost was connectivity. Taking a fixed number of arcs per
-    # node best-first spends a node's budget on its closest, most coherent
-    # neighbours -- which are the arcs most likely to be redundant with each
-    # other -- and the long arcs that tie distant groups together are exactly
-    # the ones it drops. The network then falls into pieces, each piece gets
-    # its own free datum, and pixels near the seam are lost twice over: their
-    # velocities are no longer comparable, and a DS drawing partners from both
-    # sides sees them disagree by the datum offset and is rejected.
+    # AN ARC SURVIVES IF EITHER END STILL WANTS IT, which is what makes this
+    # safe. Capping each node's own list independently would drop the long
+    # arcs that tie distant groups together -- they rank low for both ends
+    # because coherence falls with distance -- and the network would fall into
+    # pieces, each with its own free datum, which is far worse than any noise
+    # the cap removes. Keeping an arc that either end still ranks means a node
+    # cannot be isolated by another node's budget, and a long arc survives as
+    # long as one of its ends has room for it.
     #
-    # Redundancy is still what the screen is made of; it is simply taken
-    # rather than rationed, and the robust pass below decides which arcs the
-    # network believes.
+    # Redundancy is still what the screen is made of; only the excess beyond
+    # what a node can use is rationed, and the robust pass below decides which
+    # of the rest the network believes.
+    if _ARC_CAP and len(ai) > 1:
+        _cap_keep = np.zeros(len(ai), dtype=bool)
+        for _ends in (ai, aj):
+            _o = np.lexsort((-gk, _ends))
+            _e = _ends[_o]
+            _starts = np.r_[0, np.flatnonzero(np.diff(_e)) + 1]
+            _group = np.cumsum(np.r_[True, np.diff(_e) != 0]) - 1
+            _cap_keep[_o[np.arange(len(_e)) - _starts[_group] < _ARC_CAP]] = True
+        if not _cap_keep.all():
+            _lap, _mark = _3d_lap(_mark)
+            if debug:
+                print(f'DEBUG: cap      {int((~_cap_keep).sum()):,} of '
+                      f'{len(ai):,} arcs beyond {_ARC_CAP} per node dropped'
+                      f'   {_lap:.1f}s', flush=True)
+            ai, aj = ai[_cap_keep], aj[_cap_keep]
+            dh, dv, ds_ = dh[_cap_keep], dv[_cap_keep], ds_[_cap_keep]
+            gk = gk[_cap_keep]
     N = len(iy)
     gtake = gk
 
@@ -2640,6 +3103,29 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         sw = np.sqrt(np.maximum(w, 0.0))
         return lsqr(diags(sw) @ Gm, sw * rhs,
                     atol=1e-12, btol=1e-12, iter_lim=2000)[0]
+
+    def _wsolve2(Gm, rhs_a, rhs_b, w):
+        """The height and the rate solved at once: one matrix, two threads.
+
+        Every pass of the reweighting and every pass of the gate solves the
+        network TWICE, once for each quantity, and the two share the matrix and
+        depend on nothing of each other's. `lsqr` spends its time in kernels
+        that release the GIL, so the pair costs little more than one of them --
+        and these solves are the great majority of the stage.
+        """
+        import threading
+        out = [None, None]
+
+        def _run(i, r):
+            out[i] = _wsolve(Gm, r, w)
+
+        th = (threading.Thread(target=_run, args=(0, rhs_a)),
+              threading.Thread(target=_run, args=(1, rhs_b)))
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        return out[0], out[1]
 
     def _mad(r):
         return 1.4826 * float(np.median(np.abs(r - np.median(r))))
@@ -2692,14 +3178,15 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     G = _incidence(ai, aj, len(ai))
     w_ = gtake.astype(np.float64)
     r_h = r_v = None
-    for _ in range(_ii if _ar is not None else 0):
-        r_h = G @ _wsolve(G, dh, w_) - dh
-        r_v = G @ _wsolve(G, dv, w_) - dv
+    for _ in range(_ii):
+        _xh, _xv = _wsolve2(G, dh, dv, w_)
+        r_h = G @ _xh - dh
+        r_v = G @ _xv - dv
         # per NODE, not pooled: judged against its own arcs' scatter
         f_h, f_v = _SIGMA_FLOOR * _mad(r_h), _SIGMA_FLOOR * _mad(r_v)
-        s_h = _node_sigma(r_h, ai, aj, N, max(f_h, 1e-12), _ma or 1,
+        s_h = _node_sigma(r_h, ai, aj, N, max(f_h, 1e-12), _ma,
                           cap=max(_mad(r_h), 1e-12))
-        s_v = _node_sigma(r_v, ai, aj, N, max(f_v, 1e-12), _ma or 1,
+        s_v = _node_sigma(r_v, ai, aj, N, max(f_v, 1e-12), _ma,
                           cap=max(_mad(r_v), 1e-12))
         # an arc must hold up as seen from BOTH of its ends
         z = np.maximum(np.abs(r_h) / np.minimum(s_h[ai], s_h[aj]),
@@ -2727,23 +3214,25 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # Measured that way it removed a further 2 000 arcs and 35 nodes and still
     # left arcs at z = 101, because the bar moved under them.
     _fix_sh = _node_sigma(r_h, ai, aj, N, max(_SIGMA_FLOOR * _mad(r_h), 1e-12),
-                          _ma or 1, cap=max(_mad(r_h), 1e-12))
+                          _ma, cap=max(_mad(r_h), 1e-12))
     _fix_sv = _node_sigma(r_v, ai, aj, N, max(_SIGMA_FLOOR * _mad(r_v), 1e-12),
-                          _ma or 1, cap=max(_mad(r_v), 1e-12))
+                          _ma, cap=max(_mad(r_v), 1e-12))
 
     def _gate(idx):
         """Residual of the solve on `idx`, scored against the HELD scale."""
         a_, b_ = ai[idx], aj[idx]
         G_ = _incidence(a_, b_, len(idx))
-        rh_ = G_ @ _wsolve(G_, dh[idx], w_[idx]) - dh[idx]
-        rv_ = G_ @ _wsolve(G_, dv[idx], w_[idx]) - dv[idx]
-        z_ = np.maximum(np.abs(rh_) / np.minimum(_fix_sh[a_], _fix_sh[b_]),
-                        np.abs(rv_) / np.minimum(_fix_sv[a_], _fix_sv[b_]))
+        _xh_, _xv_ = _wsolve2(G_, dh[idx], dv[idx], w_[idx])
+        rh_ = G_ @ _xh_ - dh[idx]
+        rv_ = G_ @ _xv_ - dv[idx]
+        # ABSOLUTE, NOT RELATIVE. Scored against a robust sigma an arc could
+        # widen the bar that judged it: a node whose arcs were uniformly wrong
+        # got a scale to match and kept them all. The bound the caller stated
+        # cannot be widened by what it is judging.
+        z_ = np.maximum(np.abs(rh_) / _err_h, np.abs(rv_) / _err_v)
         return z_, _fix_sv, rv_
 
-    if _ar is None:
-        keep_arc = np.ones(len(ai), dtype=bool)
-    else:
+    if True:
         keep_arc = np.ones(len(ai), dtype=bool)
         _passes = 0
         # HOW MANY TIMES TO REJECT AND RE-SOLVE. The same count that governs
@@ -2756,7 +3245,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         for _passes in range(1, _ii + 1):
             _idx = np.flatnonzero(keep_arc)
             _z, _sv, _rv2 = _gate(_idx)
-            _ok = _z <= _ar
+            _ok = _z <= 1.0
             if _ok.all():
                 break                      # the gate holds on its own solution
             _new = np.zeros(len(ai), dtype=bool)
@@ -2771,12 +3260,14 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             _dbg_z, _dbg_sv, _dbg_rv = _gate(_idx)
             _gate_passes = int(_passes)
     if keep_arc.sum() < 3:
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
     rejected = int((~keep_arc).sum())
+    _lap, _mark = _3d_lap(_mark)
     if debug:
         print(f'DEBUG: IRLS     {rejected:,} of {len(ai):,} arcs rejected '
-              f'beyond {_ar} sigma  ({100 * rejected / max(len(ai), 1):.1f}%)',
-              flush=True)
+              f'beyond {err_dh:g} m / {err_dv:g} mm/yr  '
+              f'({100 * rejected / max(len(ai), 1):.1f}%)'
+              f'   {_lap:.1f}s', flush=True)
     # how much of each node's own support the rejection took away
     drej = np.bincount(np.r_[ai[~keep_arc], aj[~keep_arc]], minlength=N)
 
@@ -2798,7 +3289,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # So the test is applied until it stops removing anything. That is the
     # k-core of the surviving-arc graph at k = `consensus`, and it is what
     # the single pass was always reaching for.
-    _flr = _ma if _ma is not None else 1
+    _flr = _ma
     # counted BEFORE the floor runs: nodes the robust pass left with no arc at
     # all. Afterwards every removed node has none, so the two stop being
     # different questions and the distinction has to be taken here.
@@ -2824,9 +3315,9 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         if debug:
             print('DEBUG: fewer than 3 arcs survive the consensus floor',
                   flush=True)
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
 
-    if debug and _ar is not None:
+    if debug:
         # RE-EVALUATED ON THE ARCS THAT SHIP. The gate above ran before the
         # floor removed anything, so its residuals described a larger set than
         # the answer is built from -- and `arc_z` would no longer line up with
@@ -2835,6 +3326,12 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         _idx = np.flatnonzero(keep_arc)
         _dbg_z, _dbg_sv, _dbg_rv = _gate(_idx)
 
+    # THE CLOSURE BELOW IS CIRCULAR IF IT SEES SURVIVORS ONLY. IRLS rejects
+    # the arcs that disagree with the solve, so a residual measured over what
+    # is left is a property of the selection as much as of the solution. Keep
+    # the arcs as they were, and report both.
+    _pre = ((ai.copy(), aj.copy(), dh.copy(), dv.copy(), keep_arc.copy())
+            if debug else None)
     ai, aj, dh, dv, ds_, gtake = (ai[keep_arc], aj[keep_arc], dh[keep_arc],
                                   dv[keep_arc], ds_[keep_arc], gtake[keep_arc])
 
@@ -2866,7 +3363,8 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # existed, which is not a property of the data. `degree` is gone and every
     # arc clearing `threshold` now enters, so a node short of survivors is
     # genuinely short of support.
-    live = dcount >= (_ma if _ma is not None else 1)
+    live = dcount >= _ma
+    _lap, _mark = _3d_lap(_mark)
     if debug:
         # NODES LOST BEFORE ANY COMPONENT EXISTS. A node whose every arc was
         # rejected holds no datum and cannot be reported. Counted separately
@@ -2874,9 +3372,10 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         # different stages, and a single "kept" total hides which is which.
         print(f'DEBUG: solve     {int((~live).sum())} of {len(live)} nodes '
               f'left under {_flr} surviving arc(s)'
-              f'  ({_iso0} held none even before the floor)', flush=True)
+              f'  ({_iso0} held none even before the floor)'
+              f'   {_lap:.1f}s', flush=True)
     if not live.any():
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
 
     # ---- integrate, one free datum per component -----------------------
     # THE SOLUTION THE GATE VALIDATED IS THE SOLUTION THAT SHIPS. The robust
@@ -2893,9 +3392,8 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # consensus, which is strictly more information than coherence alone.
     m_ = len(ai)
     G = _incidence(ai, aj, m_)
-    w_fin = w_[keep_arc] if _ar is not None else w_
-    hgt = _wsolve(G, dh, w_fin)
-    vel = _wsolve(G, dv, w_fin)
+    w_fin = w_[keep_arc]
+    hgt, vel = _wsolve2(G, dh, dv, w_fin)
     anr = _wsolve(G, ds_.real, w_fin)
     ani = _wsolve(G, ds_.imag, w_fin)
     for c in np.unique(lab[live]):
@@ -2945,7 +3443,7 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             continue
         comps.append((len(k), float(np.median(dcount[sel][k])), k))
     if not comps:
-        return lab_out, vel_out, hgt_out, sea_out, coh_out
+        return None
     # AT MOST _MAX_COMPONENTS, LARGEST FIRST -- past it an int8 label would
     # fold component 128 onto -128 and two unrelated datums would read as one.
     # What is dropped is the smallest, which is also the least trustworthy.
@@ -2979,19 +3477,13 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     keep = []
     for z in order_prio:
         k = comps[z][2]
-        lab_out[sy_[k], sx_[k]] = label_of[z]
-        vel_out[sy_[k], sx_[k]] = vel[sel][k].astype(np.float32)   # rad/yr
-        hgt_out[sy_[k], sx_[k]] = hgt[sel][k].astype(np.float32)   # rad
-        coh_out[sy_[k], sx_[k]] = gnode[sel][k].astype(np.float32)
-        sea_out[sy_[k], sx_[k]] = (anr[sel][k]
-                                   + 1j * ani[sel][k]).astype(np.complex64)
         keep.append(k)
     kk = np.concatenate(keep)
     lab_all = np.array([label_of[z] for z in order_prio
                         for _ in range(len(comps[z][2]))], dtype=np.int8)
     k_mm = meter2rad * 1e-3
 
-    _3d_fit_ps_array.stats = dict(
+    _3d_fit_ps_array.stats.reset(
         nodes=int(len(kk)), arcs=int(len(ai)), dropped=int(dropped),
         arcs_rejected=int(rejected),
         degree_rejected=drej[sel][kk].astype(np.int32),
@@ -3019,8 +3511,8 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         _gn = gnode[sel][kk]
         _gn = _gn[np.isfinite(_gn)]
         print(f'DEBUG: solved   {len(kk)} of {len(live)} nodes kept, '
-              f'{int(dropped)} component(s) dropped past the int8 label limit',
-              flush=True)
+              f'{int(dropped)} component(s) dropped past the int8 label limit'
+              f'   {_3d_lap(_mark)[0]:.1f}s', flush=True)
         print(f'DEBUG:          arcs/node p50 {np.median(_dn):.0f}  '
               f'min {_dn.min()}  max {_dn.max()}', flush=True)
         if len(_gn):
@@ -3038,8 +3530,33 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         # closure is its own property: a small component whose arcs agree is
         # usable on that datum, and pooling would hide it behind a larger one
         # that does not. Arcs belong to a component when BOTH ends do.
-        print(f'DEBUG:          closure by component (arcs must satisfy the '
-              f'solve):', flush=True)
+        if _pre is not None:
+            _pa, _pj, _pdh, _pdv, _pk = _pre
+            _prv = np.abs((vel[_pa] - vel[_pj]) - _pdv) / meter2rad * 1e3
+            _prh = np.abs((hgt[_pa] - hgt[_pj]) - _pdh) / meter2rad
+            _f = np.isfinite(_prv) & np.isfinite(_prh)
+            if _f.any():
+                print(f'DEBUG:          PS closure over ALL {int(_f.sum()):,} '
+                      f'fitted arcs, rejected included -- the unselected view:',
+                      flush=True)
+                print(f'DEBUG:            per arc   rate p50 '
+                      f'{np.median(_prv[_f]):.3f} p90 '
+                      f'{np.percentile(_prv[_f], 90):.3f} mm/yr   height p50 '
+                      f'{np.median(_prh[_f]):.2f} p90 '
+                      f'{np.percentile(_prh[_f], 90):.2f} m', flush=True)
+        _gt = np.asarray(gtake, float)
+        _gt = _gt[np.isfinite(_gt)]
+        if len(_gt):
+            # WHAT THE SOLVE ACTUALLY RESTED ON. The cap keeps a node's best
+            # arcs, so the solved set sits far above the threshold that let
+            # them in, and judging the residual against `threshold` judges a
+            # population that was never used.
+            print(f'DEBUG:          solved arcs gamma p50 {np.median(_gt):.3f}'
+                  f'  p10 {np.percentile(_gt, 10):.3f}'
+                  f'  p90 {np.percentile(_gt, 90):.3f}'
+                  f'   (threshold was {float(threshold):.2f})', flush=True)
+        print(f'DEBUG:          PS closure by component, SURVIVING arcs only '
+              f'(selected for agreeing -- optimistic):', flush=True)
         for _z in order_prio:
             _kk2 = comps[_z][2]
             _nodes = sel[_kk2]
@@ -3048,16 +3565,57 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             if not _sel_a.any():
                 continue
             _cv, _ch = _rv[_sel_a], _rh[_sel_a]
+            # THE TAIL, NOT JUST THE EXTREME. The rejection cuts at a multiple
+            # of a robust scale, so the largest survivor is near that bar by
+            # construction and says nothing on its own; how many arcs sit out
+            # there is the question the bar cannot answer.
+            # WHERE THE BAD ARCS ARE. Most arcs close far better than their
+            # own coherence implies, so the ones that do not are a separate
+            # population rather than the tail of one. If they concentrate on a
+            # few nodes the fault is those nodes; if they are spread evenly it
+            # is the arc fit.
+            _bd = np.isfinite(_ch) & (_ch > 1.0)
+            if _bd.any():
+                _ea = ai[_sel_a]; _eb = aj[_sel_a]
+                _bc = np.bincount(np.r_[_ea[_bd], _eb[_bd]], minlength=N)
+                _tc = np.bincount(np.r_[_ea, _eb], minlength=N)
+                _bn = _bc[_nodes]; _tn = _tc[_nodes]
+                _sv = np.sort(_bn)[::-1]
+                _tp = max(1, int(round(0.05 * len(_bn))))
+                _fr = np.where(_tn > 0, _bn / np.maximum(_tn, 1), np.nan)
+                print(f'DEBUG:             bad arcs (>1 m): {int(_bd.sum()):,}'
+                      f' on {int((_bn > 0).sum()):,} of {len(_bn):,} nodes;'
+                      f' worst 5% of nodes carry '
+                      f'{_sv[:_tp].sum() / max(_sv.sum(), 1):.0%};'
+                      f' per-node share p50 {np.nanmedian(_fr):.1%}'
+                      f' p90 {np.nanpercentile(_fr, 90):.1%}'
+                      f' max {np.nanmax(_fr):.0%}', flush=True)
+            _cf = np.isfinite(_ch)
+            if _cf.any():
+                _hh = _ch[_cf]
+                print(f'DEBUG:             height tail  p90 '
+                      f'{np.percentile(_hh, 90):.2f}  p99 '
+                      f'{np.percentile(_hh, 99):.2f} m   '
+                      f'over 1 m: {int((_hh > 1).sum()):,} '
+                      f'({(_hh > 1).mean():.1%})   over 2 m: '
+                      f'{int((_hh > 2).sum()):,} ({(_hh > 2).mean():.2%})',
+                      flush=True)
             # PER NODE, OVER THIS COMPONENT'S ARCS ONLY -- the same arcs the
             # per-arc figures above describe. Accumulating over every arc
             # would pull in ones reaching outside the component, including
             # nodes below the survival floor that never received a datum, and
             # a node's mean could then exceed the worst arc it averages.
-            _acc = np.zeros(N); _cnt2 = np.zeros(N)
+            _acc = np.zeros(N); _cnt2 = np.zeros(N); _acch = np.zeros(N)
             np.add.at(_acc, ai[_sel_a], _cv); np.add.at(_acc, aj[_sel_a], _cv)
+            np.add.at(_acch, ai[_sel_a], _ch); np.add.at(_acch, aj[_sel_a], _ch)
             np.add.at(_cnt2, ai[_sel_a], 1.0); np.add.at(_cnt2, aj[_sel_a], 1.0)
             _cn = np.where(_cnt2[_nodes] > 0,
                            _acc[_nodes] / np.maximum(_cnt2[_nodes], 1.0), np.nan)
+            _cnh = np.where(_cnt2[_nodes] > 0,
+                            _acch[_nodes] / np.maximum(_cnt2[_nodes], 1.0),
+                            np.nan)
+            _deg2 = _cnt2[_nodes]
+            _cnh = _cnh[np.isfinite(_cnh)]
             _cn = _cn[np.isfinite(_cn)]
             if not len(_cn):
                 continue
@@ -3075,11 +3633,37 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                   f' max {_cn.max():.3f} mm/yr'
                   f'   over 1 mm/yr: {int((_cn > 1).sum())} of {len(_cn)}',
                   flush=True)
+            # THE OUTPUT, NOT THE INPUT. What a caller receives is the node
+            # value, and its precision is the arc scatter divided by the
+            # support that averaged it -- the arcs are the measurements, the
+            # nodes are the answer, and only the second is delivered.
+            if len(_cnh) and _deg2.max() > 0:
+                _sd = np.sqrt(np.maximum(_deg2, 1.0))
+                print(f'DEBUG:             per node  height p50 '
+                      f'{np.median(_cnh):.2f} max {_cnh.max():.2f} m'
+                      f'   over 1 m: {int((_cnh > 1).sum()):,} of {len(_cnh):,}',
+                      flush=True)
+                print(f'DEBUG:             node precision (arc scatter / '
+                      f'sqrt support, support p50 {np.median(_deg2):.0f}): '
+                      f'rate {np.median(_cn / _sd[:len(_cn)]):.4f} mm/yr   '
+                      f'height {np.median(_cnh / _sd[:len(_cnh)]):.3f} m',
+                      flush=True)
 
     if debug:
         # THE ARCS THEMSELVES, so the network's self-consistency can be
         # measured on the solve that actually ran rather than on a copy of it.
         # Set AFTER the stats dict is rebuilt above, or they would be wiped.
+        # THE ARCS TO A FILE WHEN ASKED. `.stats` is per-thread, so a caller in
+        # the main thread cannot read what a dask worker thread wrote; a dump
+        # is the only way to get the solved network out for offline analysis.
+        _dump = __import__('os').environ.get('INSARDEV_DUMP_ARCS')
+        if _dump:
+            np.savez(_dump, ai=ai, aj=aj, dh=dh, dv=dv,
+                     g=np.asarray(gtake, dtype=np.float32),
+                     z=_dbg_z, resid=_dbg_rv,
+                     node_iy=iy, node_ix=ix, node_index=sel[kk],
+                     vel=vel[sel][kk], hgt=hgt[sel][kk])
+            print(f'DEBUG: dumped {len(ai):,} network arcs to {_dump}', flush=True)
         _3d_fit_ps_array.stats.update(
             arc_i=ai.copy(), arc_j=aj.copy(),
             arc_dh=dh.copy(), arc_dv=dv.copy(),
@@ -3094,6 +3678,499 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
             node_iy=iy.copy(), node_ix=ix.copy(),
             node_vel=vel.copy(), node_hgt=hgt.copy())
 
+    # THE NETWORK SOLUTION, and nothing raster-shaped: the caller writes these
+    # into whichever block holds each node. Full precision -- the attachment
+    # reads a node's model to give a DS its datum, so rounding here would
+    # round every DS that leans on it.
+    return dict(iy=sy_[kk], ix=sx_[kk], label=lab_all,
+                U=np.ascontiguousarray(Un[:, sel][:, kk]),
+                vel=vel[sel][kk], hgt=hgt[sel][kk], coh=gnode[sel][kk],
+                sea=(anr[sel][kk] + 1j * ani[sel][kk]),
+                # WHAT THE SOLVE COUNTED, carried with the table. The stats are
+                # a function attribute, so under `union=True` -- where the
+                # network runs in one process and the attachments in others --
+                # they cannot be read where they were written.
+                stats=dict(_3d_fit_ps_array.stats))
+
+
+def _3d_ds_attach(S, cand_ds, ds_nodes, _oy, _ox, lab_out, vel_out,
+                  hgt_out, sea_out, coh_out, lvl_out, level_id,
+                  ele2phase, t, meter2rad, *,
+                  ny, nx, wy, wx, cell, budget, threshold, level,
+                  max_dh, max_dv, step_dh, step_dv, iterations,
+                  _ma, _ii, _err_h, _err_v, _nth, _st, debug=False):
+    """LEVEL 2: DS hung off the DS of level 1, which are FIXED INPUT.
+
+    Level 1 attaches DS to the PS network; this attaches what level 1 could not
+    reach to what it did. The distinction that matters is that the level-1
+    values arrive as an argument and are never recomputed here -- a chunk's
+    partners include nodes another chunk owns and solved, so recomputing them
+    would answer with a different network's numbers.
+
+    The output planes are updated IN PLACE; nothing is returned.
+    """
+    _fy = np.asarray(ds_nodes['iy']).copy()
+    _fx = np.asarray(ds_nodes['ix']).copy()
+    _fv = ds_nodes['vel'].astype(float)
+    _fh = ds_nodes['hgt'].astype(float)
+    _fs = np.asarray(ds_nodes['sea']).copy()
+    _fl = np.asarray(ds_nodes['label']).copy()
+    _done = np.zeros((ny, nx), dtype=bool)
+    _done[_oy, _ox] = True
+    _done[_fy, _fx] = True
+    _st['vouch_rounds'] = []
+    for _rnd in range(int(level) - 1):
+        vy, vx = np.where(cand_ds & ~_done)
+        _st['vouch_candidates'] = int(len(vy))
+        if not len(vy):
+            break
+        _before = int(_st.get('vouch_attached', 0))
+        _st['vouch_attached'] = 0
+        if True:
+            _av = np.abs(S[:, vy, vx])
+            Uv = np.ascontiguousarray(
+                np.where(_av > 0, S[:, vy, vx] / np.where(_av > 0, _av, 1),
+                         0).astype(np.complex64))
+            del _av
+            # REACH: the DS WINDOW, widened to two only where one did not
+            # serve. The window is the scale over which the atmosphere is
+            # taken to be common, so it is where a partner is worth having,
+            # and the read's halo is exactly one window -- reaching further
+            # asks for pixels the block does not hold and is silently
+            # truncated at its edges.
+            #
+            # THE SHORTLIST IS BOUNDED, `consensus` partners per candidate.
+            # Pairing every fixed node with every candidate in reach is the
+            # same selection arrived at by materialising it first: the count
+            # is n_fixed x the density of its box, it GROWS with the network
+            # every level, and the arcs beyond the best few are fitted only
+            # to be discarded by the consensus. Selecting first costs `kk`
+            # slots per candidate instead.
+            _hy1, _hx1 = max(wy // 2, 1), max(wx // 2, 1)
+            _hy2, _hx2 = max(wy, 1), max(wx, 1)
+            _ab = np.abs(S[:, _fy, _fx])
+            Ub = np.ascontiguousarray(
+                np.where(_ab > 0, S[:, _fy, _fx] / np.where(_ab > 0, _ab, 1),
+                         0).astype(np.complex64))
+            del _ab
+            _fg = np.full((ny, nx), -1, dtype=np.int64)
+            _fg[_fy, _fx] = np.arange(len(_fy))
+            # THE SAME CAP THE NETWORK USES, and for the same reason. The
+            # shortlist is chosen on raw coherence while the consensus votes
+            # on FITTED values, so every partner the gates reject is one the
+            # vote never sees and `consensus` partners offered is `consensus`
+            # only if none is rejected. What the cap must prevent is the
+            # opposite case -- a candidate with thousands of nodes in reach --
+            # and the network already answers how many arcs are worth keeping
+            # per node: beyond `_ARC_CAP` they were measured to add nothing.
+            # Level 1's thirty-six is NOT the precedent here; that bound is
+            # structural, four PS per window times the nine-window
+            # neighbourhood, and the level-2 fixed layer is dense DS with no
+            # such lattice.
+            _kk = int(max(_ARC_CAP, _ma))
+            _ov = np.empty((len(vy), _kk), dtype=np.float32)
+            _oj = np.empty((len(vy), _kk), dtype=np.int64)
+            _ea = np.zeros(len(vy), dtype=np.int8)
+            _vy64, _vx64 = vy.astype(np.int64), vx.astype(np.int64)
+            _args = (Uv, Ub, _vy64, _vx64, _fg, _hy1, _hx1, _hy2, _hx2,
+                     int(cell[0]), int(cell[1]), int(_kk), float(threshold),
+                     _ov, _oj, _ea)
+            if _nth > 1 and len(vy) > _nth:
+                from concurrent.futures import ThreadPoolExecutor
+                _step = -(-len(vy) // _nth)
+                _bnd = [(a, min(a + _step, len(vy)))
+                        for a in range(0, len(vy), _step)]
+                with ThreadPoolExecutor(_nth) as _ex:
+                    list(_ex.map(lambda b: _3d_ds_partners(*_args, b[0], b[1]),
+                                 _bnd))
+            else:
+                _3d_ds_partners(*_args, 0, len(vy))
+            del _fg
+            if debug:
+                # RECORDED, NOT PRINTED. One chunk's numbers describe one
+                # chunk; the caller has every chunk of the level and reduces
+                # them to the one line a reader can actually use.
+                _np_ = (_oj >= 0).sum(1)
+                _st['lvl_kk'] = int(_kk)
+                _st['lvl_early'] = int(_ea.sum())
+                _st['lvl_partners'] = _np_.astype(np.int32)
+            _kp = _oj >= 0
+            ds_s = np.repeat(np.arange(len(vy)), _kk).reshape(-1, _kk)[_kp]
+            ds_t = _oj[_kp]
+            del _ov, _oj, _kp
+            _st['vouch_arcs'] = int(len(ds_s))
+            if debug:
+                # THE SIZE OF THE PROBLEM, recorded where it is decided rather
+                # than after the fit has already allocated over it.
+                _st['lvl_cands'] = int(len(vy))
+                _st['lvl_fixed'] = int(len(_fy))
+                _st['lvl_arcs'] = int(len(ds_s))
+            if len(ds_s):
+                gd, hd, vd, sd, goodd = _3d_partner_shortlist(
+                    Uv, Ub, ds_s, ds_t, _fl, len(vy), ele2phase, t,
+                    meter2rad, max_dh, max_dv, step_dh, step_dv, budget,
+                    iterations, _ma, threshold,
+                    stats=_st, prefix='vouch_', debug=debug,
+                    fix_h=_fh, fix_v=_fv, seed=_3d_seed_ds_ds,
+                    threads=_nth)
+                # THE REPRESENTATIVE IS THE HIGHEST-GAMMA SURVIVOR.
+                # Two error terms are in play -- the new arc's, and the
+                # base's own inherited one -- and only the first is
+                # selectable here. Choosing instead on the base's
+                # attachment coherence was measured and is WORSE: base
+                # gamma says how coherently that DS attached, not how
+                # correct its value is, so optimising for it selects
+                # confidence rather than accuracy. The inherited error is
+                # bounded by the gate, which has already discarded every
+                # partner whose value disagreed.
+                _vst = {}
+                # RATE AND HEIGHT TOGETHER, as level 1 does and as the
+                # solve does. `err_h` was being passed without the heights it
+                # judges, so the gate could never run: level 2 was accepting
+                # partners on the rate alone, and an arc metres out in height
+                # -- a facade, a roof edge, two scatterers at different
+                # elevations in one window -- entered the answer unchallenged.
+                v2first, v2votes, _okv = _3d_partner_consensus(
+                    ds_s, gd, goodd, _fv[ds_t] + vd, len(vy),
+                    _ma, _err_v, _ii, h_abs=_fh[ds_t] + hd, err_h=_err_h,
+                    labels=(_fl[ds_t] if debug else None),
+                    stats=_vst, prefix='vouch_')
+                _st.update(_vst)
+                _st['vouch_attached'] = int(len(v2first))
+                if len(v2first):
+                    _si, _bj = ds_s[v2first], ds_t[v2first]
+                    vy2, vx2 = vy[_si], vx[_si]
+
+                    # ---- SOLVE THE LEVEL-2 DS AS A NETWORK ---------
+                    # Every extension solves its new layer against the
+                    # layers already solved, held FIXED: the PS anchor the
+                    # level-1 DS, and the PS plus those DS anchor these.
+                    # Without it the layer is a star -- each pixel takes
+                    # its value from one partner and neighbouring pixels
+                    # were never compared -- which is exactly the state
+                    # level 1 was in before its own solve existed.
+                    _a2 = np.full(len(vy), -1, dtype=np.int64)
+                    _a2[_si] = np.arange(len(_si))
+                    _e2 = np.flatnonzero(goodd & (_a2[ds_s] >= 0))
+                    _e2i, _e2p = _a2[ds_s[_e2]], ds_t[_e2]
+                    _m3 = np.zeros((ny, nx), dtype=bool)
+                    _m3[vy2, vx2] = True
+                    _tv3, _ty3, _tx3 = _3d_topk_kernel(
+                        S, wy, wx, tuple(cell), budget, _ma, _m3,
+                        threads=_nth)
+                    _ix3 = np.full((ny, nx), -1, dtype=np.int64)
+                    _ix3[vy2, vx2] = np.arange(len(_si))
+                    _hv3 = _tv3[vy2, vx2] >= float(threshold)
+                    _s3 = np.repeat(np.arange(len(_si)), _ma
+                                    ).reshape(-1, _ma)[_hv3]
+                    _py3 = np.clip(vy2[:, None] + _ty3[vy2, vx2],
+                                   0, ny - 1)[_hv3]
+                    _px3 = np.clip(vx2[:, None] + _tx3[vy2, vx2],
+                                   0, nx - 1)[_hv3]
+                    _t3 = _ix3[_py3, _px3]
+                    _ok3 = _t3 >= 0
+                    _n3i, _n3j = _s3[_ok3], _t3[_ok3]
+                    _u3 = _n3i < _n3j
+                    _n3i, _n3j = _n3i[_u3], _n3j[_u3]
+                    _st['vouch_pairs'] = int(len(_n3i))
+                    if len(_n3i):
+                        # FITTED, not predicted: these are the measurements
+                        # the solve consumes, and predicting them from the
+                        # values being solved for would be circular.
+                        _av3 = np.abs(S[:, vy2, vx2])
+                        _Uv3 = np.ascontiguousarray(
+                            np.where(_av3 > 0, S[:, vy2, vx2]
+                                     / np.where(_av3 > 0, _av3, 1), 0
+                                     ).astype(np.complex64))
+                        del _av3
+                        _pg3, _pdh3, _pdv3 = _3d_pair_fit(
+                            _Uv3, _Uv3, _n3i, _n3j, ele2phase, t,
+                            _err_v, _err_h, _ii, budget,
+                            threads=_nth)
+                        _k3 = np.isfinite(_pg3) & (_pg3 >= float(threshold))
+                        # THE SAME BOUND ON BOTH KINDS OF EQUATION. The DS->
+                        # fixed arcs are already held to `err_dv`/`err_dh`
+                        # against the pixel's consensus centre; these were
+                        # held to coherence alone, so the one unvetted input
+                        # to the solve was the half that ties DS to DS. An
+                        # edge whose delta contradicts what BOTH endpoints
+                        # independently concluded is not a measurement of the
+                        # ground between them, and letting it into the first
+                        # least-squares is what lets it choose which arcs the
+                        # reject pass then throws out.
+                        # THE SAME BOUND, NOT A LOOSER ONE. A difference of
+                        # two err-bounded estimates could in principle sit
+                        # 2*err apart, and the measured median residual lands
+                        # exactly on 1*err, which looks like a threshold cutting
+                        # through good edges. Measured, it is not: doubling the
+                        # bound keeps twice the edges, attaches exactly the same
+                        # pixels, and puts the outliers back (per-DS rate max
+                        # 0.84 -> 1.02, height 3.02 -> 3.34). The edges past the
+                        # bound are inconsistent, not merely differenced.
+                        _cc_v = _vst.get('vouch_centre_v')
+                        _cc_h = _vst.get('vouch_centre_h')
+                        if _cc_v is not None and len(_n3i):
+                            _cv_ = np.asarray(_cc_v, float)[_si]
+                            _rv3 = np.abs((_cv_[_n3i] - _cv_[_n3j]) - _pdv3)
+                            _k3 &= ~np.isfinite(_rv3) | (_rv3 <= _err_v)
+                            if _cc_h is not None:
+                                _ch_ = np.asarray(_cc_h, float)[_si]
+                                _rh3 = np.abs(
+                                    (_ch_[_n3i] - _ch_[_n3j]) - _pdh3)
+                                _k3 &= ~np.isfinite(_rh3) | (_rh3 <= _err_h)
+                        if debug:
+                            # WHICH bound rejects, and by how much. A
+                            # difference of two independently estimated
+                            # centres carries both their errors, so a
+                            # tolerance sized for ONE residual may be
+                            # rejecting edges that are consistent.
+                            _st['lvl_dsds_in'] = int(len(_n3i))
+                            _st['lvl_dsds_kept'] = int(_k3.sum())
+                            _cg = np.isfinite(_pg3) & (
+                                _pg3 >= float(threshold))
+                            if _cc_v is not None and len(_n3i):
+                                _fv_ = _cg & np.isfinite(_rv3) & (
+                                    _rv3 > _err_v)
+                                _st['lvl_dsds_failv'] = int(_fv_.sum())
+                                _st['lvl_dsds_rv'] = (
+                                    _rv3[_cg & np.isfinite(_rv3)]
+                                    / _err_v).astype(np.float32)
+                                if _cc_h is not None:
+                                    _fh_ = _cg & np.isfinite(_rh3) & (
+                                        _rh3 > _err_h)
+                                    _st['lvl_dsds_failh'] = int(_fh_.sum())
+                                    _st['lvl_dsds_both'] = int(
+                                        (_fv_ & _fh_).sum())
+                                    _st['lvl_dsds_rh'] = (
+                                        _rh3[_cg & np.isfinite(_rh3)]
+                                        / _err_h).astype(np.float32)
+                        _n3i, _n3j = _n3i[_k3], _n3j[_k3]
+                        _pdh3, _pdv3, _pg3 = _pdh3[_k3], _pdv3[_k3], _pg3[_k3]
+                    else:
+                        _pdh3 = _pdv3 = np.zeros(0)
+                        _pg3 = np.zeros(0, np.float32)
+                    _v3, _h3, _ns3, _anc3 = _3d_ds_solve(
+                        len(_si), _e2i, _e2p, vd[_e2], hd[_e2], gd[_e2],
+                        _n3i, _n3j, _pdv3, _pdh3, _pg3,
+                        _fv, _fh, _err_v, _err_h, _ii)
+                    if debug:
+                        # THE FUNNEL: what the consensus vetted, what the
+                        # solve was handed, and what it kept. The gap between
+                        # the first two is the arcs no gate in physical units
+                        # ever saw.
+                        _vv = _st.get('vouch_vote_arcs')
+                        _st['lvl_vetted'] = int(len(_vv)) if _vv is not None \
+                            else 0
+                        _st['lvl_solve_in'] = int(len(_e2) + len(_n3i))
+                        _st['lvl_solve_kept'] = int(_ns3.sum())
+                        # how far the UNVETTED arcs sit from the pixel's own
+                        # consensus centre, in the units the bound is stated in
+                        _cvv = _st.get('vouch_centre_v')
+                        if _cvv is not None and len(_e2):
+                            _cc = np.asarray(_cvv)[ds_s[_e2]]
+                            _pp = _fv[ds_t[_e2]] + vd[_e2]
+                            _dd = np.abs(_pp - _cc) / meter2rad * 1e3
+                            _dd = _dd[np.isfinite(_dd)]
+                            if len(_dd):
+                                _st['lvl_offcentre'] = _dd.astype(np.float32)
+                    # CONSENSUS TIES TO THE NETWORK, NOT TO PEERS. A
+                    # `DS - DS` equation relates a pixel to another pixel of
+                    # its OWN level and carries no datum; counted toward the
+                    # same floor it lets a cluster certify itself on its
+                    # internal edges. The consensus demanded five partners in
+                    # the FIXED layer before the solve, so the solve must
+                    # leave five standing.
+                    _lv3 = _anc3 >= _ma
+                    if debug:
+                        _cv2 = getattr(_3d_ds_solve._tl, 'conv', None) or []
+                        if _cv2:
+                            _it = np.array([c[1] for c in _cv2])
+                            _sp = np.array([c[0] for c in _cv2])
+                            _nu = np.array([c[2] for c in _cv2])
+                            _st['lvl_lsqr_hit'] = int((_sp == 7).sum())
+                            _st['lvl_lsqr_n'] = int(len(_sp))
+                            _st['lvl_lsqr_itn'] = int(_it.max())
+                            _st['lvl_lsqr_unk'] = int(_nu.max())
+                        _anc = _anc3
+                        if _anc is not None:
+                            _lm = _ns3 >= _ma
+                            _st['lvl_noanchor'] = int((_lm & (_anc == 0)).sum())
+                            _st['lvl_fewanchor'] = int(
+                                (_lm & (_anc < _ma)).sum())
+                            _st['lvl_passed'] = int(_lm.sum())
+                    _st['vouch_unconfirmed'] = int((~_lv3).sum())
+                    _v3 = np.where(_lv3, _v3, np.nan)
+                    _h3 = np.where(_lv3, _h3, np.nan)
+                    # ---- WHAT THIS LEVEL IS WORTH -----------------------
+                    # Yield alone cannot say whether a level added good
+                    # pixels or merely more of them. This is the level-1 DS
+                    # closure applied to this layer: each voting partner
+                    # predicts the candidate from its own FIXED value plus
+                    # the arc, and the disagreement with what the solve
+                    # returned is the error, in mm/yr and m. Like level 1's,
+                    # this set is not selected for agreeing, so it needs no
+                    # second view.
+                    _va3 = _vst.get('vouch_vote_arcs')
+                    if debug and _va3 is not None and len(_va3):
+                        _vk = np.asarray(_va3, np.int64)
+                        _sl = _a2[ds_s[_vk]]
+                        _mv = _sl >= 0
+                        _sl, _vk = _sl[_mv], _vk[_mv]
+                        if len(_sl):
+                            _fw = np.isfinite(_v3[_sl]) & np.isfinite(_h3[_sl])
+                            _sl, _vk = _sl[_fw], _vk[_fw]
+                    else:
+                        _sl = np.zeros(0, np.int64)
+                    if debug and len(_sl):
+                        _cv3 = np.abs((_fv[ds_t[_vk]] + vd[_vk])
+                                      - _v3[_sl]) / meter2rad * 1e3
+                        _ch3 = np.abs((_fh[ds_t[_vk]] + hd[_vk])
+                                      - _h3[_sl]) / meter2rad
+                        # PER PIXEL, as the network reports per node: a DS
+                        # averages its partners, so its worst is milder than
+                        # the worst single partner and the two scales must
+                        # be labelled apart.
+                        _qa = np.zeros(len(_si)); _qb = np.zeros(len(_si))
+                        _qc = np.zeros(len(_si))
+                        np.add.at(_qa, _sl, _cv3)
+                        np.add.at(_qb, _sl, _ch3)
+                        np.add.at(_qc, _sl, 1.0)
+                        _qh = _qc > 0
+                        _pv3 = _qa[_qh] / _qc[_qh]
+                        _ph3 = _qb[_qh] / _qc[_qh]
+                        # THE SAMPLES, NOT A SUMMARY OF THEM. Percentiles do
+                        # not average across chunks -- a median of medians is
+                        # not the median -- so the level's reducer needs the
+                        # values themselves to answer for the whole level.
+                        _st['lvl_clo_gamma'] = float(np.median(gd[v2first]))
+                        _st['lvl_clo_arc_v'] = _cv3.astype(np.float32)
+                        _st['lvl_clo_arc_h'] = _ch3.astype(np.float32)
+                        _st['lvl_clo_ds_v'] = _pv3.astype(np.float32)
+                        _st['lvl_clo_ds_h'] = _ph3.astype(np.float32)
+                    # gated on the solve, and written AFTER it --
+                    # the label used to be set before the solve ran
+                    lab_out[vy2, vx2] = np.where(_lv3, _fl[_bj], -1)
+                    vel_out[vy2, vx2] = _v3.astype(np.float32)
+                    # WHICH LEVEL FOUND THIS PIXEL, so a caller can see the
+                    # ladder rather than only its total.
+                    lvl_out[vy2, vx2] = np.where(
+                        _lv3, np.int8(level_id + _rnd), np.int8(-1))
+                    hgt_out[vy2, vx2] = _h3.astype(np.float32)
+                    coh_out[vy2, vx2] = gd[v2first].astype(np.float32)
+                    sea_out[vy2, vx2] = (
+                        (_fs[_bj].real + sd[v2first].real)
+                        + 1j * (_fs[_bj].imag + sd[v2first].imag)
+                        ).astype(np.complex64)
+                    _st.update(
+                        vouch_iy=vy2.copy(), vouch_ix=vx2.copy(),
+                        vouch_label=_fl[_bj],
+                        vouch_gamma=gd[v2first].copy(),
+                        vouch_votes=np.asarray(v2votes, dtype=np.int32),
+                        vouch_velocity_rad_yr=_v3.astype(np.float32),
+                        vouch_height_rad=_h3.astype(np.float32))
+        _got = int(_st.get('vouch_attached', 0))
+        _st['vouch_rounds'].append(_got)
+        if debug:
+            _st['lvl_left'] = int(len(vy))
+            _st['lvl_attached'] = int(_got)
+            _st['lvl_network'] = int(len(_fy) + _got)
+        if not _got:
+            break                  # nothing added: further rounds cannot
+        _ny_ = _st['vouch_iy']; _nx_ = _st['vouch_ix']
+        _keepn = np.isfinite(_st['vouch_velocity_rad_yr'])
+        _fy = np.r_[_fy, _ny_[_keepn]]
+        _fx = np.r_[_fx, _nx_[_keepn]]
+        _fv = np.r_[_fv, _st['vouch_velocity_rad_yr'][_keepn].astype(float)]
+        _fh = np.r_[_fh, _st['vouch_height_rad'][_keepn].astype(float)]
+        _fs = np.r_[_fs, sea_out[_ny_[_keepn], _nx_[_keepn]]]
+        _fl = np.r_[_fl, _st['vouch_label'][_keepn]]
+        _done[_ny_, _nx_] = True
+
+
+def _3d_ps_attach(scenes, q, nodes, date_values, *, spacing, bperp=None,
+                  window=(32, 128), threshold=0.5, cell=(2, 8), geometry,
+                  budget=None, level=1, max_dh=100.0, max_dv=25.0,
+                  step_dh=4.0, step_dv=2.0, consensus, iterations=8,
+                  err_dh=5.0, err_dv=1.0, threads=None, debug=False,
+                  out_stats=None):
+    """PASS 2, per block: the network written out, and the DS hung off it.
+
+    `nodes` is the solved table from `_3d_ps_network`, with positions in THIS
+    block's index space. Under `union=True` those nodes were solved together
+    with other blocks' -- so the datum crossing the seam is the point -- but
+    the pixels never left their own block.
+    """
+    import os as _os
+    _nth = max(1, int(threads) if threads else (_os.process_cpu_count() or 1))
+    _ma = _3d_consensus(consensus)
+    _ii = max(1, int(iterations))
+    S = np.ascontiguousarray(scenes, dtype=np.complex64)
+    n, ny, nx = S.shape
+    wy, wx, pey, pex = _3d_windows(window)
+    lab_out = np.full((ny, nx), -1, dtype=np.int8)
+    vel_out = np.full((ny, nx), np.nan, dtype=np.float32)
+    hgt_out = np.full((ny, nx), np.nan, dtype=np.float32)
+    coh_out = np.full((ny, nx), np.nan, dtype=np.float32)
+    sea_out = np.full((ny, nx), np.nan + 1j * np.nan, dtype=np.complex64)
+    # THE LEVEL THAT PRODUCED EACH PIXEL: 0 for a PS node, 1 for a DS attached
+    # to the network, n for one attached to the level n-1 DS. -1 where nothing
+    # was measured. Carried so the ladder can be looked at, not just counted.
+    lvl_out = np.full((ny, nx), -1, dtype=np.int8)
+    # CLEARED BEFORE THE EARLY RETURN, so a block that solves nothing
+    # cannot leave the previous block's DS table visible on this thread.
+    _3d_fit_ps_array.stats.reset(nodes=0, arcs=0, dropped=0,
+                                 components=[], fill_order=[])
+    if nodes is None or len(np.asarray(nodes['iy'])) == 0:
+        return lab_out, vel_out, hgt_out, sea_out, coh_out, lvl_out
+    t, ele2phase, meter2rad, car = _3d_fit_frame(date_values, bperp,
+                                                 geometry, n)
+    # stated in metres and mm/yr, used in radians -- see the network
+    _err_h = float(err_dh) * meter2rad
+    _err_v = float(err_dv) * meter2rad / 1e3
+    iy = np.asarray(nodes['iy'])
+    ix = np.asarray(nodes['ix'])
+    Un = np.ascontiguousarray(nodes['U'], dtype=np.complex64)
+    lab_all = np.asarray(nodes['label'], dtype=np.int8)
+    vel = np.asarray(nodes['vel'])
+    hgt = np.asarray(nodes['hgt'])
+    gnode = np.asarray(nodes['coh'])
+    anr = np.asarray(np.real(nodes['sea']))
+    ani = np.asarray(np.imag(nodes['sea']))
+    # the table arrives already reduced to the kept nodes, so the selections
+    # the attachment applies are the identity -- kept so the code below reads
+    # the same whether it ran here or in a network solved somewhere else
+    sel = np.arange(len(iy))
+    kk = np.arange(len(iy))
+    # Each node belongs to exactly one component, so writing them cannot
+    # contest a pixel.
+    # A NODE MAY STAND OUTSIDE THIS BLOCK. Under `union=True` the table is the
+    # whole scene's, and a node beyond these bounds is still a partner a DS
+    # here can reach -- the PS extent is far wider than a chunk -- but its
+    # model belongs to the block that holds its pixel, and only that block
+    # writes it. This is the reach a per-block network cannot offer: without
+    # it a DS near a chunk edge is judged on the handful of nodes its own
+    # chunk happens to contain.
+    _own = (iy >= 0) & (iy < ny) & (ix >= 0) & (ix < nx)
+    _oy, _ox = iy[_own], ix[_own]
+    lab_out[_oy, _ox] = lab_all[_own]
+    vel_out[_oy, _ox] = vel[_own].astype(np.float32)           # rad/yr
+    lvl_out[_oy, _ox] = np.where(np.isfinite(vel[_own]), 0, -1)  # PS nodes
+    hgt_out[_oy, _ox] = hgt[_own].astype(np.float32)           # rad
+    coh_out[_oy, _ox] = gnode[_own].astype(np.float32)
+    sea_out[_oy, _ox] = (anr[_own] + 1j * ani[_own]).astype(np.complex64)
+    if q is None:
+        q = np.full((ny, nx), np.nan, dtype=np.float32)
+    # THE STATS BELONG TO WHOEVER SOLVED, and are REBUILT here for every
+    # block. They are a function attribute, so under `union=True` -- the
+    # network in one process, the attachments in others -- they cannot be read
+    # where they were written, and a worker that fitted a previous block still
+    # holds that block's dict. Seeded from the table this block was handed, so
+    # what is reported is what this block actually wrote.
+    _3d_fit_ps_array.stats.reset(nodes=0, arcs=0, dropped=0, components=[],
+                                 fill_order=[])
+    _3d_fit_ps_array.stats.update(nodes.get('stats') or {})
+    _3d_fit_ps_array.stats['iy'] = iy
+    _3d_fit_ps_array.stats['ix'] = ix
     # ---- attach the DS to the network ----------------------------------
     # THE PS EXTENT IS THE REACH, NOT THE DS WINDOW. A PS is defined by holding
     # a coherent arc out to the PS extent -- that is what separates it from a DS
@@ -3124,33 +4201,18 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
     # datum, and a value written without one would be a different network's.
     if level >= 1:
         cand_ds = np.isfinite(q) & (q >= float(threshold))
-        cand_ds[iy[sel][kk], ix[sel][kk]] = False        # nodes are not DS here
+        cand_ds[_oy, _ox] = False                        # nodes are not DS here
         dy_, dx_ = np.where(cand_ds)
         if len(dy_):
             ny_ps, nx_ps = iy[sel][kk], ix[sel][kk]
-            hy_d, hx_d = max(pey // 2, 1), max(pex // 2, 1)
-            # ITERATE THE SPARSE SIDE. A window is a slice, so the pairs
-            # come from reading each NODE's box out of an index raster --
-            # hundreds of slices rather than a spatial query per candidate,
-            # which would build one Python list per DS and there are hundreds
-            # of thousands of those. Same pairs, a third of the time.
-            _dsi = np.full((ny, nx), -1, dtype=np.int64)
-            _dsi[dy_, dx_] = np.arange(len(dy_))
-            _ss, _tt = [], []
-            for _p in range(len(ny_ps)):
-                _y0, _y1 = max(0, ny_ps[_p] - hy_d), min(ny, ny_ps[_p] + hy_d + 1)
-                _x0, _x1 = max(0, nx_ps[_p] - hx_d), min(nx, nx_ps[_p] + hx_d + 1)
-                _sub = _dsi[_y0:_y1, _x0:_x1]
-                _w = _sub[_sub >= 0]
-                if len(_w):
-                    _ss.append(_w)
-                    _tt.append(np.full(len(_w), _p, dtype=np.int64))
-            src = (np.concatenate(_ss) if _ss else np.zeros(0, np.int64))
-            tgt = (np.concatenate(_tt) if _tt else np.zeros(0, np.int64))
-            del _dsi, _ss, _tt
+            # THE PARTNERS ARE THE 3x3 DS-WINDOW NEIGHBOURHOOD. The DS window
+            # is the scale over which the atmosphere is taken to be common, so
+            # it is also the scale over which an arc means anything; a
+            # candidate takes the nodes of its own window and the eight around
+            # it and fits every one. The set is bounded by the winner grid, so
+            # the cost is a property of the windows rather than of the scene.
             _3d_fit_ps_array.stats['ds_candidates'] = int(len(dy_))
-            _3d_fit_ps_array.stats['ds_reached'] = int(len(np.unique(src)))
-            _3d_fit_ps_array.stats['ds_arcs'] = int(len(src))
+            _3d_fit_ps_array.stats['ds_reached'] = int(len(dy_))
             # unit phasors once for the candidates and once for the nodes,
             # rather than re-slicing the scene inside every batch
             _ad = np.abs(S[:, dy_, dx_])
@@ -3159,16 +4221,23 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                          0).astype(np.complex64))
             del _ad
             Ups = np.ascontiguousarray(Un[:, sel][:, kk])
-            if len(src):
-                ga, dha, dva, dsa, good = _3d_partner_shortlist(
-                    Ud_all, Ups, src, tgt, lab_all, len(dy_),
+            if len(ny_ps):
+                # the DS window names the neighbourhood; the two extent
+                # slots are carried for shape and are not a reach any more
+                _pos = (dy_, dx_, ny_ps, nx_ps, 0, 0, wy, wx)
+                _t_ds = time.monotonic()
+                ksrc, ktgt, ga, dha, dva, dsa, good = _3d_shortlist_ds_ps(
+                    Ud_all, Ups, lab_all, len(dy_),
                     ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
-                    budget, device, iterations, _ma, threshold,
+                    budget, iterations, _ma, threshold,
                     stats=_3d_fit_ps_array.stats, prefix='ds_', debug=debug,
-                    # THE PS ARE THE FIXED LAYER. They are solved onto one
-                    # datum, so their model divides out and every candidate
-                    # is scored by prediction rather than searched.
-                    fix_h=hgt[sel][kk], fix_v=vel[sel][kk])
+                    # THE PS ARE THE FIXED LAYER: solved onto one datum, so
+                    # a partner's value is its own plus what the arc measures.
+                    fix_h=hgt[sel][kk], fix_v=vel[sel][kk], threads=_nth,
+                    pos=_pos)
+                _3d_fit_ps_array.stats['ds_arcs'] = int(len(ksrc))
+                _lap, _t_ds = _3d_lap(_t_ds)
+                _3d_fit_ps_array.stats['ds_fit_s'] = _lap
                 # THE PARTNERS ARE MEASUREMENTS, SO THEY ARE SOLVED THE WAY
                 # THE ARCS ARE. Each partner gives the DS a complete answer, so
                 # several partners are repeated measurements of one quantity --
@@ -3196,23 +4265,187 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # attachment keeps only one per pixel.
                     _gsl = np.flatnonzero(good)
                     _3d_fit_ps_array.stats.update(
-                        dsarc_src=src[_gsl].copy(),        # index into dy_/dx_
+                        dsarc_src=ksrc[_gsl].copy(),        # index into dy_/dx_
                         dsarc_ds_iy=dy_.copy(), dsarc_ds_ix=dx_.copy(),
-                        dsarc_tgt=tgt[_gsl].copy(),        # index into the nodes
+                        dsarc_tgt=ktgt[_gsl].copy(),        # index into the nodes
                         dsarc_dv=dva[_gsl].copy(),
                         dsarc_dh=dha[_gsl].copy(),
                         dsarc_gamma=ga[_gsl].copy())
-                v_abs = vel[sel][kk][tgt] + dva
+                v_abs = vel[sel][kk][ktgt] + dva
+                h_abs = hgt[sel][kk][ktgt] + dha
+                # A LOCAL DICT, NOT THE MODULE'S. `stats` is a function
+                # attribute shared by every task in the worker PROCESS, and
+                # the centres come back out of it to become the DS values --
+                # so with more than one thread per worker a block reads the
+                # centres of whichever block wrote last. That is a wrong
+                # answer when the lengths happen to match and an IndexError
+                # when they do not. Results must not travel through global
+                # state; only the diagnostics may, and they are merged after.
+                _cst = {}
                 first, votes, _okds = _3d_partner_consensus(
-                    src, ga, good, v_abs, len(dy_), _ma, _ar, _ii,
-                    labels=(lab_all[tgt] if debug else None),
-                    stats=_3d_fit_ps_array.stats, prefix='ds_')
+                    ksrc, ga, good, v_abs, len(dy_), _ma, _err_v, _ii,
+                    h_abs=h_abs, err_h=_err_h,
+                    labels=(lab_all[ktgt] if debug else None),
+                    stats=_cst, prefix='ds_')
+                _3d_fit_ps_array.stats.update(_cst)
+                _lap, _t_ds = _3d_lap(_t_ds)
+                _3d_fit_ps_array.stats['ds_consensus_s'] = _lap
                 if len(first):
-                    ds_i, ps_i = src[first], tgt[first]
+                    ds_i, ps_i = ksrc[first], ktgt[first]
                     yy2, xx2 = dy_[ds_i], dx_[ds_i]
-                    h_ds = hgt[sel][kk][ps_i] + dha[first]
+                    # THE VALUE IS THE CONSENSUS, NOT ITS BEST WITNESS. The
+                    # partners that voted are repeated measurements of this
+                    # pixel, and the vote already found which of them agree;
+                    # taking the highest-gamma one and dropping the rest
+                    # spends the redundancy on the test and keeps none of it
+                    # for the answer. The component still comes from the best
+                    # partner: a label is named, not averaged.
+                    if debug:
+                        # ARE THE PARTNERS INDEPENDENT OF EACH OTHER? The
+                        # independence cell is enforced between the CANDIDATE
+                        # and each partner, never between the partners: five
+                        # of them inside one cell are one sample of the ground
+                        # counted five times, and they agree because they are
+                        # the same measurement, not because the value is right.
+                        _va0 = _cst.get('ds_vote_arcs')
+                        if _va0 is not None and len(_va0):
+                            _vk = np.asarray(_va0, np.int64)
+                            _cy0, _cx0 = int(cell[0]), int(cell[1])
+                            _pc = (ny_ps[ktgt[_vk]] // max(_cy0, 1)
+                                   ).astype(np.int64) * (1 << 20) + \
+                                  (nx_ps[ktgt[_vk]] // max(_cx0, 1))
+                            _o0 = np.lexsort((_pc, ksrc[_vk]))
+                            _ss, _pp = ksrc[_vk][_o0], _pc[_o0]
+                            _new = np.r_[True, (_ss[1:] != _ss[:-1]) |
+                                         (_pp[1:] != _pp[:-1])]
+                            _ncell = np.bincount(_ss[_new], minlength=len(dy_))
+                            _nvote = np.bincount(ksrc[_vk], minlength=len(dy_))
+                            _hv0 = _nvote > 0
+                            _3d_fit_ps_array.stats['lvl_pcells'] = \
+                                _ncell[_hv0].astype(np.int32)
+                            _3d_fit_ps_array.stats['lvl_pvotes'] = \
+                                _nvote[_hv0].astype(np.int32)
+                            # HOW FAR the agreeing partners actually are. The
+                            # PS extent is the reach, and an isolated DS takes
+                            # whatever it can reach -- five properly separated
+                            # partners, good coherence, and every arc far past
+                            # the separation where a differential model still
+                            # describes one piece of ground.
+                            _dyp = (ny_ps[ktgt[_vk]] - dy_[ksrc[_vk]]) \
+                                * float(spacing[0])
+                            _dxp = (nx_ps[ktgt[_vk]] - dx_[ksrc[_vk]]) \
+                                * float(spacing[1])
+                            _rr = np.sqrt(_dyp**2 + _dxp**2)
+                            _sd = np.zeros(len(dy_)); _sn = np.zeros(len(dy_))
+                            np.add.at(_sd, ksrc[_vk], _rr)
+                            np.add.at(_sn, ksrc[_vk], 1.0)
+                            _3d_fit_ps_array.stats['lvl_parcm'] = (
+                                _sd[_hv0] / np.maximum(_sn[_hv0], 1)
+                                ).astype(np.float32)
+                    if debug:
+                        # DO CELL-MATES SHARE PARTNERS? Two pixels inside one
+                        # independence cell are one sample of the ground, so
+                        # they should attach to the same nodes and agree. Their
+                        # raw coherences differ slightly, though, and the
+                        # shortlist is RANKED -- a tiny difference reorders the
+                        # top `consensus` and hands them different partner sets,
+                        # whose errors are then inherited separately.
+                        _vs = _cst.get('ds_vote_arcs')
+                        if _vs is not None and len(_vs):
+                            _vk2 = np.asarray(_vs, np.int64)
+                            _cid = (dy_ // max(int(cell[0]), 1)).astype(
+                                np.int64) * (1 << 20) + \
+                                (dx_ // max(int(cell[1]), 1))
+                            # partner-set signature per candidate
+                            _ord2 = np.lexsort((ktgt[_vk2], ksrc[_vk2]))
+                            _ss2, _tt2 = ksrc[_vk2][_ord2], ktgt[_vk2][_ord2]
+                            _bnd = np.r_[0, np.flatnonzero(
+                                _ss2[1:] != _ss2[:-1]) + 1, len(_ss2)]
+                            _who = _ss2[_bnd[:-1]]
+                            _sets = [frozenset(_tt2[a:b].tolist())
+                                     for a, b in zip(_bnd[:-1], _bnd[1:])]
+                            _bycell = {}
+                            for _w, _st5 in zip(_who, _sets):
+                                _bycell.setdefault(int(_cid[_w]),
+                                                   []).append((_w, _st5))
+                            _jac, _dv = [], []
+                            for _grp in _bycell.values():
+                                if len(_grp) < 2:
+                                    continue
+                                for _i2 in range(min(len(_grp), 6)):
+                                    for _j2 in range(_i2 + 1,
+                                                     min(len(_grp), 6)):
+                                        _a5, _b5 = _grp[_i2][1], _grp[_j2][1]
+                                        _u = len(_a5 | _b5)
+                                        _jac.append(len(_a5 & _b5) / max(_u, 1))
+                            if _jac:
+                                _3d_fit_ps_array.stats['lvl_mate_jac'] = \
+                                    np.asarray(_jac, np.float32)
+                    _cv = _cst.get('ds_centre_v')
+                    _ch = _cst.get('ds_centre_h')
+                    _si = ksrc[first]
+                    h_ds = (hgt[sel][kk][ps_i] + dha[first] if _ch is None
+                            else np.asarray(_ch)[_si])
                     lab_ds = lab_all[ps_i]
-                    v_ds = vel[sel][kk][ps_i] + dva[first]
+                    v_ds = (vel[sel][kk][ps_i] + dva[first] if _cv is None
+                            else np.asarray(_cv)[_si])
+                    if debug:
+                        # ---- DS CLOSURE ---------------------------------
+                        # Every accepted partner against the value the pixel
+                        # adopted. The PS are the fixed layer, so a DS holds
+                        # no free datum and each partner is a complete answer
+                        # for it -- their spread IS the attachment's
+                        # consistency. Unlike the network's, this set is not
+                        # selected for agreeing, so it needs no second view.
+                        _vad = np.full(len(dy_), np.nan)
+                        _had = np.full(len(dy_), np.nan)
+                        _vad[ds_i] = v_ds
+                        _had[ds_i] = h_ds
+                        _va = _cst.get('ds_vote_arcs')
+                        _m2 = np.zeros(len(ksrc), dtype=bool)
+                        if _va is not None and len(_va):
+                            _m2[np.asarray(_va, np.int64)] = True
+                        _m2 &= np.isfinite(_vad[ksrc])
+                        if _m2.any():
+                            _crv = np.abs(
+                                (vel[sel][kk][ktgt[_m2]] + dva[_m2])
+                                - _vad[ksrc[_m2]]) / meter2rad * 1e3
+                            _crh = np.abs(
+                                (hgt[sel][kk][ktgt[_m2]] + dha[_m2])
+                                - _had[ksrc[_m2]]) / meter2rad
+                            # PER PIXEL, the same way the network reports per
+                            # node: a DS averages its own partners, so its
+                            # worst is milder than the worst single partner and
+                            # the two scales must be labelled apart.
+                            _na = np.zeros(len(dy_)); _nc = np.zeros(len(dy_))
+                            _nb = np.zeros(len(dy_))
+                            np.add.at(_na, ksrc[_m2], _crv)
+                            np.add.at(_nb, ksrc[_m2], _crh)
+                            np.add.at(_nc, ksrc[_m2], 1.0)
+                            _hv = _nc > 0
+                            _pv2 = _na[_hv] / _nc[_hv]
+                            _ph2 = _nb[_hv] / _nc[_hv]
+                            # THE SAMPLES, for the level's reducer. The
+                            # summaries below describe THIS block; percentiles
+                            # do not average, so a level spanning many blocks
+                            # has to pool the values themselves.
+                            _3d_fit_ps_array.stats.update(
+                                lvl_clo_arc_v=_crv.astype(np.float32),
+                                lvl_clo_arc_h=_crh.astype(np.float32),
+                                lvl_clo_ds_v=_pv2.astype(np.float32),
+                                lvl_clo_ds_h=_ph2.astype(np.float32))
+                            _3d_fit_ps_array.stats.update(
+                                ds_clo_n=int(_m2.sum()),
+                                ds_clo_rv=float(np.nanmedian(_crv)),
+                                ds_clo_rv90=float(np.nanpercentile(_crv, 90)),
+                                ds_clo_rh=float(np.nanmedian(_crh)),
+                                ds_clo_rh90=float(np.nanpercentile(_crh, 90)),
+                                ds_clo_pix=int(_hv.sum()),
+                                ds_clo_nv=float(np.median(_pv2)),
+                                ds_clo_nvmax=float(_pv2.max()),
+                                ds_clo_nh=float(np.median(_ph2)),
+                                ds_clo_nhmax=float(_ph2.max()),
+                                ds_clo_over1=int((_pv2 > 1.0).sum()))
 
                     # ---- SOLVE THE DS AS A NETWORK ----------------------
                     # Each DS has just been validated against `consensus` PS
@@ -3237,16 +4470,16 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # with no free constant of its own.
                     _att = np.full(len(dy_), -1, dtype=np.int64)
                     _att[ds_i] = np.arange(len(ds_i))
-                    _e = np.flatnonzero(good & (_att[src] >= 0))
-                    _ei, _ep = _att[src[_e]], tgt[_e]
+                    _e = np.flatnonzero(good & (_att[ksrc] >= 0))
+                    _ei, _ep = _att[ksrc[_e]], ktgt[_e]
                     # neighbours, best `consensus` by COHERENCE inside the DS
                     # window -- the search the arc kernel already does, run
                     # only at the attached pixels
                     _m2 = np.zeros((ny, nx), dtype=bool)
                     _m2[yy2, xx2] = True
-                    _, _tv, _ty, _tx = _3d_arcs_kernel(
-                        S, wy, wx, tuple(cell), budget,
-                        topk=_ma, topk_mask=_m2)
+                    _tv, _ty, _tx = _3d_topk_kernel(
+                        S, wy, wx, tuple(cell), budget, _ma, _m2,
+                        threads=_nth)
                     _idx = np.full((ny, nx), -1, dtype=np.int64)
                     _idx[yy2, xx2] = np.arange(len(ds_i))
                     _have = _tv[yy2, xx2] >= float(threshold)
@@ -3269,23 +4502,63 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                                      ).astype(np.complex64))
                         del _adn
                         _pg, _pdh, _pdv = _3d_pair_fit(
-                            _Ud, _Ud, _ni, _nj, ele2phase, t, _ar, _ii, budget)
+                            _Ud, _Ud, _ni, _nj, ele2phase, t,
+                            _err_v, _err_h, _ii,
+                            budget, threads=_nth)
                         _keep2 = np.isfinite(_pg) & (_pg >= float(threshold))
+                        # THE SAME BOUND THE DS->PS ARCS ANSWER TO. Those are
+                        # held to `err_dv`/`err_dh` against each pixel's
+                        # consensus centre; these were held to coherence
+                        # alone, so the half of the solve that ties DS to DS
+                        # was the one input no gate in physical units ever
+                        # saw. An edge whose delta contradicts what BOTH
+                        # endpoints independently concluded is not a
+                        # measurement of the ground between them.
+                        if _cv is not None and len(_ni):
+                            _cvd = np.asarray(_cv, float)[ds_i]
+                            _rv2 = np.abs((_cvd[_ni] - _cvd[_nj]) - _pdv)
+                            _keep2 &= ~np.isfinite(_rv2) | (_rv2 <= _err_v)
+                        if _ch is not None and len(_ni):
+                            _chd = np.asarray(_ch, float)[ds_i]
+                            _rh2 = np.abs((_chd[_ni] - _chd[_nj]) - _pdh)
+                            _keep2 &= ~np.isfinite(_rh2) | (_rh2 <= _err_h)
+                        if debug:
+                            _st2['lvl_dsds_in'] = int(len(_ni))
+                            _st2['lvl_dsds_kept'] = int(_keep2.sum())
                         _ni, _nj = _ni[_keep2], _nj[_keep2]
                         _pdh, _pdv = _pdh[_keep2], _pdv[_keep2]
                         _pg = _pg[_keep2]
                     else:
                         _pdh = _pdv = np.zeros(0)
                         _pg = np.zeros(0, np.float32)
-                    v_ds, h_ds, _nsurv = _3d_ds_solve(
+                    v_ds, h_ds, _nsurv, _anc1 = _3d_ds_solve(
                         len(ds_i), _ei, _ep, dva[_e], dha[_e], ga[_e],
                         _ni, _nj, _pdv, _pdh, _pg,
-                        vel[sel][kk], hgt[sel][kk], _ar, _ii)
+                        vel[sel][kk], hgt[sel][kk], _err_v, _err_h, _ii)
                     # THE SAME RULE THE NODES GET: enough of a pixel's own
                     # equations must survive the gate. One that keeps too few
                     # was not confirmed by the network, and a value carried by
                     # what is left would be a compromise nothing backs.
-                    _live2 = _nsurv >= (_ma if _ma is not None else 1)
+                    # the same rule at level 1: five surviving DS->PS
+                    # equations, not five equations of any kind
+                    _live2 = _anc1 >= _ma
+                    if debug:
+                        _cv2 = getattr(_3d_ds_solve._tl, 'conv', None) or []
+                        if _cv2:
+                            _it = np.array([c[1] for c in _cv2])
+                            _sp = np.array([c[0] for c in _cv2])
+                            _nu = np.array([c[2] for c in _cv2])
+                            _st2['lvl_lsqr_hit'] = int((_sp == 7).sum())
+                            _st2['lvl_lsqr_n'] = int(len(_sp))
+                            _st2['lvl_lsqr_itn'] = int(_it.max())
+                            _st2['lvl_lsqr_unk'] = int(_nu.max())
+                        _anc = _anc1
+                        if _anc is not None:
+                            _lm = _nsurv >= _ma
+                            _st2['lvl_noanchor'] = int((_lm & (_anc == 0)).sum())
+                            _st2['lvl_fewanchor'] = int(
+                                (_lm & (_anc < _ma)).sum())
+                            _st2['lvl_passed'] = int(_lm.sum())
                     _st2['ds_unconfirmed'] = int((~_live2).sum())
                     v_ds = np.where(_live2, v_ds, np.nan)
                     h_ds = np.where(_live2, h_ds, np.nan)
@@ -3299,16 +4572,21 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                     # the value would take it.
                     lab_out[yy2, xx2] = np.where(_live2, lab_ds, -1)
                     vel_out[yy2, xx2] = v_ds.astype(np.float32)
+                    lvl_out[yy2, xx2] = np.where(_live2, 1, -1)  # DS on the PS
                     hgt_out[yy2, xx2] = h_ds.astype(np.float32)
                     coh_out[yy2, xx2] = ga[first].astype(np.float32)
                     sea_out[yy2, xx2] = ((anr[sel][kk][ps_i] + dsa[first].real)
                                          + 1j * (ani[sel][kk][ps_i]
                                                  + dsa[first].imag)
                                          ).astype(np.complex64)
-                    _3d_fit_ps_array.stats.update(
+                    # THE NODE TABLE IS A RESULT, so it also goes somewhere
+                    # this CALL owns. Level 2 stands on it, and read back from
+                    # a process-global dict a block can inherit the nodes of
+                    # whichever block shared its worker.
+                    _dsn = dict(
                         ds_attached=int(len(first)),
                         ds_partners=np.bincount(
-                            src[good], minlength=len(dy_))[src[first]],
+                            ksrc[good], minlength=len(dy_))[ksrc[first]],
                         ds_gamma=ga[first].copy(),
                         ds_votes=np.asarray(votes, dtype=np.int32),
                         ds_iy=yy2.copy(), ds_ix=xx2.copy(), ds_label=lab_ds,
@@ -3321,6 +4599,28 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                                          + 1j * (ani[sel][kk][ps_i]
                                                  + dsa[first].imag)
                                          ).astype(np.complex64))
+                    _dsn['lvl_cands'] = int(len(dy_))
+                    _dsn['lvl_fixed'] = int(len(np.unique(ktgt)))
+                    _dsn['lvl_arcs'] = int(len(ksrc))
+                    _dsn['lvl_left'] = int(_3d_fit_ps_array.stats.get(
+                        'ds_admissible', 0))
+                    _dsn['lvl_attached'] = int(len(first))
+                    for _k in ('lvl_clo_arc_v', 'lvl_clo_arc_h',
+                               'lvl_clo_ds_v', 'lvl_clo_ds_h',
+                               'lvl_dsds_in', 'lvl_dsds_kept',
+                               'lvl_dsds_failv', 'lvl_dsds_failh',
+                               'lvl_dsds_both', 'lvl_noanchor',
+                               'lvl_fewanchor', 'lvl_passed',
+                               'lvl_pcells', 'lvl_pvotes',
+                               'lvl_parcm', 'lvl_mate_jac',
+                               'lvl_lsqr_hit', 'lvl_lsqr_n',
+                               'lvl_lsqr_itn', 'lvl_lsqr_unk'):
+                        _v = _3d_fit_ps_array.stats.get(_k)
+                        if _v is not None:
+                            _dsn[_k] = _v
+                    _3d_fit_ps_array.stats.update(_dsn)
+                    if out_stats is not None:
+                        out_stats.update(_dsn)
         # ---- ROUND 2: DS TO DS, THE SAME WAY DS ATTACHED TO PS -----------
         # A pixel can be plainly connectable and still fail round 1 -- not
         # because anything contradicts it, but because the PS are too sparse
@@ -3354,173 +4654,21 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         # the PS and the level-1 DS. That is what keeps one datum across all
         # of them, and it is why the rounds compose at all.
         if level >= 2 and _ma is not None and int(_st.get('ds_attached', 0)):
-            _fy = np.asarray(_st['ds_iy']).copy()
-            _fx = np.asarray(_st['ds_ix']).copy()
-            _fv = _st['ds_velocity_rad_yr'].astype(float)
-            _fh = _st['ds_height_rad'].astype(float)
-            _fs = np.asarray(_st['ds_seasonal_rad']).copy()
-            _fl = np.asarray(_st['ds_label']).copy()
-            _done = np.zeros((ny, nx), dtype=bool)
-            _done[iy[sel][kk], ix[sel][kk]] = True
-            _done[_fy, _fx] = True
-            _st['vouch_rounds'] = []
-            for _rnd in range(int(level) - 1):
-                vy, vx = np.where(cand_ds & ~_done)
-                _st['vouch_candidates'] = int(len(vy))
-                if not len(vy):
-                    break
-                _before = int(_st.get('vouch_attached', 0))
-                _st['vouch_attached'] = 0
-                if True:
-                    _av = np.abs(S[:, vy, vx])
-                    Uv = np.ascontiguousarray(
-                        np.where(_av > 0, S[:, vy, vx] / np.where(_av > 0, _av, 1),
-                                 0).astype(np.complex64))
-                    del _av
-                    _hy2, _hx2 = max(wy // 2, 1), max(wx // 2, 1)
-                    # the same slice, over the attached DS this time
-                    _ci = np.full((ny, nx), -1, dtype=np.int64)
-                    _ci[vy, vx] = np.arange(len(vy))
-                    _s2, _t2 = [], []
-                    for _b in range(len(_fy)):
-                        _y0, _y1 = max(0, _fy[_b] - _hy2), min(ny, _fy[_b] + _hy2 + 1)
-                        _x0, _x1 = max(0, _fx[_b] - _hx2), min(nx, _fx[_b] + _hx2 + 1)
-                        _sub = _ci[_y0:_y1, _x0:_x1]
-                        _w = _sub[_sub >= 0]
-                        if len(_w):
-                            _s2.append(_w)
-                            _t2.append(np.full(len(_w), _b, dtype=np.int64))
-                    ds_s = (np.concatenate(_s2) if _s2 else np.zeros(0, np.int64))
-                    ds_t = (np.concatenate(_t2) if _t2 else np.zeros(0, np.int64))
-                    del _ci, _s2, _t2
-                    _st['vouch_arcs'] = int(len(ds_s))
-                    if len(ds_s):
-                        _ab = np.abs(S[:, _fy, _fx])
-                        Ub = np.ascontiguousarray(
-                            np.where(_ab > 0,
-                                     S[:, _fy, _fx] / np.where(_ab > 0, _ab, 1),
-                                     0).astype(np.complex64))
-                        del _ab
-                        gd, hd, vd, sd, goodd = _3d_partner_shortlist(
-                            Uv, Ub, ds_s, ds_t, _fl, len(vy), ele2phase, t,
-                            meter2rad, max_dh, max_dv, step_dh, step_dv, budget,
-                            device, iterations, _ma, threshold,
-                            stats=_st, prefix='vouch_', debug=debug,
-                            fix_h=_fh, fix_v=_fv)
-                        # THE REPRESENTATIVE IS THE HIGHEST-GAMMA SURVIVOR.
-                        # Two error terms are in play -- the new arc's, and the
-                        # base's own inherited one -- and only the first is
-                        # selectable here. Choosing instead on the base's
-                        # attachment coherence was measured and is WORSE: base
-                        # gamma says how coherently that DS attached, not how
-                        # correct its value is, so optimising for it selects
-                        # confidence rather than accuracy. The inherited error is
-                        # bounded by the gate, which has already discarded every
-                        # partner whose value disagreed.
-                        v2first, v2votes, _okv = _3d_partner_consensus(
-                            ds_s, gd, goodd, _fv[ds_t] + vd, len(vy),
-                            _ma, _ar, _ii,
-                            labels=(_fl[ds_t] if debug else None),
-                            stats=_st, prefix='vouch_')
-                        _st['vouch_attached'] = int(len(v2first))
-                        if len(v2first):
-                            _si, _bj = ds_s[v2first], ds_t[v2first]
-                            vy2, vx2 = vy[_si], vx[_si]
-
-                            # ---- SOLVE THE LEVEL-2 DS AS A NETWORK ---------
-                            # Every extension solves its new layer against the
-                            # layers already solved, held FIXED: the PS anchor the
-                            # level-1 DS, and the PS plus those DS anchor these.
-                            # Without it the layer is a star -- each pixel takes
-                            # its value from one partner and neighbouring pixels
-                            # were never compared -- which is exactly the state
-                            # level 1 was in before its own solve existed.
-                            _a2 = np.full(len(vy), -1, dtype=np.int64)
-                            _a2[_si] = np.arange(len(_si))
-                            _e2 = np.flatnonzero(goodd & (_a2[ds_s] >= 0))
-                            _e2i, _e2p = _a2[ds_s[_e2]], ds_t[_e2]
-                            _m3 = np.zeros((ny, nx), dtype=bool)
-                            _m3[vy2, vx2] = True
-                            _, _tv3, _ty3, _tx3 = _3d_arcs_kernel(
-                                S, wy, wx, tuple(cell), budget,
-                                topk=_ma, topk_mask=_m3)
-                            _ix3 = np.full((ny, nx), -1, dtype=np.int64)
-                            _ix3[vy2, vx2] = np.arange(len(_si))
-                            _hv3 = _tv3[vy2, vx2] >= float(threshold)
-                            _s3 = np.repeat(np.arange(len(_si)), _ma
-                                            ).reshape(-1, _ma)[_hv3]
-                            _py3 = np.clip(vy2[:, None] + _ty3[vy2, vx2],
-                                           0, ny - 1)[_hv3]
-                            _px3 = np.clip(vx2[:, None] + _tx3[vy2, vx2],
-                                           0, nx - 1)[_hv3]
-                            _t3 = _ix3[_py3, _px3]
-                            _ok3 = _t3 >= 0
-                            _n3i, _n3j = _s3[_ok3], _t3[_ok3]
-                            _u3 = _n3i < _n3j
-                            _n3i, _n3j = _n3i[_u3], _n3j[_u3]
-                            _st['vouch_pairs'] = int(len(_n3i))
-                            if len(_n3i):
-                                # FITTED, not predicted: these are the measurements
-                                # the solve consumes, and predicting them from the
-                                # values being solved for would be circular.
-                                _av3 = np.abs(S[:, vy2, vx2])
-                                _Uv3 = np.ascontiguousarray(
-                                    np.where(_av3 > 0, S[:, vy2, vx2]
-                                             / np.where(_av3 > 0, _av3, 1), 0
-                                             ).astype(np.complex64))
-                                del _av3
-                                _pg3, _pdh3, _pdv3 = _3d_pair_fit(
-                                    _Uv3, _Uv3, _n3i, _n3j, ele2phase, t,
-                                    _ar, _ii, budget)
-                                _k3 = np.isfinite(_pg3) & (_pg3 >= float(threshold))
-                                _n3i, _n3j = _n3i[_k3], _n3j[_k3]
-                                _pdh3, _pdv3, _pg3 = _pdh3[_k3], _pdv3[_k3], _pg3[_k3]
-                            else:
-                                _pdh3 = _pdv3 = np.zeros(0)
-                                _pg3 = np.zeros(0, np.float32)
-                            _v3, _h3, _ns3 = _3d_ds_solve(
-                                len(_si), _e2i, _e2p, vd[_e2], hd[_e2], gd[_e2],
-                                _n3i, _n3j, _pdv3, _pdh3, _pg3,
-                                _fv, _fh, _ar, _ii)
-                            _lv3 = _ns3 >= (_ma if _ma is not None else 1)
-                            _st['vouch_unconfirmed'] = int((~_lv3).sum())
-                            _v3 = np.where(_lv3, _v3, np.nan)
-                            _h3 = np.where(_lv3, _h3, np.nan)
-                            # gated on the solve, and written AFTER it --
-                            # the label used to be set before the solve ran
-                            lab_out[vy2, vx2] = np.where(_lv3, _fl[_bj], -1)
-                            vel_out[vy2, vx2] = _v3.astype(np.float32)
-                            hgt_out[vy2, vx2] = _h3.astype(np.float32)
-                            coh_out[vy2, vx2] = gd[v2first].astype(np.float32)
-                            sea_out[vy2, vx2] = (
-                                (_fs[_bj].real + sd[v2first].real)
-                                + 1j * (_fs[_bj].imag + sd[v2first].imag)
-                                ).astype(np.complex64)
-                            _st.update(
-                                vouch_iy=vy2.copy(), vouch_ix=vx2.copy(),
-                                vouch_label=_fl[_bj],
-                                vouch_gamma=gd[v2first].copy(),
-                                vouch_votes=np.asarray(v2votes, dtype=np.int32),
-                                vouch_velocity_rad_yr=_v3.astype(np.float32),
-                                vouch_height_rad=_h3.astype(np.float32))
-                _got = int(_st.get('vouch_attached', 0))
-                _st['vouch_rounds'].append(_got)
-                if debug:
-                    print(f'DEBUG: round {_rnd + 2:<2d} {len(vy):>8,} left, '
-                          f'{_got:>7,} attached, network now '
-                          f'{len(_fy) + _got:,}', flush=True)
-                if not _got:
-                    break                  # nothing added: further rounds cannot
-                _ny_ = _st['vouch_iy']; _nx_ = _st['vouch_ix']
-                _keepn = np.isfinite(_st['vouch_velocity_rad_yr'])
-                _fy = np.r_[_fy, _ny_[_keepn]]
-                _fx = np.r_[_fx, _nx_[_keepn]]
-                _fv = np.r_[_fv, _st['vouch_velocity_rad_yr'][_keepn].astype(float)]
-                _fh = np.r_[_fh, _st['vouch_height_rad'][_keepn].astype(float)]
-                _fs = np.r_[_fs, sea_out[_ny_[_keepn], _nx_[_keepn]]]
-                _fl = np.r_[_fl, _st['vouch_label'][_keepn]]
-                _done[_ny_, _nx_] = True
-
+            _3d_ds_attach(
+                S, cand_ds, dict(iy=_st['ds_iy'], ix=_st['ds_ix'],
+                                 vel=_st['ds_velocity_rad_yr'],
+                                 hgt=_st['ds_height_rad'],
+                                 sea=_st['ds_seasonal_rad'],
+                                 label=_st['ds_label'],
+                                 gamma=_st.get('ds_gamma')),
+                _oy, _ox, lab_out, vel_out, hgt_out, sea_out, coh_out,
+                lvl_out, 2, ele2phase, t, meter2rad, ny=ny, nx=nx, wy=wy,
+                wx=wx,
+                cell=cell, budget=budget, threshold=threshold, level=level,
+                max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
+                step_dv=step_dv, iterations=iterations, _ma=_ma, _ii=_ii,
+                _err_h=_err_h, _err_v=_err_v, _nth=_nth, _st=_st,
+                debug=debug)
     if debug:
         _s = _3d_fit_ps_array.stats
         _att = int(_s.get('ds_attached', 0))
@@ -3530,27 +4678,24 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
         elif _cnd:
             print(f'DEBUG: DS       {_cnd:,} candidates, '
                   f'{int(_s.get("ds_reached", 0)):,} reached a node over '
-                  f'{int(_s.get("ds_arcs", 0)):,} arcs', flush=True)
-            _adm = int(_s.get('ds_admissible', 0))
-            _no = int(_s.get('ds_no_consensus', 0))
-            _few = int(_s.get('ds_too_few', 0))
-            _g = _s.get('ds_gamma')
-            print(f'DEBUG:          {_adm:,} held an admissible arc: '
-                  f'{_att:,} attached, {_no:,} did not'
-                  + (f'   gamma p50 {np.median(_g):.3f}'
-                     if _g is not None and len(_g) else ''), flush=True)
-            print(f'DEBUG:          of those {_no:,}: {_few:,} had too few '
-                  f'partners, {_no - _few:,} had enough and disagreed',
+                  f'{int(_s.get("ds_arcs", 0)):,} arcs'
+                  f'   fit {_s.get("ds_fit_s", 0.0):.1f}s'
+                  f' + consensus {_s.get("ds_consensus_s", 0.0):.1f}s',
                   flush=True)
-            print(f'DEBUG:          {int(_s.get("ds_multi_component", 0)):,} '
-                  f'candidates saw more than one component; '
-                  f'{int(_s.get("ds_shortlist_straddled", 0)):,} would have '
-                  f'drawn a shortlist spanning two', flush=True)
-            _xv = _s.get('ds_cross_component_votes')
-            if _xv is not None:
-                print(f'DEBUG:          cross-component votes among attached '
-                      f'DS: {int(_xv):,}' + ('' if _xv == 0 else '   <-- BUG'),
-                      flush=True)
+            # THE BLOCK'S NUMBERS ARE NOT THE LEVEL'S. Level 1 runs once per
+            # block, so printing here repeats every line as many times as
+            # there are chunks -- unreadable at a few dozen, and still not the
+            # answer, since the level's yield is the sum and its error
+            # distribution the pooled samples. Recorded for the level's
+            # reducer, which prints once when every block has finished.
+            _s['lvl_no_consensus'] = int(_s.get('ds_no_consensus', 0))
+            _s['lvl_too_few'] = int(_s.get('ds_too_few', 0))
+            _s['lvl_multi_comp'] = int(_s.get('ds_multi_component', 0))
+            _s['lvl_straddled'] = int(_s.get('ds_shortlist_straddled', 0))
+            _s['lvl_cross_votes'] = int(_s.get('ds_cross_component_votes') or 0)
+            _g = _s.get('ds_gamma')
+            if _g is not None and len(_g):
+                _s['lvl_gamma'] = np.asarray(_g, np.float32)
         else:
             print('DEBUG: DS       no candidates cleared the threshold',
                   flush=True)
@@ -3575,8 +4720,346 @@ def _3d_fit_ps_array(scenes, date_values, *, spacing, bperp=None,
                 print(f'DEBUG:          cross-component votes among attached: '
                       f'{int(_vx2):,}' + ('' if _vx2 == 0 else '   <-- BUG'),
                       flush=True)
-        print(f'DEBUG: total    {len(_s.get("iy", ())):,} PS + {_att:,} DS'
-              + (f' + {_va:,} DS->DS' if _va else '')
-              + f' = {len(_s.get("iy", ())) + _att + _va:,} measured pixels',
-              flush=True)
-    return lab_out, vel_out, hgt_out, sea_out, coh_out
+        # the closure of this level is reported once, by the level's reducer,
+        # over the pooled samples of every block -- see `lvl_clo_*` above
+        # the total is the LEVEL's, and one block does not know it
+        _s['lvl_ps'] = int(len(_s.get('iy', ())))
+    return lab_out, vel_out, hgt_out, sea_out, coh_out, lvl_out
+
+
+def __3d_fit_ps_array_gated(scenes, date_values, *, spacing, bperp=None,
+                            window=(32, 128), threshold=0.5, cell=(2, 8),
+                            geometry, budget=None, level=1,
+                            max_dh=100.0, max_dv=25.0, step_dh=4.0,
+                            step_dv=2.0, max_seasonal=5.0,
+                            consensus, iterations=8, threads=None,
+                            debug=False):
+    # THE THREE STAGES, COMPOSED. One block in, one model out -- the split
+    # exists so `union=True` can run the middle stage ONCE over nodes gathered
+    # from every block, without ever merging the blocks themselves into a
+    # raster. Run in sequence here, it is the fit as it always was.
+    _3d_fit_ps_array.stats.reset(nodes=0, arcs=0, dropped=0, components=[],
+                                 fill_order=[])
+    _kw = dict(spacing=spacing, bperp=bperp, window=window,
+               threshold=threshold, cell=cell, geometry=geometry,
+               budget=budget, iterations=iterations, threads=threads,
+               debug=debug)
+    nodes0 = _3d_ps_nodes(scenes, date_values, **_kw)
+    if nodes0 is None:
+        S = np.asarray(scenes)
+        ny, nx = (S.shape[1], S.shape[2]) if S.ndim == 3 else (0, 0)
+        return (np.full((ny, nx), -1, dtype=np.int8),
+                np.full((ny, nx), np.nan, dtype=np.float32),
+                np.full((ny, nx), np.nan, dtype=np.float32),
+                np.full((ny, nx), np.nan + 1j * np.nan, dtype=np.complex64),
+                np.full((ny, nx), np.nan, dtype=np.float32),
+                np.full((ny, nx), -1, dtype=np.int8))
+    net = _3d_ps_network(nodes0['U'], nodes0['iy'], nodes0['ix'], date_values,
+                         bperp=bperp, window=window, threshold=threshold,
+                         geometry=geometry, budget=budget,
+                         consensus=consensus, iterations=iterations,
+                         max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
+                         step_dv=step_dv, max_seasonal=max_seasonal,
+                         threads=threads, debug=debug)
+    return _3d_ps_attach(scenes, nodes0['q'], net, date_values,
+                         spacing=spacing, bperp=bperp, window=window,
+                         threshold=threshold, cell=cell, geometry=geometry,
+                         budget=budget, level=level, max_dh=max_dh,
+                         max_dv=max_dv, step_dh=step_dh, step_dv=step_dv,
+                         consensus=consensus, iterations=iterations,
+                         threads=threads, debug=debug)
+
+
+
+# PER-THREAD FROM THE START, so no call site ever meets a plain dict here.
+_3d_fit_ps_array.stats = _ThreadStats()
+
+
+@_numba.njit(nogil=True, cache=True)
+def _cascade_tile(t2, mask, thr2, cnt, mx, y, x0, hx, gx0, ny_cnt, nx_cnt):
+    """One tile's fused count+max with both ends credited, GIL-free.
+
+    `t2` holds squared coherent-sum magnitudes for the tile's own pixels
+    against their one-sided neighbourhood; every admissible score is counted
+    against the threshold and folded into the running maximum AT BOTH ENDS.
+    Credits land wherever they fall -- the caller clips to the owned region
+    by slicing the accumulators it hands in.
+    """
+    w, ndy, span = t2.shape
+    for i in range(w):
+        xi = x0 + i
+        for dy in range(ndy):
+            base = dy * span
+            for c in range(span):
+                if mask[i, base + c] == 0.0:
+                    continue
+                v = t2[i, dy, c]
+                col = gx0 + c
+                if v >= thr2:
+                    cnt[y, xi] += 1
+                    if 0 <= col < nx_cnt and y + dy < ny_cnt:
+                        cnt[y + dy, col] += 1
+                if v > mx[y, xi]:
+                    mx[y, xi] = v
+                if 0 <= col < nx_cnt and y + dy < ny_cnt:
+                    if v > mx[y + dy, col]:
+                        mx[y + dy, col] = v
+
+
+def _cascade_count_max(S, wy, wx, cell, thr):
+    """Per-pixel coherent-arc COUNT and best-arc coherence, in one sweep.
+
+    The same one-sided rectangular products as `_3d_arcs_kernel`, reduced to
+    the two numbers the cascade needs: how many admissible arcs clear `thr`,
+    and the best coherence reached. Returns (count int32, best float32) for
+    the WHOLE array handed in -- the caller slices owned pixels out.
+    """
+    n, ny, nx = S.shape
+    cy, cx = int(cell[0]), int(cell[1])
+    hy, hx = wy // 2, wx // 2
+    K = 2 * n
+    Xp = np.zeros((ny, nx + 2 * hx, K), dtype=np.float32)
+    slab = max(1, min(ny, int(64 * 1024 * 1024 // max(n * nx * 8, 1))))
+    for y0 in range(0, ny, slab):
+        y1 = min(y0 + slab, ny)
+        blk = S[:, y0:y1, :]
+        a = np.abs(blk)
+        f = np.isfinite(a) & (a > 0)
+        o = f.all(axis=0)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            u = np.where(f, blk / np.where(f, a, 1), 0)
+        u *= o[None, :, :]
+        Xp[y0:y1, hx:hx + nx, :n] = np.moveaxis(u.real, 0, -1)
+        Xp[y0:y1, hx:hx + nx, n:] = np.moveaxis(u.imag, 0, -1)
+        del blk, a, f, o, u
+    cnt = np.zeros((ny, nx), np.int32)
+    mx = np.zeros((ny, nx), np.float32)
+    thr2 = (float(thr) * n) ** 2
+    Bx = max(8, hx)
+    masks = {}
+    for y in range(ny):
+        ndy = min(hy + 1, ny - y)
+        for x0 in range(0, nx, Bx):
+            w = min(Bx, nx - x0)
+            span = w + 2 * hx
+            A1 = Xp[y, hx + x0:hx + x0 + w, :]
+            A2 = np.empty((w, K), dtype=np.float32)
+            A2[:, :n] = A1[:, n:]
+            A2[:, n:] = -A1[:, :n]
+            Bk = np.ascontiguousarray(
+                Xp[y:y + ndy, x0:x0 + span, :].transpose(2, 0, 1)
+            ).reshape(K, ndy * span)
+            t = A1 @ Bk
+            Ci = A2 @ Bk
+            np.multiply(t, t, out=t)
+            np.multiply(Ci, Ci, out=Ci)
+            t += Ci
+            key = (w, ndy)
+            if key not in masks:
+                dxm = (np.arange(span)[None, None, :] - hx
+                       - np.arange(w)[:, None, None])
+                dyv = np.arange(ndy)[None, :, None]
+                mm = ((np.abs(dxm) <= hx)
+                      & ~((dyv < cy) & (np.abs(dxm) < cx))
+                      & ~((dyv == 0) & (dxm <= 0)))
+                masks[key] = mm.reshape(w, ndy * span).astype(np.float32)
+            m = masks[key]
+            t *= m
+            _cascade_tile(t.reshape(w, ndy, span), m, thr2, cnt, mx,
+                          y, x0, hx, x0 - hx, ny, nx)
+    best = np.sqrt(mx, out=mx) / n
+    return cnt, best
+
+
+def _cascade_pass1(block, owned, origin, wy, wx, cell, thr, consensus,
+                   threads=1, token=None):
+    """One chunk of the cascade's dense scan: the DS-candidate rank raster and
+    the PS-candidate winners, from a single pass over the chunk's data.
+
+    `block` is the chunk WITH its full-window halo; `owned` = (y0, y1, x0, x1)
+    names the region this task answers for, in block-local indices, and
+    `origin` = (gy, gx) is the block's [0,0] in FULL-raster coordinates -- the
+    winner cells live on the GLOBAL (wy//2, wx//2) lattice, so a chunk that
+    does not start on a lattice line must still cut cells where the raster
+    does. The halo is a full DS window per
+    side because a winner cell owned by its origin reaches half a window past
+    the owned edge, and gating those pixels needs THEIR windows complete.
+
+    Returns (rank, Wser, wiy, wix):
+      rank : (owned) float32 -- best arc coherence where the pixel holds at
+             least `consensus` admissible arcs over `thr`, NaN otherwise.
+      Wser : (dates, cells_y, cells_x) complex64 -- the winner pixel's raw
+             series per (wy//2, wx//2) cell whose origin is owned; NaN series
+             where the cell holds no gated pixel.
+      wiy, wix : (cells_y, cells_x) int32 -- the winner's pixel position in
+             the FULL raster, -1 where none.
+    """
+    S = np.asarray(block, dtype=np.complex64)
+    n, ny, nx = S.shape
+    y0, y1, x0, x1 = owned
+    hy, hx = wy // 2, wx // 2
+    _th = max(1, int(threads))
+    if _th > 1 and ny >= 2 * (hy + 1):
+        from concurrent.futures import ThreadPoolExecutor
+        H = max(hy + 1, -(-ny // _th))
+        bands = [(a, min(a + H, ny)) for a in range(0, ny, H)]
+        cnt = np.empty((ny, nx), np.int32)
+        best = np.empty((ny, nx), np.float32)
+
+        def _band(b):
+            ya, yb = b
+            a0 = max(0, ya - hy)
+            b0 = min(ny, yb + hy)
+            c_, m_ = _cascade_count_max(S[:, a0:b0], wy, wx, cell, thr)
+            cnt[ya:yb] = c_[ya - a0:yb - a0]
+            best[ya:yb] = m_[ya - a0:yb - a0]
+        with ThreadPoolExecutor(_th) as ex:
+            list(ex.map(_band, bands))
+    else:
+        cnt, best = _cascade_count_max(S, wy, wx, cell, thr)
+    rank_full = np.where(cnt >= int(consensus), best, np.nan).astype(np.float32)
+    rank = rank_full[y0:y1, x0:x1]
+
+    # winners: one per (hy, hx) cell of the GLOBAL lattice whose origin is
+    # owned, chosen as the argmax of the gated rank over the cell -- pixels
+    # up to half a window into the halo, whose gating the full-window halo
+    # made exact
+    gy, gx = origin
+    gy0, gx0 = gy + y0, gx + x0
+    cy0 = (-(-gy0 // hy) * hy) - gy
+    cx0 = (-(-gx0 // hx) * hx) - gx
+    oy = np.arange(cy0, y1, hy)
+    ox = np.arange(cx0, x1, hx)
+    Wser = np.full((n, len(oy), len(ox)), np.nan, dtype=np.complex64)
+    wiy = np.full((len(oy), len(ox)), -1, dtype=np.int32)
+    wix = np.full((len(oy), len(ox)), -1, dtype=np.int32)
+    for a, ya in enumerate(oy):
+        for b, xa in enumerate(ox):
+            cell_r = rank_full[ya:min(ya + hy, ny), xa:min(xa + hx, nx)]
+            if not np.isfinite(cell_r).any():
+                continue
+            k = np.nanargmax(cell_r)
+            dy_, dx_ = divmod(int(k), cell_r.shape[1])
+            Wser[:, a, b] = S[:, ya + dy_, xa + dx_]
+            wiy[a, b] = gy + ya + dy_
+            wix[a, b] = gx + xa + dx_
+    return rank, Wser, wiy, wix
+
+
+def _cascade_ps(Wser, wiy, wix, ele2phase, t, meter2rad, wy, wx, py, px,
+                thr, consensus, max_dh=100.0, max_dv=25.0, step_dh=4.0,
+                step_dv=2.0, iterations=8, threads=1):
+    """PS candidates from the merged winner grid: fitted long arcs only.
+
+    The winner grid is the raster one pyramid level up, so reach is counted in
+    (wy//2, wx//2) CELLS: partners closer than the DS window in both axes are
+    the short-arc regime and excluded; partners beyond the PS window carry no
+    common atmosphere and are not attempted. Partners are ranked raw and the
+    best few FITTED -- a long arc only counts fitted.
+
+    Returns per-cell (gamma, dh, dv, arcs): the best fitted long-arc
+    coherence, its differentials, and how many fitted long arcs cleared
+    `thr`; NaN/0 where the cell has no winner or no coherent long arc.
+    """
+    n, NY, NX = Wser.shape
+    flat = Wser.reshape(n, -1)
+    a = np.abs(flat)
+    ok = np.isfinite(a).all(axis=0) & (a > 0).all(axis=0)
+    idx = np.flatnonzero(ok)
+    gamma = np.full((NY, NX), np.nan, np.float32)
+    dh = np.full((NY, NX), np.nan, np.float32)
+    dv = np.full((NY, NX), np.nan, np.float32)
+    arcs = np.zeros((NY, NX), np.int32)
+    if len(idx) < 2:
+        return gamma, dh, dv, arcs
+    with np.errstate(invalid='ignore', divide='ignore'):
+        U = (flat[:, idx] / a[:, idx]).astype(np.complex64)
+    cy_ = np.asarray(idx // NX, np.int64)
+    cx_ = np.asarray(idx % NX, np.int64)
+    # REACH IN CELLS: beyond the DS window, inside the PS window. The extent is
+    # a FULL box centred on the cell, so the reach is HALF of it -- the same
+    # rule the node network gets from its Chebyshev query and the attachment
+    # from its tiles. Counted from the extent itself, this test reached twice
+    # as far as the window it documents, and twice as far as fit3d for the
+    # same parameter.
+    ry = max(1, (py // 2) // (wy // 2))
+    rx = max(1, (px // 2) // (wx // 2))
+    ey, ex = wy // (wy // 2), wx // (wx // 2)
+    m = len(idx)
+    kk = min(int(consensus), m - 1)
+    # THE REACH IS APPLIED TO THE OPERAND, NOT THE PRODUCT. Scoring every
+    # candidate against every other and masking afterwards computes the arcs
+    # the window has already refused -- most of them, since the extent covers a
+    # fraction of the lattice -- and then sorts all of it. Tiling the
+    # candidates and taking the cells a tile can reach multiplies only what can
+    # be kept, and turns the sort into a partition over that much smaller set.
+    # The winners sit on a regular lattice in row-major order, so a tile's
+    # reachable rows are a contiguous slice and only the columns need a test.
+    src_l, tgt_l = [], []
+    ty, tx = max(1, ry // 2), max(1, rx // 2)
+    for r0 in range(0, NY, ty):
+        r1 = min(r0 + ty, NY)
+        s0, s1 = np.searchsorted(cy_, r0), np.searchsorted(cy_, r1)
+        if s1 <= s0:
+            continue
+        t0 = np.searchsorted(cy_, max(0, r0 - ry))
+        t1 = np.searchsorted(cy_, r1 - 1 + ry, side='right')
+        for c0 in range(0, NX, tx):
+            c1 = min(c0 + tx, NX)
+            si = s0 + np.flatnonzero((cx_[s0:s1] >= c0) & (cx_[s0:s1] < c1))
+            if not len(si):
+                continue
+            ti = t0 + np.flatnonzero((cx_[t0:t1] >= c0 - rx)
+                                     & (cx_[t0:t1] <= c1 - 1 + rx))
+            if not len(ti):
+                continue
+            G = np.abs(U[:, si].conj().T @ U[:, ti]) / n
+            ddy = np.abs(cy_[si][:, None] - cy_[ti][None, :])
+            ddx = np.abs(cx_[si][:, None] - cx_[ti][None, :])
+            G[(ddy < ey) & (ddx < ex)] = -1.0      # short-arc regime
+            G[(ddy > ry) | (ddx > rx)] = -1.0      # the tile over-reaches a
+            #                                        little; the pair test does
+            #                                        not
+            k_ = min(kk, G.shape[1])
+            if k_ < 1:
+                continue
+            top = (np.argpartition(-G, k_ - 1, axis=1)[:, :k_]
+                   if k_ < G.shape[1] else np.argsort(-G, axis=1)[:, :k_])
+            keep = np.take_along_axis(G, top, 1) > 0
+            src_l.append(np.repeat(si, k_)[keep.ravel()])
+            tgt_l.append(ti[top.ravel()][keep.ravel()])
+    src = np.concatenate(src_l) if src_l else np.empty(0, np.int64)
+    tgt = np.concatenate(tgt_l) if tgt_l else np.empty(0, np.int64)
+    if len(src):
+        ga, dha, dva, _ = _3d_arc_batch(
+            U, U, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
+            step_dh, step_dv, 1024.0, iterations, threads=threads)
+        good = np.isfinite(ga) & (ga >= float(thr))
+        np.add.at(arcs.ravel(), idx[src[good]], 1)
+        order = np.lexsort((-np.where(good, ga, -np.inf), src))
+        first = order[np.r_[True, np.diff(src[order]) > 0]]
+        first = first[good[first]]
+        gamma.ravel()[idx[src[first]]] = ga[first]
+        dh.ravel()[idx[src[first]]] = dha[first]
+        dv.ravel()[idx[src[first]]] = dva[first]
+    return gamma, dh, dv, arcs
+
+
+def _warmup_numba_cache():
+    """Compile numba kernels once in the main process so dask workers load from cache."""
+    _tv = np.zeros((1, 1, 3), np.float32)
+    _m = np.ones((1, 3), np.float32)
+    _own = np.ones(1, bool)
+    _par = np.ones((1, 1), bool)
+    _v = np.full((1, 1, 2), -1.0, np.float32)
+    _y = np.zeros((1, 1, 2), np.int16)
+    _x = np.zeros((1, 1, 2), np.int16)
+    _3d_topk_tile(_tv, _m, _own, _par, _v, _y, _x, 0, 0, 1, -1, 0, 1)
+    _3d_topk_stream(np.array([0.5, np.nan, 0.7]),
+                    np.array([0, 0, 0], np.int64), 1, 2)
+    _cascade_tile(np.ones((1, 1, 3), np.float32), np.ones((1, 3), np.float32),
+                  0.5, np.zeros((1, 1), np.int32), np.zeros((1, 1), np.float32),
+                  0, 0, 1, -1, 1, 1)
+
+
+_warmup_numba_cache()

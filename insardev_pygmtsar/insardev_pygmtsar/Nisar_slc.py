@@ -161,7 +161,7 @@ class Nisar_slc(Satellite):
 
         # Build GeoDataFrame
         df = pd.DataFrame(records)
-        df = gpd.GeoDataFrame(df, geometry='geometry') \
+        df = gpd.GeoDataFrame(df, geometry='geometry', crs=4326) \
             .sort_values(by=['sceneId', 'polarization', 'scene']) \
             .set_index(['sceneId', 'polarization', 'scene'])
 
@@ -171,6 +171,8 @@ class Nisar_slc(Satellite):
 
         print(f'NOTE: Loaded {len(df)} Nisar scenes (frequency{self.frequency}).')
         self.df = df
+        # a record attribute, placed before the geometry, which is kept last as the long field
+        self.df.insert(self.df.columns.get_loc('geometry'), 'BPR', self.baselines())
 
     def _make_scene(self, scene: str, mode: int = 2, debug: bool = False):
         """

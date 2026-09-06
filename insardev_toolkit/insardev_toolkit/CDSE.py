@@ -20,9 +20,43 @@ import requests
 _CDSE_TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/cdse/protocol/openid-connect/token"
 _CDSE_CLIENT_ID = "cdse-public"
 _CDSE_CATALOGUE_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Bursts"
+# bursts per catalogue request, the server rejects anything above this
+_CDSE_PAGE_SIZE = 1000
 
 # Cloudflare Worker cache proxy for CDSE bursts
 _CDSE_CACHE_PROXY = 'https://s1-cache-cdse.insar.dev'
+
+
+def _cdse_query(params, pages=None):
+    """Query the CDSE catalogue and return all matching bursts.
+
+    The catalogue never returns more than _CDSE_PAGE_SIZE bursts per request and reports the
+    rest through an @odata.nextLink, so a query matching more bursts than that is silently
+    truncated unless the link is followed.
+
+    Parameters
+    ----------
+    params : dict
+        OData parameters, e.g. {'$filter': '...', '$top': 1000}.
+    pages : int, optional
+        Maximum number of pages to read. None reads them all.
+
+    Returns
+    -------
+    list
+        List of CDSE burst records.
+    """
+    values = []
+    url, page = _CDSE_CATALOGUE_URL, 0
+    while url is not None and (pages is None or page < pages):
+        # the next link carries its own query, so pass params for the first request only
+        response = requests.get(url, params=params if page == 0 else None, timeout=(30, 300))
+        response.raise_for_status()
+        data = response.json()
+        values += data.get('value', [])
+        url = data.get('@odata.nextLink')
+        page += 1
+    return values
 
 
 class _CDSESession(requests.Session):
@@ -149,11 +183,8 @@ def _cdse_search(start=None, end=None, flightDirection=None, intersectsWith=None
     if filters:
         params['$filter'] = ' and '.join(filters)
 
-    response = requests.get(_CDSE_CATALOGUE_URL, params=params)
-    response.raise_for_status()
-
-    data = response.json()
-    return data.get('value', [])
+    # top is the limit the caller asked for, so a single page is exactly what is wanted
+    return _cdse_query(params, pages=1)
 
 
 def _parse_asf_burst_id(burst_id):
@@ -204,9 +235,12 @@ def _make_asf_burst_id(cdse_burst):
     swath = cdse_burst.get('SwathIdentifier', 'IW1')
     polarization = cdse_burst.get('PolarisationChannels', 'VV')
 
-    # Parse datetime from ContentDate
+    # Name the burst after its azimuth time, which is the value the annotation carries in
+    # adsHeader/startTime and the value ASF names a burst after. ContentDate/Start is the
+    # sensing start, 1-2 seconds later, and naming a burst after it stores it under a name
+    # ASF cannot recognize, so the same burst is downloaded twice into one directory.
     content_date = cdse_burst.get('ContentDate', {})
-    start_time = content_date.get('Start', '')
+    start_time = cdse_burst.get('AzimuthTime') or content_date.get('Start', '')
     # Convert 2019-07-02T03:24:58.123Z to 20190702T032458
     dt_str = start_time[:19].replace('-', '').replace(':', '')
 
@@ -489,13 +523,11 @@ class CDSE(progressbar_joblib):
             filters.append(f"PolarisationChannels eq '{polarizations[0]}'")
 
         params = {
-            '$top': 1000,
+            '$top': _CDSE_PAGE_SIZE,
             '$filter': ' and '.join(filters),
         }
 
-        response = requests.get(_CDSE_CATALOGUE_URL, params=params)
-        response.raise_for_status()
-        cdse_results = response.json().get('value', [])
+        cdse_results = _cdse_query(params)
 
         # Filter to exact matches (swath, date, polarization)
         results = []
@@ -728,13 +760,36 @@ class CDSE(progressbar_joblib):
                 via = 'proxy' if _CDSE_CACHE_PROXY in url else 'direct'
                 print(f'  {cache_status:4} {via:6} {zip_mb:5.1f}MB {burst}')
 
+            # Validate ZIP magic bytes
+            if zip_bytes[:2] != b'PK':
+                # Not an archive - likely JSON error from server
+                try:
+                    import json
+                    error_json = json.loads(zip_bytes.decode('utf-8', errors='replace'))
+                    error_msg = error_json.get('message', error_json.get('detail',
+                                               error_json.get('error', str(error_json))))
+                    raise Exception(f'ERROR: CDSE server returned error instead of ZIP for {burst}: {error_msg}')
+                except json.JSONDecodeError:
+                    raise Exception(f'ERROR: Invalid ZIP magic bytes for {burst}: {zip_bytes[:4]!r}')
+
+            # The archive is streamed with chunked encoding and without a content length, so an
+            # upstream failure ends the stream early and the short body arrives without any error.
+            # Such a partial archive has no end of central directory record and zipfile reports
+            # that as the misleading 'File is not a zip file'.
+            try:
+                archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+            except zipfile.BadZipFile as e:
+                raise Exception(f'ERROR: Downloaded ZIP incomplete for {burst}: {e}. '
+                              f'Got {len(zip_bytes)} bytes (cache: {cache_status}), the cache proxy '
+                              f'stream ended before the archive was complete.')
+
             # Extract zip to memory first for validation
             tiff_bytes = None
             annotation_xml = None
             noise_xml = None
             calibration_xml = None
 
-            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            with archive as zf:
                 for member in zf.namelist():
                     filename = os.path.basename(member)
 

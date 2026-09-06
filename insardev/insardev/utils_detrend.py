@@ -12,18 +12,9 @@
 Static utility functions for detrending operations.
 
 These functions contain the core algorithms for 1D and 2D polynomial
-trend fitting using PyTorch for GPU acceleration.
+trend fitting.
 """
-from .utils_torch import serialize_gpu
 import numpy as np
-import threading
-
-# Lock for CUDA torch.linalg lazy initialization (prevents multi-threading bug)
-# See: https://github.com/pytorch/pytorch/issues/90613
-_linalg_init_lock = threading.Lock()
-_linalg_initialized = False
-
-
 import numba as nb
 
 
@@ -47,15 +38,12 @@ def _warmup_numba_cache():
         np.array([0.0, 0.5, 1.0]),  # date_days_norm (real times)
         0, True,
     )
-    _v = np.zeros((2, 3), dtype=np.float32)
-    _g = np.zeros((2, 2), dtype=np.float64)
-    _gy = np.array([0.0, 1.0]); _gx = np.array([0.0, 2.0])
-    _bilinear_interp_trend(_g, _g, _gy, _gx, 2, 3, True)
-    _p = _c[:, :3].reshape(1, 3).view(np.complex64)
-    _trend2d_sliding_numba_kernel(
-        _p, _v, _v, _v, np.ones((1, 1), dtype=np.float32),
-        1, 1, 1, 1, False, True, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
-    )
+    # the gridded transform's spreaders, one call per rank: a worker that has
+    # to compile them itself does it while every other worker compiles the
+    # same thing into the same cache
+    for _k in (1, 2, 3):
+        trend2d_spread(np.ones((1, 1), np.complex128),
+                       np.zeros((1, _k)), 8)
 
 
 @nb.njit(cache=True)
@@ -142,10 +130,6 @@ def threshold_pairs_array(data_chunk, weight_chunk, threshold=np.pi/2):
             if not mask_2d[iy, ix]:
                 result[:, iy, ix] = nan_val
     return result
-
-
-
-
 
 
 @nb.njit(cache=True)
@@ -710,657 +694,6 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_compl
 regression1d_array = trend1d_array
 
 
-
-@nb.njit(cache=True)
-def _solve4x4(A, b):
-    """Solve 4x4 system Ax=b via Gaussian elimination with partial pivoting."""
-    M = np.empty((4, 5), dtype=np.float64)
-    for i in range(4):
-        for j in range(4):
-            M[i, j] = A[i, j]
-        M[i, 4] = b[i]
-    for col in range(4):
-        max_val = abs(M[col, col])
-        max_row = col
-        for row in range(col + 1, 4):
-            if abs(M[row, col]) > max_val:
-                max_val = abs(M[row, col])
-                max_row = row
-        if max_val < 1e-15:
-            return np.zeros(4, dtype=np.float64)
-        if max_row != col:
-            for j in range(5):
-                M[col, j], M[max_row, j] = M[max_row, j], M[col, j]
-        for row in range(col + 1, 4):
-            factor = M[row, col] / M[col, col]
-            for j in range(col, 5):
-                M[row, j] -= factor * M[col, j]
-    x = np.zeros(4, dtype=np.float64)
-    for i in range(3, -1, -1):
-        s = M[i, 4]
-        for j in range(i + 1, 4):
-            s -= M[i, j] * x[j]
-        x[i] = s / M[i, i]
-    return x
-
-
-@nb.njit(cache=True)
-def _trend2d_sliding_numba_kernel(phase_2d, var0, var1, var2, weight_2d,
-                                   half_y, half_x, stride_y, stride_x,
-                                   has_weight, is_complex,
-                                   g_mu0, g_std0, g_mu1, g_std1, g_mu2, g_std2):
-    """Sliding window polynomial fit with column-cached incremental updates.
-
-    Column cache: per-column AtA/Atb/n_valid for the current vertical range.
-    Horizontal step: add/remove cached column stats (O(19) per column, not O(wy)).
-    Vertical step: update each column cache by adding/removing stride_y rows.
-    """
-    ny, nx = phase_2d.shape
-    NC = 19  # 10 AtA upper-tri + 4 Atb_re + 4 Atb_im + 1 n_valid
-
-    gy_list = list(range(0, ny, stride_y))
-    if gy_list[-1] != ny - 1:
-        gy_list.append(ny - 1)
-    gx_list = list(range(0, nx, stride_x))
-    if gx_list[-1] != nx - 1:
-        gx_list.append(nx - 1)
-    n_gy = len(gy_list)
-    n_gx = len(gx_list)
-
-    grid_re = np.full((n_gy, n_gx), np.nan, dtype=np.float64)
-    grid_im = np.full((n_gy, n_gx), np.nan, dtype=np.float64)
-
-    # Precompute
-    sv0 = np.empty((ny, nx), dtype=np.float64)
-    sv1 = np.empty((ny, nx), dtype=np.float64)
-    sv2 = np.empty((ny, nx), dtype=np.float64)
-    valid = np.zeros((ny, nx), dtype=nb.boolean)
-    p_re = np.zeros((ny, nx), dtype=np.float64)
-    p_im = np.zeros((ny, nx), dtype=np.float64)
-    for i in range(ny):
-        for j in range(nx):
-            sv0[i,j] = (np.float64(var0[i,j]) - g_mu0) / g_std0
-            sv1[i,j] = (np.float64(var1[i,j]) - g_mu1) / g_std1
-            sv2[i,j] = (np.float64(var2[i,j]) - g_mu2) / g_std2
-            if not (np.isfinite(sv0[i,j]) and np.isfinite(sv1[i,j]) and np.isfinite(sv2[i,j])):
-                continue
-            if is_complex:
-                pr = np.float64(phase_2d[i,j].real); pi = np.float64(phase_2d[i,j].imag)
-                if not (np.isfinite(pr) and np.isfinite(pi)): continue
-                mag = np.sqrt(pr*pr + pi*pi)
-                if mag == 0: continue
-                p_re[i,j] = pr/mag; p_im[i,j] = pi/mag
-            else:
-                pf = np.float64(phase_2d[i,j].real)
-                if not np.isfinite(pf): continue
-                p_re[i,j] = pf
-            valid[i,j] = True
-
-    min_valid = 8
-    # Column cache: cc[j, 0:10]=AtA, cc[j, 10:14]=Atb_re, cc[j, 14:18]=Atb_im, cc[j, 18]=n_valid
-    cc = np.zeros((nx, NC), dtype=np.float64)
-
-    # --- Helper: add one pixel (i,j) to column cache cc[j] with sign +1 or -1 ---
-    # Inlined below for speed, but the mapping is:
-    # cc[j,0]=AtA00 cc[j,1]=AtA01 cc[j,2]=AtA02 cc[j,3]=AtA03
-    # cc[j,4]=AtA11 cc[j,5]=AtA12 cc[j,6]=AtA13
-    # cc[j,7]=AtA22 cc[j,8]=AtA23 cc[j,9]=AtA33
-    # cc[j,10:14]=Atb_re cc[j,14:18]=Atb_im cc[j,18]=n_valid
-
-    # Build initial column caches for first grid row
-    wy0 = max(0, gy_list[0] - half_y)
-    wy1 = min(ny, gy_list[0] + half_y + 1)
-    for j in range(nx):
-        for i in range(wy0, wy1):
-            if not valid[i,j]: continue
-            a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
-            if has_weight:
-                ww = np.float64(weight_2d[i,j])
-                if not (np.isfinite(ww) and ww > 0): continue
-                w = np.sqrt(max(ww, 1e-6))
-            else:
-                w = 1.0
-            wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
-            cc[j,0]+=wa0*wa0; cc[j,1]+=wa0*wa1; cc[j,2]+=wa0*wa2; cc[j,3]+=wa0*wa3
-            cc[j,4]+=wa1*wa1; cc[j,5]+=wa1*wa2; cc[j,6]+=wa1*wa3
-            cc[j,7]+=wa2*wa2; cc[j,8]+=wa2*wa3; cc[j,9]+=wa3*wa3
-            bw=p_re[i,j]*w
-            cc[j,10]+=wa0*bw; cc[j,11]+=wa1*bw; cc[j,12]+=wa2*bw; cc[j,13]+=wa3*bw
-            if is_complex:
-                bw2=p_im[i,j]*w
-                cc[j,14]+=wa0*bw2; cc[j,15]+=wa1*bw2; cc[j,16]+=wa2*bw2; cc[j,17]+=wa3*bw2
-            cc[j,18] += 1.0
-
-    prev_wy0 = wy0; prev_wy1 = wy1
-
-    for gi in range(n_gy):
-        cy = gy_list[gi]
-        wy0 = max(0, cy - half_y)
-        wy1 = min(ny, cy + half_y + 1)
-
-        if gi > 0:
-            # Update column caches vertically: remove top rows, add bottom rows
-            for j in range(nx):
-                for i in range(prev_wy0, wy0):
-                    if not valid[i,j]: continue
-                    a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
-                    if has_weight:
-                        ww = np.float64(weight_2d[i,j])
-                        if not (np.isfinite(ww) and ww > 0): continue
-                        w = np.sqrt(max(ww, 1e-6))
-                    else:
-                        w = 1.0
-                    wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
-                    cc[j,0]-=wa0*wa0; cc[j,1]-=wa0*wa1; cc[j,2]-=wa0*wa2; cc[j,3]-=wa0*wa3
-                    cc[j,4]-=wa1*wa1; cc[j,5]-=wa1*wa2; cc[j,6]-=wa1*wa3
-                    cc[j,7]-=wa2*wa2; cc[j,8]-=wa2*wa3; cc[j,9]-=wa3*wa3
-                    bw=p_re[i,j]*w
-                    cc[j,10]-=wa0*bw; cc[j,11]-=wa1*bw; cc[j,12]-=wa2*bw; cc[j,13]-=wa3*bw
-                    if is_complex:
-                        bw2=p_im[i,j]*w
-                        cc[j,14]-=wa0*bw2; cc[j,15]-=wa1*bw2; cc[j,16]-=wa2*bw2; cc[j,17]-=wa3*bw2
-                    cc[j,18] -= 1.0
-                for i in range(prev_wy1, wy1):
-                    if not valid[i,j]: continue
-                    a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
-                    if has_weight:
-                        ww = np.float64(weight_2d[i,j])
-                        if not (np.isfinite(ww) and ww > 0): continue
-                        w = np.sqrt(max(ww, 1e-6))
-                    else:
-                        w = 1.0
-                    wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
-                    cc[j,0]+=wa0*wa0; cc[j,1]+=wa0*wa1; cc[j,2]+=wa0*wa2; cc[j,3]+=wa0*wa3
-                    cc[j,4]+=wa1*wa1; cc[j,5]+=wa1*wa2; cc[j,6]+=wa1*wa3
-                    cc[j,7]+=wa2*wa2; cc[j,8]+=wa2*wa3; cc[j,9]+=wa3*wa3
-                    bw=p_re[i,j]*w
-                    cc[j,10]+=wa0*bw; cc[j,11]+=wa1*bw; cc[j,12]+=wa2*bw; cc[j,13]+=wa3*bw
-                    if is_complex:
-                        bw2=p_im[i,j]*w
-                        cc[j,14]+=wa0*bw2; cc[j,15]+=wa1*bw2; cc[j,16]+=wa2*bw2; cc[j,17]+=wa3*bw2
-                    cc[j,18] += 1.0
-            prev_wy0 = wy0; prev_wy1 = wy1
-
-        # Build window AtA from column caches for first grid column
-        AtA = np.zeros((4, 4), dtype=np.float64)
-        Atb_re = np.zeros(4, dtype=np.float64)
-        Atb_im = np.zeros(4, dtype=np.float64)
-        n_valid = 0
-        wx0_init = max(0, gx_list[0] - half_x)
-        wx1_init = min(nx, gx_list[0] + half_x + 1)
-        for j in range(wx0_init, wx1_init):
-            AtA[0,0]+=cc[j,0]; AtA[0,1]+=cc[j,1]; AtA[0,2]+=cc[j,2]; AtA[0,3]+=cc[j,3]
-            AtA[1,1]+=cc[j,4]; AtA[1,2]+=cc[j,5]; AtA[1,3]+=cc[j,6]
-            AtA[2,2]+=cc[j,7]; AtA[2,3]+=cc[j,8]; AtA[3,3]+=cc[j,9]
-            Atb_re[0]+=cc[j,10]; Atb_re[1]+=cc[j,11]; Atb_re[2]+=cc[j,12]; Atb_re[3]+=cc[j,13]
-            if is_complex:
-                Atb_im[0]+=cc[j,14]; Atb_im[1]+=cc[j,15]; Atb_im[2]+=cc[j,16]; Atb_im[3]+=cc[j,17]
-            n_valid += int(cc[j,18])
-
-        # Solve at first grid column
-        if n_valid >= min_valid:
-            A = AtA.copy()
-            A[1,0]=A[0,1]; A[2,0]=A[0,2]; A[3,0]=A[0,3]
-            A[2,1]=A[1,2]; A[3,1]=A[1,3]; A[3,2]=A[2,3]
-            for k in range(4): A[k,k]+=1e-8
-            c = _solve4x4(A, Atb_re)
-            cx0 = gx_list[0]
-            pr = c[0]+sv0[cy,cx0]*c[1]+sv1[cy,cx0]*c[2]+sv2[cy,cx0]*c[3]
-            if is_complex:
-                ci = _solve4x4(A, Atb_im)
-                ppi = ci[0]+sv0[cy,cx0]*ci[1]+sv1[cy,cx0]*ci[2]+sv2[cy,cx0]*ci[3]
-                mag = np.sqrt(pr*pr+ppi*ppi)
-                if mag > 0: grid_re[gi,0]=pr/mag; grid_im[gi,0]=ppi/mag
-            else:
-                grid_re[gi,0] = pr
-
-        # Horizontal sweep using column caches
-        prev_wx0 = wx0_init; prev_wx1 = wx1_init
-
-        for gj in range(1, n_gx):
-            cx = gx_list[gj]
-            new_wx0 = max(0, cx - half_x)
-            new_wx1 = min(nx, cx + half_x + 1)
-
-            # Remove left columns from window
-            for j in range(prev_wx0, new_wx0):
-                AtA[0,0]-=cc[j,0]; AtA[0,1]-=cc[j,1]; AtA[0,2]-=cc[j,2]; AtA[0,3]-=cc[j,3]
-                AtA[1,1]-=cc[j,4]; AtA[1,2]-=cc[j,5]; AtA[1,3]-=cc[j,6]
-                AtA[2,2]-=cc[j,7]; AtA[2,3]-=cc[j,8]; AtA[3,3]-=cc[j,9]
-                Atb_re[0]-=cc[j,10]; Atb_re[1]-=cc[j,11]; Atb_re[2]-=cc[j,12]; Atb_re[3]-=cc[j,13]
-                if is_complex:
-                    Atb_im[0]-=cc[j,14]; Atb_im[1]-=cc[j,15]; Atb_im[2]-=cc[j,16]; Atb_im[3]-=cc[j,17]
-                n_valid -= int(cc[j,18])
-
-            # Add right columns to window
-            for j in range(prev_wx1, new_wx1):
-                AtA[0,0]+=cc[j,0]; AtA[0,1]+=cc[j,1]; AtA[0,2]+=cc[j,2]; AtA[0,3]+=cc[j,3]
-                AtA[1,1]+=cc[j,4]; AtA[1,2]+=cc[j,5]; AtA[1,3]+=cc[j,6]
-                AtA[2,2]+=cc[j,7]; AtA[2,3]+=cc[j,8]; AtA[3,3]+=cc[j,9]
-                Atb_re[0]+=cc[j,10]; Atb_re[1]+=cc[j,11]; Atb_re[2]+=cc[j,12]; Atb_re[3]+=cc[j,13]
-                if is_complex:
-                    Atb_im[0]+=cc[j,14]; Atb_im[1]+=cc[j,15]; Atb_im[2]+=cc[j,16]; Atb_im[3]+=cc[j,17]
-                n_valid += int(cc[j,18])
-
-            prev_wx0 = new_wx0; prev_wx1 = new_wx1
-
-            if n_valid >= min_valid:
-                A = AtA.copy()
-                A[1,0]=A[0,1]; A[2,0]=A[0,2]; A[3,0]=A[0,3]
-                A[2,1]=A[1,2]; A[3,1]=A[1,3]; A[3,2]=A[2,3]
-                for k in range(4): A[k,k]+=1e-8
-                c = _solve4x4(A, Atb_re)
-                pr = c[0]+sv0[cy,cx]*c[1]+sv1[cy,cx]*c[2]+sv2[cy,cx]*c[3]
-                if is_complex:
-                    ci = _solve4x4(A, Atb_im)
-                    ppi = ci[0]+sv0[cy,cx]*ci[1]+sv1[cy,cx]*ci[2]+sv2[cy,cx]*ci[3]
-                    mag = np.sqrt(pr*pr+ppi*ppi)
-                    if mag > 0: grid_re[gi,gj]=pr/mag; grid_im[gi,gj]=ppi/mag
-                else:
-                    grid_re[gi,gj] = pr
-
-    return grid_re, grid_im, gy_list, gx_list
-
-
-@nb.njit(cache=True)
-def _bilinear_interp_trend(grid_re, grid_im, gy, gx, ny, nx, is_complex):
-    """Bilinear interpolation of sparse trend grid to full (ny, nx) resolution."""
-    n_gy = len(gy)
-    n_gx = len(gx)
-    out_re = np.full((ny, nx), np.nan, dtype=np.float64)
-    out_im = np.full((ny, nx), np.nan, dtype=np.float64)
-
-    # Precompute per-pixel grid indices and fractional weights
-    # O(ny + nx) instead of O(ny * nx) searches
-    row_gi = np.empty(ny, dtype=np.int64)
-    row_fy = np.empty(ny, dtype=np.float64)
-    gi = 0
-    for i in range(ny):
-        while gi < n_gy - 2 and gy[gi + 1] < i:
-            gi += 1
-        row_gi[i] = gi
-        span = gy[gi + 1] - gy[gi]
-        row_fy[i] = (i - gy[gi]) / span if span > 0 else 0.0
-
-    col_gj = np.empty(nx, dtype=np.int64)
-    col_fx = np.empty(nx, dtype=np.float64)
-    gj = 0
-    for j in range(nx):
-        while gj < n_gx - 2 and gx[gj + 1] < j:
-            gj += 1
-        col_gj[j] = gj
-        span = gx[gj + 1] - gx[gj]
-        col_fx[j] = (j - gx[gj]) / span if span > 0 else 0.0
-
-    for i in range(ny):
-        gi1 = row_gi[i]
-        gi2 = gi1 + 1
-        fy = row_fy[i]
-        for j in range(nx):
-            gj1 = col_gj[j]
-            gj2 = gj1 + 1
-            fx = col_fx[j]
-
-            # Bilinear weights for 4 corners
-            w00 = (1-fy)*(1-fx); w01 = (1-fy)*fx
-            w10 = fy*(1-fx);     w11 = fy*fx
-
-            # Accumulate from valid corners only
-            wsum = 0.0; vr = 0.0; vi = 0.0
-            r = grid_re[gi1, gj1]
-            if np.isfinite(r):
-                wsum += w00; vr += w00 * r
-                if is_complex: vi += w00 * grid_im[gi1, gj1]
-            r = grid_re[gi1, gj2]
-            if np.isfinite(r):
-                wsum += w01; vr += w01 * r
-                if is_complex: vi += w01 * grid_im[gi1, gj2]
-            r = grid_re[gi2, gj1]
-            if np.isfinite(r):
-                wsum += w10; vr += w10 * r
-                if is_complex: vi += w10 * grid_im[gi2, gj1]
-            r = grid_re[gi2, gj2]
-            if np.isfinite(r):
-                wsum += w11; vr += w11 * r
-                if is_complex: vi += w11 * grid_im[gi2, gj2]
-            if wsum > 0:
-                out_re[i, j] = vr / wsum
-                if is_complex:
-                    out_im[i, j] = vi / wsum
-    return out_re, out_im
-
-
-@nb.njit(cache=True)
-def _gauss_solve(N, rhs, n):
-    """Solve N*x = rhs via Gaussian elimination with partial pivoting. In-place."""
-    x = np.empty(n, dtype=np.float64)
-    for col in range(n):
-        max_val = abs(N[col, col]); max_row = col
-        for row in range(col+1, n):
-            if abs(N[row, col]) > max_val:
-                max_val = abs(N[row, col]); max_row = row
-        if max_val < 1e-30:
-            for i in range(n): x[i] = 0.0
-            return x
-        if max_row != col:
-            for j in range(col, n):
-                N[col, j], N[max_row, j] = N[max_row, j], N[col, j]
-            rhs[col], rhs[max_row] = rhs[max_row], rhs[col]
-        for row in range(col+1, n):
-            factor = N[row, col] / N[col, col]
-            for j in range(col+1, n):
-                N[row, j] -= factor * N[col, j]
-            rhs[row] -= factor * rhs[col]
-            N[row, col] = 0.0
-    for i in range(n-1, -1, -1):
-        s = rhs[i]
-        for j in range(i+1, n):
-            s -= N[i, j] * x[j]
-        x[i] = s / N[i, i] if abs(N[i, i]) > 1e-30 else 0.0
-    return x
-
-
-def trend2d_window_array(phase_2d, variables, weight_2d, win_y, win_x, stride=1):
-    """Sliding window local polynomial fit with column-cached incremental updates.
-
-    Per-pixel degree=1 polynomial fit using a sliding window with 3 regressors.
-    Uses a fast numba kernel with column-cached incremental normal equations.
-    With stride>1, computes at grid points and bilinearly interpolates the trend.
-
-    Parameters
-    ----------
-    phase_2d : (ny, nx) complex64 or float32
-    variables : list of 3 (ny, nx) float32 — regressors (azi, rng, ele)
-    weight_2d : (ny, nx) float32 or None
-    win_y, win_x : int — window size in pixels
-    stride : int or tuple(int, int) — step between grid points (default 1).
-        E.g. stride=(10, 40) evaluates every 10th row, 40th column, then
-        bilinearly interpolates the trend to full resolution.
-
-    Returns
-    -------
-    trend : (ny, nx) same dtype
-    """
-    ny, nx = phase_2d.shape
-    is_complex = np.iscomplexobj(phase_2d)
-
-    if not (1 <= len(variables) <= 3):
-        raise ValueError("trend2d_window_array requires 1 to 3 variables (e.g. ele, azi+rng, azi+rng+ele)")
-    # Pad to 3 variables with zeros if fewer provided
-    while len(variables) < 3:
-        variables = list(variables) + [np.zeros_like(variables[0])]
-
-    has_weight = weight_2d is not None
-    w2d = weight_2d if has_weight else np.empty((1, 1), dtype=np.float32)
-    half_y = min(win_y, ny) // 2
-    half_x = min(win_x, nx) // 2
-
-    if isinstance(stride, (tuple, list)):
-        stride_y, stride_x = int(stride[0]), int(stride[1])
-    else:
-        stride_y = stride_x = int(stride)
-
-    # Global standardization
-    v0, v1, v2 = variables[0], variables[1], variables[2]
-    mask = np.isfinite(v0) & np.isfinite(v1) & np.isfinite(v2)
-    g_mu0 = np.float64(v0[mask].mean()); g_std0 = max(np.float64(v0[mask].std()), 1e-10)
-    g_mu1 = np.float64(v1[mask].mean()); g_std1 = max(np.float64(v1[mask].std()), 1e-10)
-    g_mu2 = np.float64(v2[mask].mean()); g_std2 = max(np.float64(v2[mask].std()), 1e-10)
-
-    grid_re, grid_im, gy_list, gx_list = _trend2d_sliding_numba_kernel(
-        phase_2d, v0, v1, v2, w2d,
-        half_y, half_x, stride_y, stride_x, has_weight, is_complex,
-        g_mu0, g_std0, g_mu1, g_std1, g_mu2, g_std2)
-
-    if stride_y == 1 and stride_x == 1:
-        trend_re = grid_re
-        trend_im = grid_im
-    else:
-        gy = np.array(gy_list, dtype=np.float64)
-        gx = np.array(gx_list, dtype=np.float64)
-        trend_re, trend_im = _bilinear_interp_trend(grid_re, grid_im, gy, gx,
-                                                      ny, nx, is_complex)
-
-    if is_complex:
-        result = np.empty((ny, nx), dtype=np.complex64)
-        result.real = trend_re.astype(np.float32)
-        result.imag = trend_im.astype(np.float32)
-        # Normalize to unit circle
-        mag = np.abs(result)
-        mag[~(mag > 0)] = 1
-        result /= mag
-        result[np.isnan(trend_re)] = np.nan + 0j
-        return result
-    else:
-        result = trend_re.astype(np.float32)
-        result[np.isnan(trend_re)] = np.nan
-        return result
-
-
-@serialize_gpu
-def trend2d_array(phase, weight, variables, device, degree=1):
-    """
-    Fit 2D polynomial trend using PyTorch least squares (pure GPU implementation).
-
-    Two modes:
-    - Complex input: unit-circle fitting (normalize to unit magnitude, fit complex
-      polynomial, normalize result), returns complex64 unit-magnitude trend
-    - Real input: standard real polynomial fit, returns float32 trend
-
-    Parameters
-    ----------
-    phase : np.ndarray
-        2D or 3D array (pair, y, x) or (y, x). Real or complex.
-    weight : np.ndarray or None
-        Weight array (real), same spatial shape as phase
-    variables : list of np.ndarray
-        List of 2D variable arrays (y, x) to use as regressors
-    device : torch.device
-        PyTorch device
-    degree : int
-        Polynomial degree for each variable (1=linear, 2=quadratic, etc.)
-
-    Returns
-    -------
-    np.ndarray
-        Trend surface, same shape as phase.
-        Complex input returns complex64 unit-magnitude trend.
-        Real input returns float32 trend.
-    """
-    import torch
-    from itertools import combinations_with_replacement
-
-    # Force torch.linalg lazy initialization to avoid CUDA multi-threading bug
-    # See: https://github.com/pytorch/pytorch/issues/90613
-    global _linalg_initialized
-    if device.type == 'cuda' and not _linalg_initialized:
-        with _linalg_init_lock:
-            if not _linalg_initialized:
-                with torch.cuda.device(device):
-                    _ = torch.linalg.solve(torch.eye(2, device=device), torch.ones(2, device=device))
-                _linalg_initialized = True
-
-    # Handle 2D vs 3D input
-    squeeze = phase.ndim == 2
-    if squeeze:
-        phase = phase[np.newaxis, ...]
-        if weight is not None:
-            weight = weight[np.newaxis, ...]
-
-    n_pairs, ny, nx = phase.shape
-    n_pixels = ny * nx
-
-    # Detect complex input
-    is_complex = np.iscomplexobj(phase)
-
-    # Use float64 on CPU, float32 on GPU (MPS doesn't support float64)
-    if device.type == 'cpu':
-        dtype = torch.float64
-    else:
-        dtype = torch.float32
-
-    # Flatten variables and track fitting mask (NaN = excluded from fit, not from output)
-    fit_mask = np.ones(n_pixels, dtype=bool)
-    vars_np = []
-    for var in variables:
-        v_flat = var.ravel()
-        fit_mask &= np.isfinite(v_flat)
-        vars_np.append(v_flat)
-
-    # For polynomial features: use nan_to_num so all pixels get valid features
-    # NaN pixels get 0.0 features — but we use standardized features, so the
-    # prediction at these pixels uses the mean value (bias term dominates).
-    # This is acceptable for a smooth polynomial trend.
-    vars_t = [torch.tensor(np.nan_to_num(v, nan=0.0), dtype=dtype, device=device) for v in vars_np]
-    n_vars = len(vars_t)
-
-    # Build polynomial features on GPU (matching sklearn PolynomialFeatures order)
-    # Order: degree 1 first, then degree 2, etc. (same as sklearn include_bias=False)
-    features = []
-    for d in range(1, degree + 1):
-        for combo in combinations_with_replacement(range(n_vars), d):
-            term = torch.ones(n_pixels, dtype=dtype, device=device)
-            for idx in combo:
-                term = term * vars_t[idx]
-            features.append(term)
-
-    # Stack features: (n_pixels, n_features)
-    X_poly = torch.stack(features, dim=1)
-
-    # Add bias column
-    ones = torch.ones(n_pixels, 1, dtype=dtype, device=device)
-    A_all = torch.cat([X_poly, ones], dim=1)
-
-    cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
-    n_feat = A_all.shape[1]
-
-    # Common standardization from transform-valid pixels (fit_mask)
-    fit_indices = torch.tensor(np.where(fit_mask)[0], device=device)
-    A_fit = A_all[fit_indices]
-    feature_mean = A_fit[:, :-1].mean(dim=0, keepdim=True)
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='std\\(\\): degrees of freedom')
-        feature_std = A_fit[:, :-1].std(dim=0, keepdim=True) + 1e-10
-
-    # Standardize design matrix once — (n_pixels, n_feat), stays on device
-    A_std = torch.cat([
-        (A_all[:, :-1] - feature_mean) / feature_std,
-        A_all[:, -1:]
-    ], dim=1)
-
-    del vars_t, features, X_poly, ones, A_all, A_fit, fit_indices
-
-    # Flatten phase/weight to (n_pairs, n_pixels) — stay on CPU
-    phase_flat = phase.reshape(n_pairs, n_pixels)
-    weight_flat = weight.reshape(n_pairs, n_pixels) if weight is not None else None
-
-    # Compute batch size from dask chunk memory budget
-    # Dominant memory per pixel: WA_batch (n_pairs × n_feat) + W,b (n_pairs × 2)
-    from .utils_dask import get_dask_chunk_size_mb
-    dtype_size = 8 if dtype == torch.float64 else 4
-    mem_per_pixel = n_pairs * (n_feat + 2) * dtype_size
-    batch_size = max(1024, (get_dask_chunk_size_mb() * 1024 * 1024) // mem_per_pixel)
-
-    # Accumulate normal equations incrementally over spatial batches
-    AtWA = torch.zeros((n_pairs, n_feat, n_feat), dtype=dtype, device=device)
-    acc_dtype = cdtype if is_complex else dtype
-    AtWb = torch.zeros((n_pairs, n_feat), dtype=acc_dtype, device=device)
-    n_valid = np.zeros(n_pairs, dtype=np.int64)
-
-    n_batches = (n_pixels + batch_size - 1) // batch_size
-    for i in range(n_batches):
-        s, e = i * batch_size, min((i + 1) * batch_size, n_pixels)
-        p_batch = phase_flat[:, s:e]
-        fm_batch = fit_mask[s:e]
-
-        # Per-batch valid mask (stays on CPU)
-        if is_complex:
-            valid_b = np.isfinite(p_batch) & (p_batch != 0)
-        else:
-            valid_b = np.isfinite(p_batch)
-        valid_b = valid_b & fm_batch[None, :]
-        if weight_flat is not None:
-            w_batch = weight_flat[:, s:e]
-            valid_b = valid_b & np.isfinite(w_batch)
-        n_valid += valid_b.sum(axis=1)
-
-        # W_batch: (n_pairs, batch) on device
-        if weight_flat is not None:
-            sqrt_w = np.sqrt(np.nan_to_num(w_batch, nan=0.0)).astype(np.float32)
-            W_b = torch.tensor(np.where(valid_b, sqrt_w, 0.0), dtype=dtype, device=device)
-        else:
-            W_b = torch.tensor(valid_b.astype(np.float32), dtype=dtype, device=device)
-
-        # b_batch: (n_pairs, batch) on device
-        if is_complex:
-            p_abs = np.abs(p_batch)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                p_unit = np.where(p_abs > 0, p_batch / p_abs, 0 + 0j)
-            b_b = torch.tensor(np.nan_to_num(p_unit, nan=0.0), dtype=cdtype, device=device)
-        else:
-            b_b = torch.tensor(np.nan_to_num(p_batch, nan=0.0), dtype=dtype, device=device)
-
-        # WA_batch: (n_pairs, batch, n_feat) — bounded memory
-        A_b = A_std[s:e]  # view on device
-        WA_b = W_b[:, :, None] * A_b[None, :, :]
-
-        # Accumulate AtWA (real) and AtWb (real or complex)
-        AtWA += WA_b.transpose(1, 2) @ WA_b
-        Wb_b = (W_b * b_b)[:, :, None]
-        if is_complex:
-            AtWb += (WA_b.transpose(1, 2).to(cdtype) @ Wb_b.to(cdtype)).squeeze(2)
-        else:
-            AtWb += (WA_b.transpose(1, 2) @ Wb_b).squeeze(2)
-
-        del WA_b, W_b, b_b, Wb_b
-
-    # Regularize and solve
-    reg = 1e-10 * torch.eye(n_feat, dtype=dtype, device=device)
-    if is_complex:
-        AtWA = AtWA.to(cdtype)
-    AtWA = AtWA + reg
-    coeffs = torch.linalg.solve(AtWA.cpu(), AtWb.cpu()).to(device)
-
-    # Skip pairs with too few valid pixels
-    skip_mask = n_valid < 10
-
-    # Predict in batches — bounded memory
-    out_dtype = np.complex64 if is_complex else np.float32
-    trends_np = np.empty((n_pairs, n_pixels), dtype=out_dtype)
-    for i in range(n_batches):
-        s, e = i * batch_size, min((i + 1) * batch_size, n_pixels)
-        A_b = A_std[s:e]
-        if is_complex:
-            t_b = (A_b.to(cdtype) @ coeffs.T).T.cpu().numpy()
-            with np.errstate(invalid='ignore'):
-                t_abs = np.abs(t_b)
-                t_b = np.where(t_abs > 0, t_b / t_abs, 0)
-            t_b[~np.isfinite(t_b)] = 0
-        else:
-            t_b = (A_b @ coeffs.T).T.cpu().numpy()
-        trends_np[:, s:e] = t_b
-
-    # Set skipped pairs to NaN
-    if skip_mask.any():
-        trends_np[skip_mask] = np.nan
-
-    trends = trends_np.reshape(n_pairs, ny, nx)
-
-    if squeeze:
-        trends = trends[0]
-
-    # Cleanup GPU memory
-    if device.type == 'mps':
-        torch.mps.empty_cache()
-    elif device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    if is_complex:
-        return trends.astype(np.complex64)
-    return trends.astype(np.float32)
-
-
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
                          max_refine=3, is_complex=True, return_models=False):
     """
@@ -1506,457 +839,570 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     return trend_data.reshape(n_pairs, ny, nx)
 
 
+
+
+
+
+
 # ============================================================================
-# Chunked trend2d pipeline kernels
+# Complex-phase 2-D trend: coherent sum over a gradient lattice
 # ============================================================================
-# These functions implement a 4-phase pipeline that avoids the full-spatial
-# rechunk required by trend2d_array(). Normal equations (AtWA, AtWb) are
-# accumulated per spatial chunk then summed via tree reduction.
+# NOTHING IS UNWRAPPED: the trend is the peak of |sum z exp(-i g.v)| over a
+# lattice, bounded in TURNS across the extent the samples span. Outliers enter
+# as unit vectors and cancel as sqrt(N), and the sum has no adjacency term, so
+# a sparse raster solves as well as a full one.
 
-def _build_poly_features(var_flat_list, n_pixels, degree):
-    """Build polynomial feature matrix from flattened variable arrays.
 
-    Features are ordered: degree 1 first, then degree 2, etc.
-    Same order as sklearn PolynomialFeatures(include_bias=False).
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_walk1(A, ax0, ur, ui, out_r, out_i):
+    n = A.shape[0]; n0 = ax0.size
+    d0 = ax0[1] - ax0[0] if n0 > 1 else 0.0
+    nd = ur.shape[0]
+    for p in range(n):
+        a0 = A[p, 0]
+        s0r = np.cos(a0 * d0); s0i = -np.sin(a0 * d0)
+        ph = a0 * ax0[0]
+        cr = np.cos(ph); ci = -np.sin(ph)
+        for i in range(n0):
+            for d in range(nd):
+                zr = ur[d, p]; zi = ui[d, p]
+                out_r[d, i] += zr * cr - zi * ci
+                out_i[d, i] += zr * ci + zi * cr
+            t = cr * s0r - ci * s0i
+            ci = cr * s0i + ci * s0r
+            cr = t
 
-    Parameters
-    ----------
-    var_flat_list : list of ndarray (n_pixels,)
-        Flattened variable arrays (NaN-free, use nan_to_num before calling).
-    n_pixels : int
-        Number of pixels.
-    degree : int
-        Polynomial degree.
 
-    Returns
-    -------
-    ndarray (n_pixels, n_poly_features)
-        Polynomial feature matrix in float64.
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_walk2(A, ax0, ax1, ur, ui, out_r, out_i):
+    n = A.shape[0]; n0 = ax0.size; n1 = ax1.size
+    d0 = ax0[1] - ax0[0] if n0 > 1 else 0.0
+    d1 = ax1[1] - ax1[0] if n1 > 1 else 0.0
+    nd = ur.shape[0]
+    for p in range(n):
+        a0 = A[p, 0]; a1 = A[p, 1]
+        s0r = np.cos(a0 * d0); s0i = -np.sin(a0 * d0)
+        s1r = np.cos(a1 * d1); s1i = -np.sin(a1 * d1)
+        ph = a0 * ax0[0] + a1 * ax1[0]
+        br = np.cos(ph); bi = -np.sin(ph)
+        for i in range(n0):
+            cr = br; ci = bi
+            for j in range(n1):
+                idx = i * n1 + j
+                for d in range(nd):
+                    zr = ur[d, p]; zi = ui[d, p]
+                    out_r[d, idx] += zr * cr - zi * ci
+                    out_i[d, idx] += zr * ci + zi * cr
+                t = cr * s1r - ci * s1i
+                ci = cr * s1i + ci * s1r
+                cr = t
+            t = br * s0r - bi * s0i
+            bi = br * s0i + bi * s0r
+            br = t
+
+
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_walk3(A, ax0, ax1, ax2, ur, ui, out_r, out_i):
+    n = A.shape[0]; n0 = ax0.size; n1 = ax1.size; n2 = ax2.size
+    d0 = ax0[1] - ax0[0] if n0 > 1 else 0.0
+    d1 = ax1[1] - ax1[0] if n1 > 1 else 0.0
+    d2 = ax2[1] - ax2[0] if n2 > 1 else 0.0
+    nd = ur.shape[0]
+    for p in range(n):
+        a0 = A[p, 0]; a1 = A[p, 1]; a2 = A[p, 2]
+        s0r = np.cos(a0 * d0); s0i = -np.sin(a0 * d0)
+        s1r = np.cos(a1 * d1); s1i = -np.sin(a1 * d1)
+        s2r = np.cos(a2 * d2); s2i = -np.sin(a2 * d2)
+        ph = a0 * ax0[0] + a1 * ax1[0] + a2 * ax2[0]
+        br = np.cos(ph); bi = -np.sin(ph)
+        for i in range(n0):
+            mr = br; mi = bi
+            for j in range(n1):
+                cr = mr; ci = mi
+                for l in range(n2):
+                    idx = (i * n1 + j) * n2 + l
+                    for d in range(nd):
+                        zr = ur[d, p]; zi = ui[d, p]
+                        out_r[d, idx] += zr * cr - zi * ci
+                        out_i[d, idx] += zr * ci + zi * cr
+                    t = cr * s2r - ci * s2i
+                    ci = cr * s2i + ci * s2r
+                    cr = t
+                t = mr * s1r - mi * s1i
+                mi = mr * s1i + mi * s1r
+                mr = t
+            t = br * s0r - bi * s0i
+            bi = br * s0i + bi * s0r
+            br = t
+
+
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_coherent_kernel(A, G, ur, ui, out_r, out_i):
+    """Coherent sum per date per candidate, accumulated in place.
+
+    Serial: dask parallelises across blocks, and parallel=True inside a
+    multi-threaded worker trips numba's workqueue layer and kills the worker.
+
+    No table is built -- the sine and cosine go straight into the accumulator,
+    computed once per (candidate, sample) and reused across dates.
     """
-    from itertools import combinations_with_replacement
-
-    n_vars = len(var_flat_list)
-    features = []
-    for d in range(1, degree + 1):
-        for combo in combinations_with_replacement(range(n_vars), d):
-            term = np.ones(n_pixels, dtype=np.float64)
-            for idx in combo:
-                term = term * var_flat_list[idx]
-            features.append(term)
-
-    if len(features) == 0:
-        return np.empty((n_pixels, 0), dtype=np.float64)
-    return np.column_stack(features)
+    nd, n = ur.shape
+    K, k = G.shape
+    for j in range(K):
+        for p in range(n):
+            ph = 0.0
+            for i in range(k):
+                ph += A[p, i] * G[j, i]
+            c = np.cos(ph)
+            s = np.sin(ph)
+            for d in range(nd):
+                out_r[d, j] += ur[d, p] * c + ui[d, p] * s
+                out_i[d, j] += ui[d, p] * c - ur[d, p] * s
 
 
-def _compute_feature_stats(var_dask_list, degree):
-    """Phase 0: Compute global feature_mean and feature_std for standardization.
+def trend2d_coherent_partial(z, A, axes, G=None):
+    """Coherent sums for one spatial chunk: (nd, K) complex64.
 
-    Computes statistics from transform (pair-independent) using dask tree
-    reductions.  Single .compute() call for efficiency.
+    z : (nd, n) complex64 -- flattened valid samples, NaN already zeroed
+    A : (n, k) float32    -- centred variables
+    G : (K, k) float32    -- gradient lattice
 
-    Parameters
-    ----------
-    var_dask_list : list of dask.array.Array
-        Transform variables (2D: y, x).
-    degree : int
-        Polynomial degree.
-
-    Returns
-    -------
-    feature_mean : ndarray (n_poly_features,)
-    feature_std : ndarray (n_poly_features,)
+    A reduction with no reuse, so it stays on the CPU. The candidates are
+    WALKED: along a linspaced axis the phase advances by a constant step, so
+    the next one is a complex multiply instead of a sine and cosine.
     """
-    import dask
-    import dask.array as da
-    from itertools import combinations_with_replacement
+    import numpy as _np
 
-    n_vars = len(var_dask_list)
+    def _np_(x):
+        return x.detach().cpu().numpy() if hasattr(x, 'detach') else _np.asarray(x)
 
-    # Valid mask: all variables finite
-    valid_mask = da.ones(var_dask_list[0].shape, dtype=bool,
-                         chunks=var_dask_list[0].chunks)
-    for v in var_dask_list:
-        valid_mask = valid_mask & da.isfinite(v)
-
-    # Build polynomial features lazily and schedule reductions
-    to_compute = []
-    n_features = 0
-    for d in range(1, degree + 1):
-        for combo in combinations_with_replacement(range(n_vars), d):
-            term = da.ones_like(var_dask_list[0], dtype=np.float64)
-            for idx in combo:
-                v64 = var_dask_list[idx].astype(np.float64)
-                term = term * da.where(da.isfinite(v64), v64, 0.0)
-            masked = da.where(valid_mask, term, np.nan)
-            to_compute.append(da.nanmean(masked))
-            to_compute.append(da.nanstd(masked))
-            n_features += 1
-
-    if n_features == 0:
-        return np.empty(0, dtype=np.float64), np.ones(0, dtype=np.float64)
-
-    results = dask.compute(*to_compute)
-    feature_mean = np.array([float(results[2 * i]) for i in range(n_features)],
-                            dtype=np.float64)
-    feature_std = np.array([float(results[2 * i + 1]) for i in range(n_features)],
-                           dtype=np.float64) + 1e-10
-
-    return feature_mean, feature_std
+    z = _np_(z)
+    A = _np.ascontiguousarray(_np_(A), dtype=_np.float32)
+    ax = [_np.ascontiguousarray(_np_(a), dtype=_np.float32) for a in axes]
+    K = int(_np.prod([a.size for a in ax]))
+    if G is None and len(ax) > 3:
+        G = _np.stack(_np.meshgrid(*ax, indexing='ij'), -1).reshape(-1, len(ax))
+    if G is not None:
+        G = _np.ascontiguousarray(_np_(G), dtype=_np.float32)
+    if z.ndim == 1:
+        z = z[None]
+    ur = _np.ascontiguousarray(z.real, dtype=_np.float32)
+    ui = _np.ascontiguousarray(z.imag, dtype=_np.float32)
+    out_r = _np.zeros((z.shape[0], K), _np.float64)
+    out_i = _np.zeros((z.shape[0], K), _np.float64)
+    if z.shape[1]:
+        if len(ax) == 1:
+            _trend2d_walk1(A, ax[0], ur, ui, out_r, out_i)
+        elif len(ax) == 2:
+            _trend2d_walk2(A, ax[0], ax[1], ur, ui, out_r, out_i)
+        elif len(ax) == 3:
+            _trend2d_walk3(A, ax[0], ax[1], ax[2], ur, ui, out_r, out_i)
+        else:
+            _trend2d_coherent_kernel(A, G, ur, ui, out_r, out_i)
+    return (out_r + 1j * out_i).astype(_np.complex64)
 
 
-def _accumulate_chunk(phase_chunk, weight_chunk, var_chunks,
-                      feature_mean, feature_std, degree, is_complex):
-    """Phase 1: Accumulate normal equations for one spatial tile.
+# ---------------------------------------------------------------------------
+# The coherent sum by gridding: S(g) = sum u exp(-i g.v) on a lattice of
+# candidates IS a type-1 non-uniform DFT of the phasors at the positions v.
+# Spreading each sample onto a grid in VARIABLE space with a smooth kernel and
+# transforming once evaluates every candidate at the cost of the kernel's
+# footprint -- w**k per sample instead of one pass per candidate. The grid is
+# linear in the samples, so blocks and bursts add exactly as before.
+# ---------------------------------------------------------------------------
 
-    Builds local A_std from transform tile using global feature_mean /
-    feature_std, then accumulates AtWA and AtWb per pair with internal
-    pixel batching for bounded memory.
+TREND2D_W = 7                 # kernel half-support in cells, each side
+TREND2D_BETA = 2.30           # exponential-of-semicircle shape, per unit width
+TREND2D_FFT_BUDGET = 64 << 20    # of the transform to hold at once; the
+                                 # transform and its correction need a few
+                                 # copies of a batch live at the same time
 
-    Parameters
-    ----------
-    phase_chunk : ndarray (n_pairs, cy, cx)
-        Phase data.  Complex or real.
-    weight_chunk : ndarray or None
-        Weight data, same shape as phase_chunk.
-    var_chunks : tuple/list of ndarray (cy, cx)
-        Transform variable arrays.
-    feature_mean : ndarray (n_poly_features,)
-    feature_std : ndarray (n_poly_features,)
-    degree : int
-    is_complex : bool
 
-    Returns
-    -------
-    ndarray (n_pairs, 1, 1, n_accum)
-        Packed: [AtWA.ravel() | AtWb(.real,.imag) | n_valid] in float64.
-    """
-    n_pairs = phase_chunk.shape[0]
-    cy, cx = phase_chunk.shape[1], phase_chunk.shape[2]
-    n_pixels = cy * cx
-
-    # Flatten variables and build fit mask
-    var_flat_list = []
-    fit_mask = np.ones(n_pixels, dtype=bool)
-    for v in var_chunks:
-        v_flat = v.ravel().astype(np.float64)
-        fit_mask &= np.isfinite(v_flat)
-        var_flat_list.append(np.nan_to_num(v_flat, nan=0.0))
-
-    n_poly = len(feature_mean)
-    n_feat = n_poly + 1  # +1 for bias
-    n_feat_b = 2 * n_feat if is_complex else n_feat
-    n_accum = n_feat * n_feat + n_feat_b + 1
-
-    phase_flat = phase_chunk.reshape(n_pairs, n_pixels)
-    weight_flat = (weight_chunk.reshape(n_pairs, n_pixels)
-                   if weight_chunk is not None else None)
-
-    # Batch size: keep A_std_batch + WA under half dask chunk budget
-    from .utils_dask import get_dask_chunk_size_mb
-    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
-    batch_size = max(1024, _budget // max(1, 2 * n_feat * 8))
-    n_batches = (n_pixels + batch_size - 1) // batch_size
-
-    result = np.zeros((n_pairs, 1, 1, n_accum), dtype=np.float64)
-
-    for p in range(n_pairs):
-        AtWA = np.zeros((n_feat, n_feat), dtype=np.float64)
-        AtWb = np.zeros(n_feat,
-                        dtype=np.complex128 if is_complex else np.float64)
-        n_valid_total = 0
-
-        for bi in range(n_batches):
-            s = bi * batch_size
-            e = min((bi + 1) * batch_size, n_pixels)
-            batch_len = e - s
-
-            p_batch = phase_flat[p, s:e]
-            fm_batch = fit_mask[s:e]
-
-            if is_complex:
-                valid = np.isfinite(p_batch) & (p_batch != 0) & fm_batch
-            else:
-                valid = np.isfinite(p_batch) & fm_batch
-            if weight_flat is not None:
-                valid &= np.isfinite(weight_flat[p, s:e])
-
-            n_valid = int(valid.sum())
-            if n_valid == 0:
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_spread1(A, ur, ui, cells, w, beta, M, st, gr, gi):
+    for p in range(A.shape[0]):
+        t = (A[p, 0] + 0.5) * cells[0] + w
+        i0 = int(np.ceil(t - 0.5 * w))
+        for d in range(w):
+            i = i0 + d
+            z = 2.0 * (i - t) / w
+            if z <= -1.0 or z >= 1.0:
                 continue
-            n_valid_total += n_valid
-
-            # Build A_std for this batch (bounded memory)
-            var_batch_list = [v[s:e] for v in var_flat_list]
-            X_poly_b = _build_poly_features(var_batch_list, batch_len, degree)
-            A_std_b = np.concatenate([
-                (X_poly_b - feature_mean) / feature_std,
-                np.ones((batch_len, 1), dtype=np.float64)
-            ], axis=1)
-
-            A_v = A_std_b[valid]  # (n_valid, n_feat)
-
-            if weight_flat is not None:
-                sqrt_w = np.sqrt(
-                    np.clip(weight_flat[p, s:e][valid], 0, None))
-                WA = A_v * sqrt_w[:, None]
-            else:
-                WA = A_v
-
-            if is_complex:
-                p_vals = p_batch[valid]
-                p_abs = np.abs(p_vals)
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    p_unit = np.where(p_abs > 0, p_vals / p_abs, 0 + 0j)
-                b_vals = np.nan_to_num(p_unit, nan=0.0)
-            else:
-                b_vals = np.nan_to_num(p_batch[valid],
-                                       nan=0.0).astype(np.float64)
-
-            if weight_flat is not None:
-                Wb = sqrt_w * b_vals
-            else:
-                Wb = b_vals
-
-            AtWA += WA.T @ WA
-            if is_complex:
-                AtWb += (WA.astype(np.complex128).T
-                         @ Wb.astype(np.complex128))
-            else:
-                AtWb += WA.T @ Wb
-
-        # Pack into result
-        result[p, 0, 0, :n_feat * n_feat] = AtWA.ravel()
-        if is_complex:
-            result[p, 0, 0,
-                   n_feat * n_feat:n_feat * n_feat + n_feat] = AtWb.real
-            result[p, 0, 0,
-                   n_feat * n_feat + n_feat:
-                   n_feat * n_feat + 2 * n_feat] = AtWb.imag
-        else:
-            result[p, 0, 0,
-                   n_feat * n_feat:n_feat * n_feat + n_feat] = AtWb.real
-        result[p, 0, 0, -1] = n_valid_total
-
-    return result
+            kw = np.exp(beta * (np.sqrt(1.0 - z * z) - 1.0))
+            for q in range(ur.shape[0]):
+                gr[q, i] += ur[q, p] * kw
+                gi[q, i] += ui[q, p] * kw
 
 
-def _solve_chunk(accum_block, n_feat, is_complex):
-    """Phase 3: Solve for coefficients from accumulated normal equations.
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_spread2(A, ur, ui, cells, w, beta, M, st, gr, gi):
+    kv = np.empty((2, w))
+    base = np.empty(2, np.int64)
+    for p in range(A.shape[0]):
+        for a in range(2):
+            t = (A[p, a] + 0.5) * cells[a] + w
+            i0 = int(np.ceil(t - 0.5 * w))
+            base[a] = i0
+            for d in range(w):
+                z = 2.0 * (i0 + d - t) / w
+                kv[a, d] = (np.exp(beta * (np.sqrt(1.0 - z * z) - 1.0))
+                            if -1.0 < z < 1.0 else 0.0)
+        for d0 in range(w):
+            k0 = kv[0, d0]
+            if k0 == 0.0:
+                continue
+            r0 = (base[0] + d0) * st[0]
+            for d1 in range(w):
+                kk = k0 * kv[1, d1]
+                if kk == 0.0:
+                    continue
+                idx = r0 + (base[1] + d1) * st[1]
+                for q in range(ur.shape[0]):
+                    gr[q, idx] += ur[q, p] * kk
+                    gi[q, idx] += ui[q, p] * kk
 
-    Parameters
-    ----------
-    accum_block : ndarray (n_pairs, n_accum)
-        Packed accumulators per pair.
-    n_feat : int
-        Number of features (including bias).
-    is_complex : bool
 
-    Returns
-    -------
-    ndarray (n_pairs, n_coeff_out)
-        Coefficients packed as float64.
-        Real: (n_pairs, n_feat).  Complex: (n_pairs, 2*n_feat) with [re | im].
+@nb.njit(parallel=False, cache=True, fastmath=True)
+def _trend2d_spread3(A, ur, ui, cells, w, beta, M, st, gr, gi):
+    kv = np.empty((3, w))
+    base = np.empty(3, np.int64)
+    for p in range(A.shape[0]):
+        for a in range(3):
+            t = (A[p, a] + 0.5) * cells[a] + w
+            i0 = int(np.ceil(t - 0.5 * w))
+            base[a] = i0
+            for d in range(w):
+                z = 2.0 * (i0 + d - t) / w
+                kv[a, d] = (np.exp(beta * (np.sqrt(1.0 - z * z) - 1.0))
+                            if -1.0 < z < 1.0 else 0.0)
+        for d0 in range(w):
+            k0 = kv[0, d0]
+            if k0 == 0.0:
+                continue
+            r0 = (base[0] + d0) * st[0]
+            for d1 in range(w):
+                k1 = k0 * kv[1, d1]
+                if k1 == 0.0:
+                    continue
+                r1 = r0 + (base[1] + d1) * st[1]
+                for d2 in range(w):
+                    kk = k1 * kv[2, d2]
+                    if kk == 0.0:
+                        continue
+                    idx = r1 + (base[2] + d2) * st[2]
+                    for q in range(ur.shape[0]):
+                        gr[q, idx] += ur[q, p] * kk
+                        gi[q, idx] += ui[q, p] * kk
+
+
+def trend2d_grid_shape(cells):
+    """The cells the samples can reach: the extent plus the kernel's footprint."""
+    import numpy as _np
+    return _np.atleast_1d(_np.asarray(cells, _np.int64)) + 2 * TREND2D_W
+
+
+def trend2d_spread(z, A, cells):
+    """Samples -> the spread grid, (nd, prod(cells + 2w)) real and imaginary.
+
+    A is in [-0.5, 0.5] per axis, the variable centred on its midpoint and
+    divided by its extent. Only the cells the samples can reach are held; the
+    zero padding that sets the candidate spacing is added once, in the finalize.
     """
-    n_pairs = accum_block.shape[0]
-    n_coeff_out = 2 * n_feat if is_complex else n_feat
-    result = np.empty((n_pairs, n_coeff_out), dtype=np.float64)
+    import numpy as _np
+    w = TREND2D_W
+    beta = TREND2D_BETA * w
+    k = A.shape[1]
+    cells = _np.broadcast_to(_np.asarray(cells, _np.float64).ravel(),
+                             (k,)).copy()
+    M = trend2d_grid_shape(cells)
+    st = _np.ones(k, _np.int64)
+    for a in range(k - 2, -1, -1):
+        st[a] = st[a + 1] * M[a + 1]
+    z = _np.asarray(z)
+    if z.ndim == 1:
+        z = z[None]
+    A = _np.ascontiguousarray(A, dtype=_np.float64)
+    ur = _np.ascontiguousarray(z.real, dtype=_np.float64)
+    ui = _np.ascontiguousarray(z.imag, dtype=_np.float64)
+    size = int(_np.prod(M))
+    gr = _np.zeros((z.shape[0], size), _np.float64)
+    gi = _np.zeros((z.shape[0], size), _np.float64)
+    if z.shape[1]:
+        fn = {1: _trend2d_spread1, 2: _trend2d_spread2,
+              3: _trend2d_spread3}.get(k)
+        if fn is None:
+            raise ValueError(f"trend2d(): {k} variables, the gridded transform "
+                             f"is written for one, two or three.")
+        fn(A, ur, ui, cells, w, beta, M, st, gr, gi)
+    return gr, gi
 
-    for p in range(n_pairs):
-        accum = accum_block[p]
 
-        AtWA = accum[:n_feat * n_feat].reshape(n_feat, n_feat)
-        if is_complex:
-            AtWb_re = accum[n_feat * n_feat:n_feat * n_feat + n_feat]
-            AtWb_im = accum[n_feat * n_feat + n_feat:
-                            n_feat * n_feat + 2 * n_feat]
-            AtWb = AtWb_re + 1j * AtWb_im
-        else:
-            AtWb = accum[n_feat * n_feat:n_feat * n_feat + n_feat]
-        n_valid = accum[-1]
+def trend2d_deapodise(cells, bins, k):
+    """The correction, taken from the SPREADER ITSELF.
 
-        if n_valid < 2 * n_feat:
-            result[p] = np.nan
+    One sample at the centre must transform to a flat 1, so whatever spreading
+    and the transform do to it is exactly what divides out -- including the
+    discretisation, which the kernel's analytic transform would miss.
+    """
+    import numpy as _np
+    gr, gi = trend2d_spread(_np.ones((1, 1), _np.complex128),
+                            _np.zeros((1, 1)), cells)
+    return _np.fft.fft(_trend2d_embed(gr[0] + 1j * gi[0], cells, bins, 1))
+
+
+def _trend2d_embed(grid, cells, bins, k):
+    """Place the occupied cells in the padded box the transform runs over."""
+    import numpy as _np
+    w = TREND2D_W
+    M = int(cells) + 2 * w
+    P = int(cells) * int(bins)
+    off = (P - int(cells)) // 2 - w
+    out = _np.zeros((P,) * k, grid.dtype)
+    sl = tuple(slice(off, off + M) for _ in range(k))
+    out[sl] = grid.reshape((M,) * k)
+    return out
+
+
+def trend2d_reach(cells):
+    """Turns the transform can report, in cycles across the extent.
+
+    HALF the computed band, not all of it: past that the kernel's transform has
+    decayed and dividing by it amplifies noise into a peak at the edge.
+    """
+    return cells / 4.0
+
+
+def trend2d_peak(total, cells, bins, k, guard=0.2):
+    """The summed spread grids -> one plane per date.
+
+    The transform gives the objective at every candidate at once; the peak
+    locates the gradient, a parabola through its neighbours puts it between
+    nodes, and the peak's ARGUMENT is the constant, since there the residual
+    phasors align.
+
+    NaN, never the best of a bad grid, for a peak in the outer `guard` of the
+    band -- the box is periodic, so a trend past the reach folds back to the
+    far edge and would otherwise be believed -- or below sqrt(n ln K), which is
+    what n random phasors produce on their own over K candidates.
+
+    Returns (gradients in cycles across the extent, constants, coherence,
+    resolved, why), why being 0 resolved, 1 no pixels, 2 on the rim, 3 in the
+    mud.
+    """
+    import numpy as np
+    cells = int(cells)
+    bins = int(bins)
+    M = cells + 2 * TREND2D_W
+    nd = total.shape[0]
+    K = M ** k
+    S = total[:, :K] + 1j * total[:, K:2 * K]
+    n = total[:, -1]
+    P = cells * bins
+    j = np.fft.fftfreq(P, d=1.0 / P)
+    kh = trend2d_deapodise(cells, bins, k)
+    corr = np.where(np.abs(kh) > 1e-12, 1.0 / kh, 0.0)
+    # ASCENDING, not transform order: the peak's neighbours have to be its
+    # neighbours in frequency, or the bracket test skips the node at zero and
+    # the interpolation silently returns the node itself
+    cyc = np.fft.fftshift(j) / bins
+    reach = trend2d_reach(cells)
+    band = np.abs(cyc) <= reach
+    edge = np.abs(cyc) > (1.0 - guard) * reach
+    bc = cyc[band]
+    be = edge[band]
+    g = np.full((nd, k), np.nan)
+    c = np.full(nd, np.nan)
+    coh = np.zeros(nd)
+    why = np.zeros(nd, np.int64)
+    # AS MANY DATES PER TRANSFORM AS THE BUDGET HOLDS. One at a time wastes the
+    # planning and the memory traffic; all of them at once is nd padded grids
+    # at once, which is where a long stack runs out of room.
+    _bytes = (P ** k) * 16
+    _batch = max(1, int(TREND2D_FFT_BUDGET / max(_bytes, 1)))
+    _F = {}
+    for _b0 in range(0, nd, _batch):
+        _sel = [d for d in range(_b0, min(_b0 + _batch, nd)) if n[d] > 0]
+        if not _sel:
             continue
-
-        AtWA = AtWA + 1e-10 * np.eye(n_feat, dtype=np.float64)
-
-        if is_complex:
-            coeffs = np.linalg.solve(AtWA.astype(np.complex128), AtWb)
-            result[p] = np.concatenate([coeffs.real, coeffs.imag])
-        else:
-            result[p] = np.linalg.solve(AtWA, AtWb)
-
-    return result
-
-
-def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
-                 feature_mean, feature_std, degree, is_complex,
-                 detrend_mode, extrapolate=False):
-    """Phase 4: Apply polynomial trend to one spatial tile.
-
-    Parameters
-    ----------
-    phase_chunk : ndarray (n_pairs, cy, cx)
-    coeffs_packed : ndarray (n_pairs, n_coeff_out)
-        Packed coefficients (float64).
-    var_chunks : tuple/list of ndarray (cy, cx)
-        Transform variable arrays.
-    feature_mean, feature_std : ndarray (n_poly_features,)
-    degree : int
-    is_complex : bool
-    detrend_mode : bool
-        If True, return detrended data.
-    extrapolate : bool
-        If False (default) and not detrend_mode, mask trend to input's valid region.
-
-    Returns
-    -------
-    ndarray (n_pairs, cy, cx)
-    """
-    n_pairs = phase_chunk.shape[0]
-    cy, cx = phase_chunk.shape[1], phase_chunk.shape[2]
-    n_pixels = cy * cx
-
-    n_poly = len(feature_mean)
-    n_feat = n_poly + 1
-
-    # Flatten variables
-    var_flat_list = [np.nan_to_num(v.ravel().astype(np.float64), nan=0.0)
-                     for v in var_chunks]
-
-    # Batch size: keep A_std under half dask chunk budget
-    from .utils_dask import get_dask_chunk_size_mb
-    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
-    batch_size = max(1024, _budget // max(1, n_feat * 8))
-    n_batches = (n_pixels + batch_size - 1) // batch_size
-
-    out_dtype = np.complex64 if is_complex else np.float32
-    result = np.empty((n_pairs, cy, cx), dtype=out_dtype)
-
-    for p in range(n_pairs):
-        cp = coeffs_packed[p]
-
-        if np.any(np.isnan(cp)):
-            result[p] = np.nan
+        _blk = np.stack([_trend2d_embed(S[d], cells, bins, k) for d in _sel])
+        for a in range(1, k + 1):          # axis at a time, in place
+            _blk = np.fft.fft(_blk, axis=a)
+        for a in range(k):
+            sh = [1] * (k + 1)
+            sh[a + 1] = P
+            _blk *= corr.reshape(sh)
+        _blk = np.fft.fftshift(_blk, axes=tuple(np.arange(1, k + 1)))
+        for _i, d in enumerate(_sel):      # cropped, so only the band is kept
+            _F[d] = _blk[_i][np.ix_(*([band] * k))].astype(np.complex64)
+        del _blk
+    for d in range(nd):
+        if n[d] <= 0:
+            why[d] = 1
             continue
-
-        if is_complex:
-            coeffs = cp[:n_feat] + 1j * cp[n_feat:]
-        else:
-            coeffs = cp
-
-        trend_flat = np.empty(
-            n_pixels,
-            dtype=np.complex128 if is_complex else np.float64)
-
-        for bi in range(n_batches):
-            s = bi * batch_size
-            e = min((bi + 1) * batch_size, n_pixels)
-            batch_len = e - s
-
-            var_batch_list = [v[s:e] for v in var_flat_list]
-            X_poly_b = _build_poly_features(var_batch_list, batch_len,
-                                            degree)
-            A_std_b = np.concatenate([
-                (X_poly_b - feature_mean) / feature_std,
-                np.ones((batch_len, 1), dtype=np.float64)
-            ], axis=1)
-
-            if is_complex:
-                trend_flat[s:e] = A_std_b.astype(np.complex128) @ coeffs
-            else:
-                trend_flat[s:e] = A_std_b @ coeffs
-
-        if is_complex:
-            trend_abs = np.abs(trend_flat)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                trend_flat = np.where(trend_abs > 0,
-                                      trend_flat / trend_abs, 0)
-            trend_flat[~np.isfinite(trend_flat)] = 0
-            trend = trend_flat.reshape(cy, cx).astype(np.complex64)
-        else:
-            trend = trend_flat.reshape(cy, cx).astype(np.float32)
-
-        if detrend_mode:
-            if is_complex:
-                result[p] = phase_chunk[p] * np.conj(trend)
-            else:
-                result[p] = phase_chunk[p] - trend
-        else:
-            if not extrapolate:
-                nan_mask = np.isnan(phase_chunk[p].real) if is_complex else np.isnan(phase_chunk[p])
-                trend[nan_mask] = np.nan
-            result[p] = trend
-
-    return result
+        F = _F[d]
+        mag2 = np.abs(F) ** 2
+        q = np.unravel_index(mag2.argmax(), mag2.shape)
+        peak = F[q]
+        coh[d] = float(abs(peak) / max(n[d], 1.0))
+        if any(be[q[a]] for a in range(k)):
+            why[d] = 2
+            continue
+        for a in range(k):
+            g[d, a] = bc[q[a]]
+            if 0 < q[a] < mag2.shape[a] - 1:
+                sl = list(q)
+                sl[a] = q[a] - 1
+                ym = mag2[tuple(sl)]
+                sl[a] = q[a] + 1
+                yp = mag2[tuple(sl)]
+                den = ym - 2 * mag2[q] + yp
+                if den != 0:
+                    g[d, a] += (np.clip(0.5 * (ym - yp) / den, -1, 1)
+                                / bins)
+        c[d] = float(np.angle(peak))
+    floor = np.sqrt(np.log(max(int(band.sum()) ** k, 2)) / np.maximum(n, 1.0))
+    mud = (why == 0) & (coh <= floor)
+    why[mud] = 3
+    resolved = why == 0
+    g[~resolved] = np.nan
+    c[~resolved] = np.nan
+    return g, c, coh, resolved, why
 
 
+def trend2d_axes(span, rng, half):
+    """Candidate positions per variable: the SEARCH IS IN TURNS, not in rates.
 
-@nb.njit(cache=True)
-def detrend1d_dates_array(scenes, date_values, duration=90.0, max_refine=3,
-                          budget_mb=None):
-    """Per-date atmospheric residual on a date-major block, pixelwise.
-
-    This is detrend1d_pairs() moved onto the dates: the SAME estimator,
-    trend1d_pairs_array, driven from the band entries (|dt| <= duration) of
-    the per-pixel date matrix. Removing the per-date model m_d from each scene
-    is identical to removing m_ref - m_rep from every interferogram, so the
-    interferograms formed afterwards carry exactly the phases the pair-domain
-    step produced -- verified by comparing them directly.
-
-    Nothing is estimated here that the pair step did not estimate; the entries
-    are differences of the two scene phases, formed a batch at a time and
-    discarded, and the pair step it replaces was doing the same work on the
-    same network downstream.
+    So the rate depends on how far the samples reach, known only after reading.
+    One node past `rng`, so a trend of exactly `rng` is bracketed, not on the
+    rim where it would be called unresolved.
     """
-    if isinstance(scenes, list):
-        scenes = np.asarray(scenes[0]) if len(scenes) == 1 else np.concatenate(
-            [np.asarray(c) for c in scenes], axis=0)
-    # copy: the batches below write back through this view, and ascontiguousarray
-    # is a no-op on an already-contiguous complex64 input, so without it the
-    # CALLER's array is overwritten -- which also violates what dask map_blocks
-    # assumes about kernels not mutating their input blocks.
-    scenes = np.array(scenes, dtype=np.complex64, order='C', copy=True)
-    n_dates, ny, nx = scenes.shape
-
-    def _as_ns(v):
-        v = np.asarray(v)
-        if v.dtype.kind == 'M':
-            return v.astype('datetime64[ns]').astype(np.int64)
-        return v.astype(np.int64)
-    ns = _as_ns(date_values)
-    days = ns / (86400 * 1e9)
-    i1, i2 = np.triu_indices(n_dates, k=1)
-    band = (days[i2] - days[i1]) <= float(duration)
-    i1, i2 = i1[band], i2[band]
-    if i1.size < n_dates:
-        return scenes
-
-    npix = ny * nx
-    flat = scenes.reshape(n_dates, npix)
-    if budget_mb is None:
-        try:
-            from .utils_dask import get_dask_chunk_size_mb
-            budget_mb = get_dask_chunk_size_mb()
-        except Exception:
-            budget_mb = 128
-    step = max(256, min(npix, int(budget_mb) * 1024 * 1024 // max(1, 8 * i1.size)))
-    for a0 in range(0, npix, step):
-        b0 = min(a0 + step, npix)
-        seg = flat[:, a0:b0]
-        amp = np.abs(seg)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            U = np.where(amp > 0, seg / np.where(amp > 0, amp, 1),
-                         0).astype(np.complex64)[:, :, None]
-        vobs = (U[i1] * np.conj(U[i2])).astype(np.complex64)
-        mdl = trend1d_pairs_array(vobs, None, ns[i1], ns[i2],
-                                  max_refine=int(max_refine),
-                                  is_complex=True, return_models=True)
-        corr = np.exp(-1j * np.where(np.isfinite(mdl), mdl, 0.0)).astype(np.complex64)
-        flat[:, a0:b0] = (seg * corr[:, :, 0]).astype(scenes.dtype)
-    return scenes
+    import numpy as np
+    out = []
+    for i in range(len(half)):
+        h = int(half[i])
+        g = (float(rng[i]) * h / max(h - 1, 1)
+             / max(float(span[i]), 1e-30))
+        out.append(np.linspace(-g, g, 2 * h + 1, dtype=np.float32))
+    return out
 
 
-# Populate numba file cache on first import so dask workers skip compilation
+def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None):
+    """One spatial block -> the spread grid the fit reads, per date.
+
+    Everything the estimator reads is a sum over pixels, so a block contributes
+    its share and the caller adds them: the grid, real and imaginary, plus the
+    sample count the coherence floor needs.
+    """
+    import numpy as np
+    k = len(transform_blk)
+    nb = data_blk.shape[0]
+    stats = np.asarray(stats, np.float64).ravel()
+    mu = stats[:k]
+    span = np.maximum(stats[k:2 * k], 1e-30)
+    M = int(cells) + 2 * TREND2D_W
+    K = M ** k
+    out = np.zeros((nb, 1, 1, 2 * K + 1), np.float64)
+
+    # the positions this block can contribute: geometry, and a date with phase
+    ny, nx = data_blk.shape[-2:]
+    if dims is None:
+        dims = ['yx'] * len(transform_blk)
+    V = [np.asarray(b, np.float32) for b in transform_blk]
+    keep = np.ones(ny * nx, bool)
+    for v, d in zip(V, dims):
+        if d == 'yx':
+            keep &= np.isfinite(v.reshape(-1))
+    have = np.zeros(ny * nx, bool)
+    for t in range(nb):
+        a = np.abs(data_blk[t]).reshape(-1)
+        have |= np.isfinite(a) & (a > 0)
+    keep &= have
+    # A VARIABLE ALONG ONE AXIS RULES OUT WHOLE ROWS OR COLUMNS, and normally
+    # none, so the raster-sized mask is only built if it has to be
+    for v, d in zip(V, dims):
+        if d != 'yx' and not np.isfinite(v).all():
+            bad = ~np.isfinite(v)
+            keep &= ~(np.repeat(bad, nx) if d == 'y' else np.tile(bad, ny))
+    idx = np.flatnonzero(keep)
+    npts = idx.size
+    if npts == 0:
+        return out
+
+    # INDEXED, NEVER BROADCAST, and scaled to the box the grid spans: the
+    # midpoint centring is what puts every sample inside [-1/2, 1/2]
+    rows = idx // nx
+    A = np.empty((npts, k), np.float64)
+    for i, (v, d) in enumerate(zip(V, dims)):
+        if d == 'yx':
+            A[:, i] = v.reshape(-1)[idx]
+        elif d == 'y':
+            A[:, i] = v[rows]
+        else:
+            A[:, i] = v[idx - rows * nx]
+        A[:, i] = (A[:, i] - mu[i]) / span[i]
+    u = np.zeros((nb, npts), np.complex128)
+    for t in range(nb):
+        z = data_blk[t].reshape(-1)[idx]
+        a = np.abs(z)
+        np.divide(z, a, out=u[t], where=np.isfinite(a) & (a > 0))
+    out[:, 0, 0, -1] = (np.abs(u) > 0).sum(1)
+
+    gr, gi = trend2d_spread(u, A, cells)
+    out[:, 0, 0, :K] = gr
+    out[:, 0, 0, K:2 * K] = gi
+    return out
+
+
+def trend2d_finalize(total, axes):
+    """The combined accumulators -> one plane per date.
+
+    The accumulator IS the objective, sampled: the peak locates the gradient, a
+    parabola through its neighbours puts it between nodes, and the peak's
+    ARGUMENT is the constant, since there the residual phasors align.
+
+    NaN, never the best of a bad lattice, for a peak on the rim -- not a
+    maximum but where the search stopped -- or below sqrt(n ln K), which is
+    what n random phasors produce on their own over K candidates.
+
+    Returns (gradients, constants, coherence, resolved, why), where why is
+    0 resolved, 1 no pixels, 2 on the rim, 3 in the mud.
+    """
+    import numpy as np
+    shape = tuple(int(a.size) for a in axes)
+    K = int(np.prod(shape))
+    nd, k = total.shape[0], len(axes)
+    S = total[:, :K] + 1j * total[:, K:2 * K]
+    n = total[:, -1]
+    g = np.zeros((nd, k), np.float64)
+    c = np.zeros(nd, np.float64)
+    coh = np.zeros(nd, np.float64)
+    rim = np.zeros(nd, bool)
+    mag2 = (np.abs(S) ** 2).reshape((nd,) + shape)
+    for d in range(nd):
+        j = np.unravel_index(mag2[d].argmax(), shape)
+        for i in range(k):
+            step = float(axes[i][1] - axes[i][0]) if shape[i] > 1 else 0.0
+            g[d, i] = float(axes[i][j[i]])
+            if 0 < j[i] < shape[i] - 1:
+                sl = list(j)
+                sl[i] = j[i] - 1; ym = mag2[d][tuple(sl)]
+                sl[i] = j[i] + 1; yp = mag2[d][tuple(sl)]
+                den = ym - 2 * mag2[d][j] + yp
+                if den != 0:
+                    g[d, i] += np.clip(0.5 * (ym - yp) / den, -1, 1) * step
+            elif shape[i] > 1:
+                rim[d] = True
+        peak = S[d].reshape(shape)[j]
+        c[d] = float(np.angle(peak))
+        coh[d] = float(abs(peak) / max(n[d], 1.0))
+    floor = np.sqrt(np.log(max(K, 2)) / np.maximum(n, 1.0))
+    resolved = (n > 0) & ~rim & (coh > floor)
+    why = np.where(n <= 0, 1, np.where(rim, 2, np.where(coh <= floor, 3, 0)))
+    g[~resolved] = np.nan
+    c[~resolved] = np.nan
+    return g, c, coh, resolved, why
+
+
+# Populate numba file cache on first import so dask workers skip compilation.
+# LAST, so every kernel above is defined by the time it runs.
 _warmup_numba_cache()

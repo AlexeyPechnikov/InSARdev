@@ -510,7 +510,11 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
 
     # Add record attributes from dict (reverse order to match transform_slc_int16)
     for name, value in list(record_dict.items())[::-1]:
-        if name not in ['orbit', 'path']:
+        # NOT BPR: the record carries the scan-time baseline, whose origin is
+        # the first date, while the value set above is measured from THIS
+        # transform's reference -- which is what makes BPR == 0 name the
+        # reference in a stored stack.
+        if name not in ['orbit', 'path', 'BPR', 'baseline_model']:
             if isinstance(value, (pd.Timestamp, np.datetime64)):
                 value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
             data_proj.attrs[name] = value
@@ -581,7 +585,6 @@ class S1_transform(S1_align):
     def transform(self,
                   target: str,
                   ref: str,
-                  records: pd.DataFrame|None=None,
                   epsg: str|int|None='auto',
                   resolution: tuple[int, int]=(16, 4),
                   remove_topo_phase: bool = True,
@@ -607,8 +610,6 @@ class S1_transform(S1_align):
             The output directory where the results are saved.
         ref : str
             The reference burst data. For multi-path processing only the path with this data is processed.
-        records : pd.DataFrame, optional
-            The records to use. By default, all records are used.
         epsg : str|int|None, optional
             The EPSG code to use for the output data. By default ('auto'), the EPSG code is computed automatically.
             Use epsg=0 to disable geocoding and keep radar coordinates (y=azimuth, x=range).
@@ -694,8 +695,7 @@ class S1_transform(S1_align):
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
 
-        if records is None:
-            records = self.to_dataframe(ref=ref)
+        records = self.to_dataframe(ref=ref)
 
         if epsg == 0:
             print('NOTE: epsg=0, keeping radar coordinates (no geocoding).')
@@ -960,9 +960,8 @@ class S1_transform(S1_align):
             del topo, transform, prm_cache
             self.consolidate_metadata(target, record_id=all_dates[-1][-1])
 
-        # Get reference and repeat bursts as groups (forward the records subset so records= actually
-        # windows the processed scenes; previously records was accepted but dropped here -> full archive)
-        refrep_dict = self.get_repref(ref=ref, records=records)
+        # Get reference and repeat bursts as groups
+        refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
 
         # Default n_jobs to cpu_count()

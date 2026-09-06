@@ -80,6 +80,11 @@ class EOF(progressbar_joblib):
             for orbit in orbits:
                 os.remove(os.path.join(basedir, orbit))
     
+        # an S1 or Nisar object holds its records in .df, accept it as the records themselves.
+        # Checked on .df rather than on a to_dataframe() method, which Xarray objects have too.
+        if not isinstance(scenes, pd.DataFrame) and isinstance(getattr(scenes, 'df', None), pd.DataFrame):
+            scenes = scenes.df
+
         if isinstance(scenes, pd.DataFrame):
             if skip_exist:
                 # ignore scenes with orbits

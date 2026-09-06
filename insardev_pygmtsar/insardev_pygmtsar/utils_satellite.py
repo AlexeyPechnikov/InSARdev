@@ -258,6 +258,9 @@ def _process_tile_worker(args):
     trans_root = zarr.open(trans_store, mode='r+')
 
     # Get zarr arrays for writing (no reading of full coordinate arrays!)
+    # per-tile extent of azi, rng and ele, folded as the batches are written
+    extent = np.full((3, 2), np.nan, dtype=np.float64)
+
     azi_arr = trans_root['azi']
     rng_arr = trans_root['rng']
     ele_arr = trans_root['ele']
@@ -565,9 +568,18 @@ def _process_tile_worker(args):
         azi_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_azi)
         rng_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_rng)
         ele_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_ele_gmt)
+        # how far each variable reaches, folded in while the batch is still in
+        # hand and before packing, so it is in physical units. The parent
+        # combines the tiles into actual_range; an all-NaN batch gives NaN and
+        # drops out of that by itself.
+        with np.errstate(invalid='ignore'):
+            for _i, _b in enumerate((batch_azi, batch_rng, batch_ele_gmt)):
+                if np.isfinite(_b).any():
+                    extent[_i][0] = np.fmin(extent[_i][0], np.nanmin(_b))
+                    extent[_i][1] = np.fmax(extent[_i][1], np.nanmax(_b))
         del batch_azi, batch_rng, batch_ele_gmt
 
-    return True
+    return extent
 
 
 def _process_topo_worker(args):
@@ -1784,21 +1796,28 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
             diff = 180 - diff  # Wrapped difference for vertical baseline flip
         return diff
 
-    # Only validate when baseline is significant (> 1m)
-    # For self-baseline (baseline ≈ 0), alpha is numerically undefined (arctan2 of tiny values)
+    # Only validate when the baseline is long enough for alpha to be determined.
+    # For self-baseline (baseline ≈ 0), alpha is numerically undefined (arctan2 of tiny values),
+    # and a short baseline is barely better: the baseline vector moves well under a metre along
+    # a burst whatever its length, so the angle it subtends grows as 1/baseline. Measured on
+    # Sentinel-1, alpha varies by 5.37° over a 7.5m baseline and by 0.03° over a 400m one, both
+    # being the same movement of the vector, and it stays under 1.2° for every baseline above
+    # 25m. GMTSAR itself validates none of this and reads bperp from alpha_start alone.
     baseline_mean = (baseline_start + baseline_center + baseline_end) / 3
-    if baseline_mean > 1.0:
+    if baseline_mean > 25.0:
         # Alpha should vary smoothly along the scene (< 5° variation)
         alpha_var_sc = alpha_variation(alpha_start_deg, alpha_center_deg)
         alpha_var_ce = alpha_variation(alpha_center_deg, alpha_end_deg)
         assert alpha_var_sc < 5.0, (
             f"Alpha varies too much between start and center: {alpha_var_sc:.2f}° "
-            f"(start={alpha_start_deg:.2f}°, center={alpha_center_deg:.2f}°). "
+            f"(start={alpha_start_deg:.2f}°, center={alpha_center_deg:.2f}°, "
+            f"baseline={baseline_mean:.2f}m). "
             f"This indicates a sign computation bug."
         )
         assert alpha_var_ce < 5.0, (
             f"Alpha varies too much between center and end: {alpha_var_ce:.2f}° "
-            f"(center={alpha_center_deg:.2f}°, end={alpha_end_deg:.2f}°). "
+            f"(center={alpha_center_deg:.2f}°, end={alpha_end_deg:.2f}°, "
+            f"baseline={baseline_mean:.2f}m). "
             f"This indicates a sign computation bug."
         )
         # Baseline length should vary smoothly (< 10% variation)
@@ -2162,6 +2181,12 @@ def save_transform(transform, outdir, scale_factor=2.0):
         trans_int[varname] = int_data
         trans_int[varname].attrs['scale_factor'] = 1/scale_factor
         trans_int[varname].attrs['add_offset'] = 0
+        # CF actual_range, in the units a reader gets back: from the ROUNDED
+        # values, so it is what decoding reconstructs and never the _FillValue
+        # sentinel. It spares every later reader a pass over the raster.
+        trans_int[varname].attrs['actual_range'] = [
+            float(scaled.min(skipna=True)) / scale_factor,
+            float(scaled.max(skipna=True)) / scale_factor]
 
     # Scale look vector components (unit vectors, range -1 to 1)
     # Use higher scale factor for precision (1e6 gives ~1e-6 precision)
@@ -2175,6 +2200,15 @@ def save_transform(transform, outdir, scale_factor=2.0):
             trans_int[varname] = int_data
             trans_int[varname].attrs['scale_factor'] = 1/look_scale
             trans_int[varname].attrs['add_offset'] = 0
+            trans_int[varname].attrs['actual_range'] = [
+                float(scaled.min(skipna=True)) / look_scale,
+                float(scaled.max(skipna=True)) / look_scale]
+
+    for _c in ('y', 'x'):
+        if _c in trans_int.coords:
+            _v = trans_int[_c].values
+            trans_int[_c].attrs['actual_range'] = [float(np.nanmin(_v)),
+                                                   float(np.nanmax(_v))]
 
     # Use 8192 chunk size for memory-efficient reading
     CHUNK_SIZE = 8192
@@ -3730,6 +3764,9 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     x_arr = trans_root.create_array('x', data=out_x_coords, chunks=(n_x,), overwrite=True,
                                      dimension_names=['x'])
     y_arr.attrs['_ARRAY_DIMENSIONS'] = ['y']
+    for _a in (y_arr, x_arr):
+        _f, _l = float(_a[0]), float(_a[-1])
+        _a.attrs['actual_range'] = [min(_f, _l), max(_f, _l)]
     x_arr.attrs['_ARRAY_DIMENSIONS'] = ['x']
     del out_y_coords, out_x_coords  # Free immediately after writing to zarr
 
@@ -3764,18 +3801,29 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     _t0_tiles = time.perf_counter()
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                              max_tasks_per_child=1) as executor:
-        list(executor.map(_process_tile_worker, tile_args))
+        tile_extents = list(executor.map(_process_tile_worker, tile_args))
     if debug:
         print(f'PROFILE: transform ProcessPoolExecutor ({len(tile_args)} tiles, {n_jobs} workers) {time.perf_counter() - _t0_tiles:.3f}s')
 
     del tile_args
 
+    # how far each variable reaches, combined from the tiles that wrote it --
+    # they carried it back, so nothing is re-read. A variable no tile could
+    # fill stays NaN and gets no attribute rather than a made-up range.
+    _ext = np.stack([e for e in tile_extents if e is not None]) \
+        if any(e is not None for e in tile_extents) else np.full((1, 3, 2), np.nan)
+    with np.errstate(invalid='ignore'):
+        _lo = np.nanmin(_ext[:, :, 0], axis=0)
+        _hi = np.nanmax(_ext[:, :, 1], axis=0)
+
     # Add transform metadata
-    for arr in [azi_arr, rng_arr, ele_arr]:
+    for _i, arr in enumerate([azi_arr, rng_arr, ele_arr]):
         arr.attrs['scale_factor'] = 1/scale_factor
         arr.attrs['add_offset'] = 0
         arr.attrs['_FillValue'] = int(fill_value)
         arr.attrs['_ARRAY_DIMENSIONS'] = ['y', 'x']
+        if np.isfinite(_lo[_i]) and np.isfinite(_hi[_i]):
+            arr.attrs['actual_range'] = [float(_lo[_i]), float(_hi[_i])]
 
     from pyproj import CRS
     trans_root.attrs['spatial_ref'] = CRS.from_epsg(epsg).to_wkt()

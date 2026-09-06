@@ -285,6 +285,12 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         overwrite=True,
                         fill_value=np.nan if (np.issubdtype(da_xr.dtype, np.floating) or np.issubdtype(da_xr.dtype, np.complexfloating)) else 0,
                     )
+                    # THE VARIABLE'S OWN ATTRIBUTES: the metadata pass below
+                    # drops every data_var and writes coordinates only, so a
+                    # variable that is not stamped here loses them -- and
+                    # actual_range among them, which a reader needs.
+                    if da_xr.attrs:
+                        z.attrs.update({k: v for k, v in da_xr.attrs.items()})
                     sources.append(da_xr.data)
                     if not is_store_object:
                         # ANY rank, not just 3D: TensorStore serialises
@@ -299,13 +305,15 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         targets.append(z)
                 else:
                     # Non-dask array - write directly with dimension_names
-                    ds_grp.create_array(
+                    _z = ds_grp.create_array(
                         var_name,
                         data=np.asarray(da_xr.data),
                         chunks=da_xr.shape,
                         dimension_names=dim_names,
                         overwrite=True
                     )
+                    if da_xr.attrs:
+                        _z.attrs.update({k: v for k, v in da_xr.attrs.items()})
 
     # Write dask arrays to zarr in memory-controlled batches.
     # Each batch slice is optimized (dask.optimize culls unused keys).

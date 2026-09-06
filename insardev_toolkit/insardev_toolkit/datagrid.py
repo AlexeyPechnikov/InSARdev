@@ -210,6 +210,11 @@ class datagrid:
         import xarray as xr
         from shapely.geometry import Polygon
     
+        # an S1 or Nisar object holds its records in .df, accept it as the geometry itself.
+        # Checked on .df rather than on a to_dataframe() method, which Xarray objects have too.
+        if isinstance(getattr(geometry, 'df', None), (gpd.GeoDataFrame, gpd.GeoSeries)):
+            geometry = geometry.df
+    
         if isinstance(geometry, (xr.DataArray, xr.Dataset)) and ('lat' in geometry.dims and 'lon' in geometry.dims):
             # WGS84 coordinates expected
             lon_start = geometry.lon.min().item()

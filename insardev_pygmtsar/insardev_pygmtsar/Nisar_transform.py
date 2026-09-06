@@ -667,7 +667,11 @@ def _transform_slc_int16_nisar(outdir, transform, topo, prm_rep, prm_ref, slc_da
 
     # Add record attributes
     for name, value in list(record_dict.items())[::-1]:
-        if name not in ['path']:
+        # NOT BPR: the record carries the scan-time baseline, whose origin is
+        # the first date, while the value set above is measured from THIS
+        # transform's reference -- which is what makes BPR == 0 name the
+        # reference in a stored stack.
+        if name not in ['path', 'BPR', 'baseline_model']:
             if isinstance(value, (pd.Timestamp, np.datetime64)):
                 value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
             data_proj.attrs[name] = value
@@ -710,7 +714,6 @@ class Nisar_transform(Nisar_align):
     def transform(self,
                   target: str,
                   ref: str,
-                  records: pd.DataFrame | None = None,
                   frequency: str | None = None,
                   epsg: str | int | None = 'auto',
                   resolution: tuple[int, int] = (8, 16),
@@ -738,8 +741,6 @@ class Nisar_transform(Nisar_align):
             The output directory where the results are saved.
         ref : str
             The reference scene date (YYYY-MM-DD).
-        records : pd.DataFrame, optional
-            The records to use. By default, all records are used.
         frequency : str | None, optional
             Frequency band to process: 'A' or 'B'.
             - None: Auto-detect if files have single frequency, error if both present
@@ -803,8 +804,7 @@ class Nisar_transform(Nisar_align):
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance with a DEM.')
 
-        if records is None:
-            records = self.to_dataframe(ref=ref)
+        records = self.to_dataframe(ref=ref)
 
         # Validate and determine frequency to use
         if frequency is not None:

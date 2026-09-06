@@ -21,6 +21,8 @@ _ASF_AUTH_HOST = 'cumulus.asf.alaska.edu'
 _AUTH_DOMAINS = ['asf.alaska.edu', 'earthdata.nasa.gov', 'daac.asf.alaska.edu']
 _AUTH_COOKIES = ['urs_user_already_logged', 'uat_urs_user_already_logged', 'asf-urs']
 _ASF_SEARCH_URL = 'https://api.daac.asf.alaska.edu/services/search/param'
+# granules per catalog request, matching the ASF/CMR page size
+_ASF_GRANULE_CHUNK = 250
 
 
 class _PRODUCT_TYPE:
@@ -108,8 +110,48 @@ class _ASFSession(requests.Session):
         super().rebuild_auth(prepared_request, response)
 
 
+def _asf_query(params, retries=30, timeout_second=3):
+    """POST a query to the ASF SearchAPI and return the parsed GeoJSON.
+
+    POST is used instead of GET because query strings are limited to a few
+    kilobytes by the server: a granule list of ~180 bursts, or a detailed WKT
+    geometry, exceeds that and the request is rejected with HTTP 414
+    (Request-URI Too Large). The SearchAPI accepts exactly the same parameters
+    form-encoded in the request body, without any length limit.
+
+    Parameters
+    ----------
+    params : dict
+        SearchAPI parameters, e.g. {'granule_list': '...', 'output': 'geojson'}.
+    retries : int, optional
+        Number of attempts before giving up. Default 30.
+    timeout_second : int, optional
+        Seconds to wait between attempts. Default 3.
+
+    Returns
+    -------
+    dict
+        Parsed GeoJSON response.
+    """
+    import time
+    for attempt in range(retries):
+        try:
+            # (connect, read) timeouts: the catalog is slow for large granule lists
+            response = requests.post(_ASF_SEARCH_URL, data=params, timeout=(30, 300))
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            if attempt + 1 == retries:
+                raise
+            print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in {timeout_second}s...')
+            time.sleep(timeout_second)
+
+
 def _asf_granule_search(granule_list):
     """Search ASF by granule names (burst IDs or product names).
+
+    The list is split into chunks so that a single request stays within the
+    catalog limits regardless of how many granules are requested.
 
     Parameters
     ----------
@@ -119,33 +161,30 @@ def _asf_granule_search(granule_list):
     Returns
     -------
     list
-        List of _ASFSearchResult objects.
+        List of _ASFSearchResult objects, in the order the granules were requested.
     """
     if not granule_list:
         return []
 
-    # ASF SearchAPI accepts comma-separated granule list
-    params = {
-        'granule_list': ','.join(granule_list),
-        'output': 'geojson'
-    }
+    if isinstance(granule_list, str):
+        granule_list = [granule_list]
+    else:
+        granule_list = list(granule_list)
 
-    import time
-    for attempt in range(30):
-        try:
-            response = requests.get(_ASF_SEARCH_URL, params=params, timeout=30)
-            response.raise_for_status()
-            break
-        except Exception as e:
-            if attempt + 1 == 30:
-                raise
-            print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in 3s...')
-            time.sleep(3)
+    features = {}
+    for chunk in [granule_list[idx:idx + _ASF_GRANULE_CHUNK]
+                  for idx in range(0, len(granule_list), _ASF_GRANULE_CHUNK)]:
+        # ASF SearchAPI accepts comma-separated granule list
+        data = _asf_query({'granule_list': ','.join(chunk), 'output': 'geojson'})
+        for feature in data.get('features', []):
+            fileID = feature.get('properties', {}).get('fileID')
+            # the catalog can report the same granule twice, keep the first entry
+            features.setdefault(fileID, feature)
 
-    data = response.json()
-    features = data.get('features', [])
-
-    return [_ASFSearchResult(f) for f in features]
+    # return in the requested order, ignoring granules missing from the catalog
+    ordered = [features.pop(granule) for granule in granule_list if granule in features]
+    # keep any extra entries the catalog returned under a different name
+    return [_ASFSearchResult(f) for f in ordered + list(features.values())]
 
 
 def _asf_search(start=None, end=None, flightDirection=None, intersectsWith=None,
@@ -195,19 +234,7 @@ def _asf_search(start=None, end=None, flightDirection=None, intersectsWith=None,
     if beamMode:
         params['beamMode'] = beamMode
 
-    import time
-    for attempt in range(30):
-        try:
-            response = requests.get(_ASF_SEARCH_URL, params=params, timeout=30)
-            response.raise_for_status()
-            break
-        except Exception as e:
-            if attempt + 1 == 30:
-                raise
-            print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in 3s...')
-            time.sleep(3)
-
-    data = response.json()
+    data = _asf_query(params)
     features = data.get('features', [])
 
     return [_ASFSearchResult(f) for f in features]
@@ -692,9 +719,13 @@ class ASF(progressbar_joblib):
                 # all files valid, skip download
                 return
 
-            # download manifest to memory to get dimensions for TIFF validation
+            # download manifest to memory to get dimensions for TIFF validation.
+            # A burst absent from the cache is extracted from the archived scene on demand,
+            # and the server answers nothing at all while it does that, measured at 150s for
+            # a single manifest. The read timeout has to outlast that silence, otherwise every
+            # attempt aborts before the first byte and no number of retries ever succeeds.
             manifest_url = get_burst_url(properties['additionalUrls'][0])
-            response = session.get(manifest_url, timeout=(10, 60))
+            response = session.get(manifest_url, timeout=(10, 300))
             response.raise_for_status()
             xml_content = response.text
             if debug:
@@ -969,6 +1000,48 @@ class ASF(progressbar_joblib):
             results = asf_search.granule_search(bursts_missed)
             pbar.update(1)
 
+        def polarization_siblings(burst):
+            # the polarization channels of a scene share every part of the name but the channel
+            parts = burst.split('_')
+            names = ['_'.join(parts[:4] + [pol] + parts[5:]) for pol in ['VV', 'VH', 'HH', 'HV']]
+            return [name for name in names if name != burst]
+
+        def replace_polarization(url, polarization):
+            # burst urls end with .../<subswath>/<polarization>/<burstIndex>.<ext>
+            parts = url.split('/')
+            parts[-2] = polarization
+            return '/'.join(parts)
+
+        # The catalog occasionally omits one polarization channel of an otherwise complete
+        # dual-polarization scene. The channels differ only by the polarization in the name
+        # and in the url path, so restore such a burst from a sibling channel.
+        catalog = {result.geojson()['properties']['fileID']: result for result in results}
+        bursts_absent = [burst for burst in bursts_missed if burst not in catalog]
+        if bursts_absent:
+            # a sibling is not necessarily requested here, it can be downloaded already
+            siblings = {name for burst in bursts_absent for name in polarization_siblings(burst)}
+            for result in asf_search.granule_search(sorted(siblings - set(catalog))):
+                catalog.setdefault(result.geojson()['properties']['fileID'], result)
+        for burst in bursts_absent:
+            sibling = next((catalog[name] for name in polarization_siblings(burst)
+                            if name in catalog), None)
+            if sibling is None:
+                print(f'NOTE: burst {burst} is missing in the ASF catalog and is not downloaded.')
+                continue
+            feature = sibling.geojson()
+            properties = dict(feature['properties'])
+            polarization = burst.split('_')[4]
+            properties['fileID'] = burst
+            properties['sceneName'] = burst
+            properties['fileName'] = f'{burst}.tiff'
+            properties['polarization'] = polarization
+            properties['url'] = replace_polarization(properties['url'], polarization)
+            properties['additionalUrls'] = [replace_polarization(url, polarization)
+                                            for url in properties['additionalUrls']]
+            results.append(_ASFSearchResult(dict(feature, properties=properties)))
+            print(f'NOTE: burst {burst} is missing in the ASF catalog, '
+                  f'restored from {feature["properties"]["fileID"]}.')
+
         # Check for conflicting bursts from different paths with same burstNum_subswath pattern
         # Such data cannot be stored in the same basedir without conflicts
         pattern_to_fullburstid = {}
@@ -1011,8 +1084,10 @@ class ASF(progressbar_joblib):
         failed_count = statuses.count(False)
         if failed_count > 0:
             raise Exception(f'Bursts downloading failed for {failed_count} items.')
-        # parse processed bursts and convert to dataframe
-        bursts_downloaded = pd.DataFrame(bursts_missed, columns=['burst'])
+        # parse processed bursts and convert to dataframe, reporting the bursts really
+        # downloaded, which excludes any burst the catalog does not know about
+        bursts_downloaded = pd.DataFrame([result.geojson()['properties']['fileID'] for result in results],
+                                         columns=['burst'])
         # return the results in a user-friendly dataframe
         return bursts_downloaded
 

@@ -24,6 +24,145 @@ class Satellite(progressbar_joblib, datagrid):
     def __repr__(self):
         return 'Object %s %d items\n%r' % (self.__class__.__name__, len(self.df), self.df)
 
+    def _repr_html_(self) -> str:
+        """Render the records as a table in a notebook, the way the records themselves render.
+
+        Defined explicitly because __getattr__ refuses private names, so this cannot be reached
+        by delegation, and without it a notebook falls back to the plain text __repr__.
+        """
+        return 'Object %s %d items%s' % (self.__class__.__name__, len(self.df), self.df._repr_html_())
+
+    def __len__(self) -> int:
+        """Number of records."""
+        return len(self.df)
+
+    def __contains__(self, key) -> bool:
+        """Whether a column exists, as for the records."""
+        return key in self.df
+
+    def __iter__(self):
+        """Iterate the column names, as the records do."""
+        return iter(self.df)
+
+    def __getattr__(self, name: str):
+        """Attribute access to the records, so that s1.mission is the mission column.
+
+        Only reached when the attribute is defined neither on the object nor on its class, so
+        it never shadows a method. Private and dunder names are refused: the copy and pickle
+        protocols look their hooks up with getattr, and answering those from the records would
+        copy and pickle the records instead of this object, which transform() sends to the
+        joblib workers.
+        """
+        if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        df = self.__dict__.get('df')
+        if df is None:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        try:
+            return getattr(df, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
+
+    def __getitem__(self, key):
+        """Select records or columns, as for the records themselves.
+
+        Selecting records returns an object of the same kind, so the result is still ready for
+        processing, e.g. s1 = s1[s1.mission == 'S1A']. Selecting a column returns the column.
+        """
+        records = self.df[key]
+        if isinstance(records, self.gpd.GeoDataFrame) and records.index.names == self.df.index.names:
+            return self.with_records(records)
+        return records
+
+    def with_records(self, records) -> 'Satellite':
+        """Return this object holding the given records, without scanning the data again."""
+        import copy
+        obj = copy.copy(self)
+        obj.df = records
+        return obj
+
+    def baselines(self, debug: bool = False):
+        """Perpendicular baseline of every record in meters.
+
+        A baseline is orbit geometry, so it needs neither the images nor a DEM nor a
+        transform, and the reference date can be chosen before any processing. The value is
+        measured from the first date of the group, which is only the origin of the scale: a
+        pair baseline is a difference of two of them, so the origin cancels.
+
+        THIS ORIGIN IS NOT THE STACK'S REFERENCE. Only `transform(ref=...)` knows which
+        date the stack is referenced to, and it measures each burst from that one, so a
+        stored stack has BPR == 0 exactly at its reference; a value from here must never
+        overwrite it. The origin is
+        reported for every group, because a value on its own means nothing without it, and it
+        is always the first date: any date would do, so a baseline that cannot be solved is
+        reported as an error rather than worked around by choosing another origin.
+
+        Sentinel-1 reads the orbits from files downloaded after the bursts, so its baselines
+        stay undefined until the orbits are there and the data directory is scanned again.
+        Nisar carries the orbit inside the scene and has no such wait.
+
+        Parameters
+        ----------
+        debug : bool, optional
+            Print debug information. Default is False.
+
+        Returns
+        -------
+        pandas.Series
+            Perpendicular baseline per record, NaN where it cannot be computed.
+        """
+        import numpy as np
+        import pandas as pd
+        from tqdm.auto import tqdm
+
+        BPRs = pd.Series(np.nan, index=self.df.index, name='BPR')
+        if 'orbit' in self.df.columns and self.df.orbit.isnull().all():
+            print('NOTE: Orbits are not downloaded, baselines are undefined. '
+                  'Download the orbits and scan the data directory again.')
+            return BPRs
+
+        # bursts are keyed by fullBurstID and burst, scenes by sceneId and scene
+        group_level, record_level = self.df.index.names[0], self.df.index.names[2]
+        for group, records in self.df.groupby(level=group_level):
+            dates = records.startTime.dt.date
+            # the polarizations share the acquisition, so one record per date is enough
+            firsts = records[~dates.duplicated()]
+            if 'orbit' in firsts.columns and firsts.orbit.isnull().any():
+                print(f'NOTE: {group} misses orbits, its baselines are undefined.')
+                continue
+
+            names = list(firsts.index.get_level_values(record_level))
+            name_dates = list(dates[~dates.duplicated()])
+
+            prms = {}
+            def prm_of(name):
+                if name not in prms:
+                    prms[name], _, _ = self.align_ref(name, debug=debug, return_slc=False)
+                return prms[name]
+
+            # the origin is the first date and never moves: it only shifts the whole scale,
+            # so moving it would hide a defect instead of reporting one
+            origin, origin_date = names[0], name_dates[0]
+            values = {}
+            with tqdm(desc='Computing Baselines'.ljust(25), total=len(names)) as pbar:
+                for name, date in zip(names, name_dates):
+                    if name == origin:
+                        values[date] = 0.0
+                    else:
+                        try:
+                            values[date] = float(
+                                prm_of(origin).SAT_baseline(prm_of(name)).get('B_perpendicular'))
+                        except Exception as e:
+                            # every date is a valid reference, so an unsolved baseline is a
+                            # defect and not a property of the data. Only this one is left out.
+                            print(f'ERROR: {group} baseline of {date} is unsolved: {e}')
+                    pbar.update(1)
+
+            print(f'NOTE: {group} baselines are measured from {origin_date}.')
+            BPRs[records.index] = [values.get(date, np.nan) for date in dates]
+
+        return BPRs
+
     def to_dataframe(self, crs: int = 4326, ref: str = None) -> pd.DataFrame:
         """
         Return a Pandas DataFrame for all records.
@@ -54,7 +193,12 @@ class Satellite(progressbar_joblib, datagrid):
             if len(ref_ids) == 0:
                 raise ValueError(f"Reference date '{ref}' not found in the data")
             df = self.df[self.df.index.get_level_values(0).isin(ref_ids)]
-        return df.set_crs(4326).to_crs(crs)
+        # the records are WGS84 already, so return them as they are and reproject only when
+        # another projection is asked for. Without a reference date this is the records object
+        # itself, so that a selection assigned to it is not silently lost on a copy.
+        if crs == 4326:
+            return df
+        return df.to_crs(crs)
 
     def get_record(self, record_id: str) -> pd.DataFrame:
         """
@@ -101,7 +245,7 @@ class Satellite(progressbar_joblib, datagrid):
         """Alias for fullBurstId() - get the sceneId (level 0 index) for a record."""
         return self.fullBurstId(record_id)
 
-    def plot(self, records: pd.DataFrame = None, ref: str = None,
+    def plot(self, ref: str = None,
              alpha: float = 0.7, caption: str = 'Estimated Footprint',
              cmap: str = 'turbo', aspect: float = None, _size: tuple[int, int] = None,
              ax=None):
@@ -110,8 +254,6 @@ class Satellite(progressbar_joblib, datagrid):
 
         Parameters
         ----------
-        records : pd.DataFrame, optional
-            Records to plot. Default is all records.
         ref : str, optional
             Reference date to filter records.
         alpha : float, optional
@@ -134,8 +276,7 @@ class Satellite(progressbar_joblib, datagrid):
         if _size is None:
             _size = (2000, 1000)
 
-        if records is None:
-            records = self.to_dataframe(ref=ref)
+        records = self.to_dataframe(ref=ref)
 
         if ax is None:
             plt.figure()
@@ -185,7 +326,7 @@ class Satellite(progressbar_joblib, datagrid):
         zarr.group(store=root_store, zarr_format=3, overwrite=False)
         zarr.consolidate_metadata(root_store)
 
-    def get_repref(self, ref: str, records: pd.DataFrame = None) -> dict:
+    def get_repref(self, ref: str) -> dict:
         """
         Get the reference and repeat records for a given reference date.
 
@@ -193,8 +334,6 @@ class Satellite(progressbar_joblib, datagrid):
         ----------
         ref : str
             The reference date (YYYY-MM-DD).
-        records : pd.DataFrame, optional
-            The DataFrame containing the records. If None, uses to_dataframe(ref=ref).
 
         Returns
         -------
@@ -202,8 +341,7 @@ class Satellite(progressbar_joblib, datagrid):
             A dictionary mapping ref_id -> (ref_list, rep_list) where each list
             contains tuples of record indices.
         """
-        if records is None:
-            records = self.to_dataframe(ref=ref)
+        records = self.to_dataframe(ref=ref)
 
         recs_ref = records[records.startTime.dt.date.astype(str) == ref]
         refs_dict = {}
@@ -329,8 +467,12 @@ class Satellite(progressbar_joblib, datagrid):
         duplicates = lat_index[lat_index.duplicated()].tolist() + lon_index[lon_index.duplicated()].tolist()
         assert len(duplicates) == 0, 'ERROR: DEM grid includes duplicated coordinates'
 
-        # Crop to the geometry extent
-        bounds = self.get_bounds(geometry.buffer(buffer_degrees))
+        # Crop to the geometry extent. The buffer is in degrees on purpose, so silence the
+        # warning about buffering a geographic CRS.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*geographic CRS.*')
+            bounds = self.get_bounds(geometry.buffer(buffer_degrees))
         ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
 
         ds = ortho.astype(np.float32).transpose('lat', 'lon').rename("dem")
@@ -384,9 +526,13 @@ class Satellite(progressbar_joblib, datagrid):
         record = self.get_record(record_id)
         geometry = record.geometry
 
-        # Get bounds with buffer
+        # Get bounds with buffer. The buffer is in degrees on purpose, so silence the
+        # warning about buffering a geographic CRS.
+        import warnings
         buffer_degrees = 0.04
-        bounds = geometry.buffer(buffer_degrees).total_bounds  # [minx, miny, maxx, maxy]
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*geographic CRS.*')
+            bounds = geometry.buffer(buffer_degrees).total_bounds  # [minx, miny, maxx, maxy]
         lon_min, lat_min, lon_max, lat_max = bounds
 
         # Open DEM file directly (never loads full array!)

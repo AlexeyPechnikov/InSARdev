@@ -122,75 +122,10 @@ def get_connected_components(valid_mask_2d, min_size=4):
     return labeled_array, components, n_total, sizes
 
 
-def print_component_stats_debug(method_name, shape, n_valid, n_components, sizes):
-    """Print debug statistics about connected components."""
-    comp_sizes = sizes[1:n_components + 1] if n_components > 0 else []
-    sorted_sizes = np.sort(comp_sizes)[::-1]
-    n_tiny = np.sum(comp_sizes < 10) if len(comp_sizes) > 0 else 0
-
-    print(f'{method_name}: {shape} grid, {n_valid} valid pixels, {n_components} components')
-    if n_components <= 10:
-        print(f'  Component sizes: {list(sorted_sizes)}')
-    else:
-        print(f'  Largest 5: {list(sorted_sizes[:5])}, smallest 5: {list(sorted_sizes[-5:])}, tiny(<10px): {n_tiny}')
 
 
-def find_connected_components(valid_mask_2d, min_size=None):
-    """
-    Find connected components in a 2D valid mask using 4-connectivity.
-
-    Parameters
-    ----------
-    valid_mask_2d : np.ndarray
-        2D boolean array where True indicates valid pixels.
-    min_size : int, optional
-        Minimum component size to include. If None, all components are returned.
-
-    Returns
-    -------
-    list of np.ndarray
-        List of boolean masks, one per connected component (sorted by size, largest first).
-    """
-    labeled_array, components, n_total, _ = get_connected_components(
-        valid_mask_2d, min_size=min_size or 1
-    )
-    return [(labeled_array == c['label']) for c in components]
 
 
-def line_crosses_mask(p1, p2, mask):
-    """
-    Check if the line segment from p1 to p2 crosses any True pixels in mask.
-
-    Uses Bresenham-like sampling along the line.
-
-    Parameters
-    ----------
-    p1, p2 : tuple
-        (row, col) endpoints of the line segment.
-    mask : np.ndarray
-        2D boolean array to check against.
-
-    Returns
-    -------
-    bool
-        True if the line crosses any True pixels in mask.
-    """
-    r1, c1 = p1
-    r2, c2 = p2
-
-    # Number of steps (at least the max of row/col difference)
-    n_steps = max(abs(r2 - r1), abs(c2 - c1), 1)
-
-    for step in range(1, n_steps):  # Skip endpoints
-        t = step / n_steps
-        r = int(round(r1 + t * (r2 - r1)))
-        c = int(round(c1 + t * (c2 - c1)))
-
-        if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1]:
-            if mask[r, c]:
-                return True
-
-    return False
 
 
 def find_component_connections_fast(labeled_array, phase, components,
@@ -445,72 +380,8 @@ def find_component_connections_fast(labeled_array, phase, components,
     return connections
 
 
-def _line_crosses_other_labels(labeled_array, p1, p2, label1, label2):
-    """Check if line from p1 to p2 crosses labels other than label1/label2."""
-    r1, c1 = p1
-    r2, c2 = p2
-    dr, dc = r2 - r1, c2 - c1
-    n_steps = max(abs(dr), abs(dc), 1)
-
-    for step in range(1, n_steps):
-        t = step / n_steps
-        r = int(round(r1 + t * dr))
-        c = int(round(c1 + t * dc))
-
-        label_at = labeled_array[r, c]
-        if label_at > 0 and label_at != label1 and label_at != label2:
-            return True
-    return False
 
 
-def _estimate_offset_fast(phase, labeled_array, label_i, label_j, p_i, p_j, n_neighbors=5):
-    """Estimate phase offset between components at connection point."""
-    # Sample pixels near connection point
-    r_i, c_i = p_i
-    r_j, c_j = p_j
-
-    # Search window around connection points
-    window = max(n_neighbors * 2, 10)
-
-    # Get nearby pixels from component i
-    r_min_i = max(0, r_i - window)
-    r_max_i = min(labeled_array.shape[0], r_i + window + 1)
-    c_min_i = max(0, c_i - window)
-    c_max_i = min(labeled_array.shape[1], c_i + window + 1)
-
-    sub_label_i = labeled_array[r_min_i:r_max_i, c_min_i:c_max_i]
-    sub_phase_i = phase[r_min_i:r_max_i, c_min_i:c_max_i]
-    mask_i = (sub_label_i == label_i) & ~np.isnan(sub_phase_i)
-
-    # Get nearby pixels from component j
-    r_min_j = max(0, r_j - window)
-    r_max_j = min(labeled_array.shape[0], r_j + window + 1)
-    c_min_j = max(0, c_j - window)
-    c_max_j = min(labeled_array.shape[1], c_j + window + 1)
-
-    sub_label_j = labeled_array[r_min_j:r_max_j, c_min_j:c_max_j]
-    sub_phase_j = phase[r_min_j:r_max_j, c_min_j:c_max_j]
-    mask_j = (sub_label_j == label_j) & ~np.isnan(sub_phase_j)
-
-    if mask_i.sum() < 3 or mask_j.sum() < 3:
-        return 0, 0.0
-
-    # Get phase values
-    phase_vals_i = sub_phase_i[mask_i]
-    phase_vals_j = sub_phase_j[mask_j]
-
-    # Use median for robustness
-    median_i = np.median(phase_vals_i[:n_neighbors] if len(phase_vals_i) > n_neighbors else phase_vals_i)
-    median_j = np.median(phase_vals_j[:n_neighbors] if len(phase_vals_j) > n_neighbors else phase_vals_j)
-
-    delta = median_i - median_j
-    k_offset = int(np.round(delta / (2 * np.pi)))
-
-    # Confidence based on fractional part
-    fractional = (delta / (2 * np.pi)) - k_offset
-    confidence = 1.0 - 2 * abs(fractional)
-
-    return k_offset, max(0, confidence)
 
 
 def find_component_connections(components, conncomp_gap=None, max_neighbors=30):
@@ -773,115 +644,6 @@ def estimate_component_offset(unwrapped, comp_mask_i, comp_mask_j, closest_i, cl
     return k_offset, confidence
 
 
-def connect_components_ilp(unwrapped, components, connections, n_neighbors=5, max_time=60.0, debug=False):
-    """
-    Connect separately-unwrapped components using ILP optimization.
-
-    Finds optimal integer 2π offsets for each component to minimize
-    phase discontinuities at connection points.
-
-    Parameters
-    ----------
-    unwrapped : np.ndarray
-        2D array with separately unwrapped components.
-    components : list of np.ndarray
-        List of boolean masks for each component.
-    connections : list of tuple
-        Output from find_component_connections.
-    n_neighbors : int, optional
-        Number of pixels to use for offset estimation at each connection.
-        Default is 50.
-    max_time : float, optional
-        Maximum solver time in seconds. Default is 60.
-    debug : bool, optional
-        If True, print diagnostic information.
-
-    Returns
-    -------
-    np.ndarray
-        2D array with connected unwrapped phase.
-    """
-    from ortools.sat.python import cp_model
-
-    n_comps = len(components)
-    if n_comps < 2 or len(connections) == 0:
-        return unwrapped.copy()
-
-    # Estimate offsets and weights for each connection
-    edge_data = []
-    for comp_i, comp_j, closest_i, closest_j, distance in connections:
-        k_offset, confidence = estimate_component_offset(
-            unwrapped, components[comp_i], components[comp_j],
-            closest_i, closest_j, n_neighbors=n_neighbors
-        )
-        # Weight by confidence and inverse distance
-        weight = confidence / (distance + 1.0)
-        edge_data.append((comp_i, comp_j, k_offset, weight))
-
-        if debug:
-            print(f'  Connection {comp_i}-{comp_j}: dist={distance:.1f}, '
-                  f'k_offset={k_offset}, confidence={confidence:.3f}')
-
-    # Build ILP model
-    model = cp_model.CpModel()
-
-    # Variables: k_i = integer offset for component i
-    # Range: reasonable bounds (±100 cycles should be enough)
-    k_vars = [model.NewIntVar(-100, 100, f'k_{i}') for i in range(n_comps)]
-
-    # Fix component 0 as reference
-    model.Add(k_vars[0] == 0)
-
-    # Objective: minimize weighted sum of |measured_offset - (k_i - k_j)|
-    # We use absolute value linearization: |x| = max(x, -x)
-    scale = 1000  # Scale weights to integers for CP-SAT
-    abs_vars = []
-
-    for idx, (comp_i, comp_j, k_offset, weight) in enumerate(edge_data):
-        # k_offset = round((phase_i - phase_j) / 2π)
-        # To align: phase_j + k_offset*2π ≈ phase_i
-        # After offsets: (phase_i + k_i*2π) ≈ (phase_j + k_j*2π)
-        # So: phase_i - phase_j ≈ (k_j - k_i)*2π
-        # Thus: k_offset ≈ k_j - k_i
-        # Minimize: |k_offset - (k_j - k_i)| = |k_offset - k_j + k_i|
-
-        # Create auxiliary variable for the difference
-        diff_var = model.NewIntVar(-200, 200, f'diff_{idx}')
-        model.Add(diff_var == k_offset - k_vars[comp_j] + k_vars[comp_i])
-
-        # Absolute value
-        abs_var = model.NewIntVar(0, 200, f'abs_{idx}')
-        model.AddAbsEquality(abs_var, diff_var)
-
-        abs_vars.append((abs_var, int(weight * scale)))
-
-    # Objective: minimize weighted sum of absolute differences
-    model.Minimize(sum(w * v for v, w in abs_vars))
-
-    # Solve
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = max_time
-
-    status = solver.Solve(model)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        if debug:
-            print(f'  ILP solver failed with status {status}')
-        return unwrapped.copy()
-
-    # Extract solution
-    k_offsets = [solver.Value(k_vars[i]) for i in range(n_comps)]
-
-    if debug:
-        print(f'  ILP solution: k_offsets = {k_offsets}')
-
-    # Apply offsets to create connected result
-    result = unwrapped.copy()
-    for i, comp_mask in enumerate(components):
-        if k_offsets[i] != 0:
-            result[comp_mask] += k_offsets[i] * 2 * np.pi
-
-    return result
 
 
 def connect_components_ilp_fast(unwrapped, labeled_array, components, connections, max_time=60.0, debug=False):
